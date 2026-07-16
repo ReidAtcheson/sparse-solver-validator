@@ -13,13 +13,11 @@ use ssv_backends::{
 };
 use ssv_canonical::Digest;
 use ssv_direct::maximum_backend_payload_bytes;
-use ssv_fast::{FastBackend, FastError, FastNonceMode};
 use ssv_problem::{FinalizedRandomness, ProblemError, ProblemTemplate, TemplateRandomness};
 use ssv_service_protocol::{
-    CertificatePayload, CertificateSchema, ChallengePayload, ChallengeSchema,
-    CommitmentChallengePayload, CommitmentChallengeRequest, CommitmentChallengeSchema,
-    MAX_CHALLENGE_BYTES, MAX_ID_BYTES, MAX_SOLUTION_ELEMENTS_LIMIT, ProofProtocol, ProtocolError,
-    RetryPolicy, SignedCertificate, SignedChallenge, SignedCommitmentChallenge,
+    CertificatePayload, CertificateSchema, ChallengePayload, ChallengeSchema, MAX_CHALLENGE_BYTES,
+    MAX_ID_BYTES, MAX_SOLUTION_ELEMENTS_LIMIT, ProtocolError, RetryPolicy, SignedCertificate,
+    SignedChallenge,
 };
 use ssv_validation::{
     ArtifactPrelude, ArtifactSummary, MAX_PUBLIC_STATEMENT_BYTES, MAX_SUCCINCT_ARTIFACT_BYTES,
@@ -60,10 +58,9 @@ pub struct CertifiedValidation {
 pub struct ValidatedSubmission {
     output: ValidatedOutput,
     challenge_digest: Digest,
-    commitment_challenge_digest: Option<Digest>,
     validation_started_at_unix_seconds: i64,
-    latest_challenge_issue_unix_seconds: i64,
-    earliest_challenge_expiry_unix_seconds: i64,
+    challenge_issued_at_unix_seconds: i64,
+    challenge_expires_at_unix_seconds: i64,
 }
 
 #[derive(Debug, Error)]
@@ -72,22 +69,16 @@ pub enum ServiceError {
     InvalidConfiguration(&'static str),
     #[error("challenge issuance requires challenge-derived-v1 template randomness")]
     ChallengeRequiresDerivedTemplate,
-    #[error("the selected proof protocol has no registered post-commit challenge stage")]
-    CommitmentChallengeUnsupported,
     #[error("problem or manifest exceeds this service's solution-element policy")]
     SolutionElementLimit,
     #[error("hosted validation requires a signed challenge; literal local mode is rejected")]
     SignedChallengeRequired,
-    #[error("hosted fast validation requires an externally signed post-commit challenge")]
-    SignedCommitmentChallengeRequired,
     #[error("challenge lifetime differs from this service's configured policy")]
     ChallengeLifetimeMismatch,
     #[error("signed challenge is bound to a different problem template")]
     TemplateDigestMismatch,
     #[error("problem challenge provenance is inconsistent")]
     ProblemProvenanceMismatch,
-    #[error("fast commitment challenge predates the problem challenge")]
-    CommitmentBeforeProblemChallenge,
     #[error("certificate timestamp precedes validation start")]
     CertificateBeforeValidation,
     #[error("certificate timestamp precedes a signed challenge")]
@@ -102,8 +93,6 @@ pub enum ServiceError {
     Artifact(#[from] ValidationError),
     #[error("validation backend rejected the artifact: {0}")]
     Backend(#[from] BackendError),
-    #[error("fast preflight rejected the artifact: {0}")]
-    Fast(#[from] FastError),
 }
 
 /// Computes the HTTP body cap for the common container under a service's
@@ -207,38 +196,6 @@ impl StatelessValidatorService {
         Ok(SignedChallenge::sign(payload, &self.signing_key)?)
     }
 
-    /// Issues a fresh commitment-bound challenge without retaining server state.
-    /// Replay remains possible under v1; the token proves ordering/timestamping.
-    pub fn issue_commitment_challenge(
-        &self,
-        request: &CommitmentChallengeRequest,
-        entropy: Digest,
-        now_unix_seconds: i64,
-    ) -> Result<SignedCommitmentChallenge, ServiceError> {
-        if request.protocol != ProofProtocol::FastBinary64UnitCircleV2 {
-            return Err(ServiceError::CommitmentChallengeUnsupported);
-        }
-        let expires_at_unix_seconds = now_unix_seconds
-            .checked_add(self.config.challenge_lifetime_seconds)
-            .ok_or(ServiceError::InvalidConfiguration(
-                "challenge timestamp overflow",
-            ))?;
-        let payload = CommitmentChallengePayload {
-            schema: CommitmentChallengeSchema::V1,
-            issuer: self.config.issuer.clone(),
-            key_id: self.config.key_id.clone(),
-            issued_at_unix_seconds: now_unix_seconds,
-            expires_at_unix_seconds,
-            entropy,
-            problem_digest: request.problem_digest,
-            validation_manifest_digest: request.validation_manifest_digest,
-            protocol: request.protocol,
-            commitment_digest: request.commitment_digest,
-            retry_policy: RetryPolicy::ReplayAllowedV1,
-        };
-        Ok(SignedCommitmentChallenge::sign(payload, &self.signing_key)?)
-    }
-
     pub fn validate_submission(
         &self,
         proof_bytes: &[u8],
@@ -304,45 +261,6 @@ impl StatelessValidatorService {
             .verify_challenge_context(&challenge.payload_canonical_bytes())
             .map_err(|_| ServiceError::ProblemProvenanceMismatch)?;
 
-        let mut latest_issue = challenge.payload.issued_at_unix_seconds;
-        let mut earliest_expiry = challenge.payload.expires_at_unix_seconds;
-        let mut commitment_challenge_digest = None;
-
-        if prelude.statement().manifest().protocol == ProofProtocol::FastBinary64UnitCircleV2 {
-            let preflight = FastBackend::preflight(
-                &prelude.statement().verifier_statement(),
-                prelude.payload(),
-            )?;
-            if preflight.nonce_mode != FastNonceMode::ExternalSigned {
-                return Err(ServiceError::SignedCommitmentChallengeRequired);
-            }
-            let commitment_challenge = preflight
-                .external_challenge
-                .as_ref()
-                .ok_or(ServiceError::SignedCommitmentChallengeRequired)?;
-            commitment_challenge.verify(
-                &self.verifying_key(),
-                &self.config.issuer,
-                &self.config.key_id,
-                validation_started_at_unix_seconds,
-                self.config.maximum_future_skew_seconds,
-            )?;
-            require_configured_lifetime(
-                commitment_challenge.payload.issued_at_unix_seconds,
-                commitment_challenge.payload.expires_at_unix_seconds,
-                self.config.challenge_lifetime_seconds,
-            )?;
-            if commitment_challenge.payload.issued_at_unix_seconds
-                < challenge.payload.issued_at_unix_seconds
-            {
-                return Err(ServiceError::CommitmentBeforeProblemChallenge);
-            }
-            latest_issue = latest_issue.max(commitment_challenge.payload.issued_at_unix_seconds);
-            earliest_expiry =
-                earliest_expiry.min(commitment_challenge.payload.expires_at_unix_seconds);
-            commitment_challenge_digest = Some(commitment_challenge.digest());
-        }
-
         let report = verify_backend(&prelude)?.accept()?;
         let output = ValidatedOutput {
             summary: prelude.summary(),
@@ -351,10 +269,9 @@ impl StatelessValidatorService {
         Ok(ValidatedSubmission {
             output,
             challenge_digest: challenge.digest(),
-            commitment_challenge_digest,
             validation_started_at_unix_seconds,
-            latest_challenge_issue_unix_seconds: latest_issue,
-            earliest_challenge_expiry_unix_seconds: earliest_expiry,
+            challenge_issued_at_unix_seconds: challenge.payload.issued_at_unix_seconds,
+            challenge_expires_at_unix_seconds: challenge.payload.expires_at_unix_seconds,
         })
     }
 
@@ -366,19 +283,18 @@ impl StatelessValidatorService {
         if issued_at_unix_seconds < validated.validation_started_at_unix_seconds {
             return Err(ServiceError::CertificateBeforeValidation);
         }
-        if issued_at_unix_seconds < validated.latest_challenge_issue_unix_seconds {
+        if issued_at_unix_seconds < validated.challenge_issued_at_unix_seconds {
             return Err(ServiceError::CertificateBeforeChallenge);
         }
-        if issued_at_unix_seconds > validated.earliest_challenge_expiry_unix_seconds {
+        if issued_at_unix_seconds > validated.challenge_expires_at_unix_seconds {
             return Err(ServiceError::ChallengeExpiredDuringValidation);
         }
         let payload = CertificatePayload {
-            schema: CertificateSchema::V2,
+            schema: CertificateSchema::V3,
             issuer: self.config.issuer.clone(),
             key_id: self.config.key_id.clone(),
             issued_at_unix_seconds,
-            challenge_digest: Some(validated.challenge_digest),
-            commitment_challenge_digest: validated.commitment_challenge_digest,
+            challenge_digest: validated.challenge_digest,
             problem_digest: validated.output.summary.problem_digest,
             validation_manifest_digest: validated.output.summary.validation_manifest_digest,
             proof_digest: validated.output.summary.proof_digest,

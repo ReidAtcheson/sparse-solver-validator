@@ -1465,7 +1465,6 @@ name = "ssv-fast"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "ed25519-dalek",
  "ssv-canonical",
  "ssv-problem",
  "ssv-relation",
@@ -1518,7 +1517,6 @@ dependencies = [
  "ssv-backends",
  "ssv-canonical",
  "ssv-direct",
- "ssv-fast",
  "ssv-problem",
  "ssv-service-protocol",
  "ssv-solution",

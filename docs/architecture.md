@@ -54,9 +54,10 @@ is not a production security audit.
    prover-selected proof program.
 6. Network transport does not define proof semantics. Offline and hosted paths
    verify the same strict artifact bytes.
-7. Local literal randomness, hosted problem challenges, external fast
-   post-commit challenges, and offline fast Fiat--Shamir are explicitly tagged
-   modes. None is an error fallback for another.
+7. Local literal randomness and hosted problem challenges are explicitly tagged
+   seed origins. Exact and fast proof challenges are noninteractive
+   Fiat--Shamir derivations bound to the complete public statement and prior
+   transcript.
 8. Hot data uses flat contiguous storage and validated indices. Untrusted lengths
    and resource policy are checked before large allocation or expensive work.
 
@@ -96,33 +97,37 @@ The certificate identifies one problem, manifest, protocol, and proof digest. A
 stateless service does not claim that it is the first submission or the best
 residual.
 
-### 3.2 Local and offline validation
+### 3.2 Local validation
 
 A local template uses the explicit `literal-v1` seed form. The offline validator
-accepts it only when local mode is explicitly enabled. Exact proofs derive their
-interactive challenges from their pinned Fiat--Shamir transcript. The fast
-profile also has an explicit offline Fiat--Shamir precommitment mode, which has no
-external timestamp and weaker practical grinding resistance than its external
-mode.
+accepts it only when local mode is explicitly enabled. Exact and fast proofs
+derive every algebraic challenge from their pinned Fiat--Shamir transcript.
+Hosted and local artifacts use the same proof schedule; only problem-seed
+provenance differs.
 
-### 3.3 Fast external precommitment
+### 3.3 Fast noninteractive precommitment
 
-The fast profile has a second, later challenge lifecycle:
+The fast profile commits to its encoded witness before deriving its algebraic
+challenges:
 
 ```text
-problem challenge -> fixes A,b -> solve -> commit to encoded [x || R]
-                                            |
-                                            | commitment digest
-                                            v
-                              signed post-commit challenge
-                                            |
-                                            v
-                                      finish proof
+signed or literal problem -> fixes A,b -> solve -> commit to encoded [x || R]
+                                                  |
+                                                  | absorb root and statement
+                                                  v
+                                      Fiat--Shamir challenges -> finish proof
 ```
 
-The matrix-instance challenge cannot replace this post-commit event. The latter
-binds the problem digest, manifest digest, fast protocol, and commitment digest;
-it never changes `A,b`.
+The commitment root, problem digest, manifest digest, protocol, and numerical
+policy are bound before the first challenge is derived. The one-step prover owns
+this sequencing internally; no issuer round trip is part of proof construction.
+
+A signed problem header makes the instance unpredictable before issuance, but
+it does not prevent a prover from retrying commitments after seeing that header.
+Authentication, expiry, quotas, rate limits, and audit logs are deployment-level
+abuse controls, not a cryptographic one-shot guarantee. The fast profile remains
+provisional; exact validation under the same signed problem header is the
+assurance follow-up.
 
 ## 4. Public problem and succinct evaluation
 
@@ -216,7 +221,7 @@ the relation after receiving all of `x`.
 | `ssv-problem` | Templates, seed derivation, generator compilation, sparse rows, certificates, and the shared succinct public-MLE plan |
 | `ssv-solution` | Strict solver-facing binary64 vector input and contiguous validated storage |
 | `ssv-relation` | Proof-independent Q63.64 witness conversion, exact integer residual relation, and no-wrap bounds; fast reuses the witness conversion but computes its own binary64 residual |
-| `ssv-service-protocol` | Backend IDs, manifests, signed problem challenges, signed post-commit challenges, typed certificate scores, and Ed25519 verification |
+| `ssv-service-protocol` | Backend IDs, manifests, signed problem challenges, typed certificate scores, and Ed25519 verification |
 | `ssv-validation` | Backend-neutral public statements, restricted verifier statements, strict outer artifact framing, and backend lifecycle traits |
 | `ssv-direct` | Non-succinct artifact carrying `x` and independent streaming relation checker |
 | `ssv-field-sumcheck` | Reusable flat-table finite-field sumcheck with fixed coordinate and transcript conventions |
@@ -275,7 +280,7 @@ no-wrap metadata without row scans. The result is an exact residual numerator an
 dyadic denominator for Q63.64 `x`; it is not a proof about unrounded solver
 arithmetic and it does not claim zero knowledge.
 
-### 6.3 `fast-binary64-unit-circle-v2`
+### 6.3 `fast-binary64-unit-circle-v3`
 
 The fast profile converts the same Q63.64 witness back to a frozen binary64
 representation and computes `R = Ax-b` under its binary64 contract. It packs
@@ -316,11 +321,11 @@ remain authoritative.
 ### `sparse-prover`
 
 Reads a finalized problem, validation manifest, and solver-owned `x` file.
-`prove` exhaustively dispatches the single-stage direct and exact profiles.
-`fast-commit` fixes the fast root and optionally writes the JSON request for an
-external nonce; `fast-prove` consumes that precommitment and either the signed
-nonce or the explicitly offline mode. Every path writes the same strict outer
-artifact format.
+`prove` exhaustively dispatches direct, exact, and fast profiles and writes the
+same strict outer artifact format. For fast proofs it performs commitment and
+Fiat--Shamir completion inside one process. Local `fast-commit` and `fast-prove`
+commands retain those implementation stages for diagnostics and separate
+process-memory benchmarks; neither contacts an issuer.
 
 ### `sparse-validator`
 
@@ -333,13 +338,12 @@ manifest, time, and score policy as needed.
 
 ### `sparse-validator-server`
 
-Provides health, problem-challenge, fast post-commit-challenge, and validation
-HTTP endpoints around the same library verification paths. It binds
+Provides health, problem-challenge, and validation HTTP endpoints around the
+same library verification paths. It binds
 `0.0.0.0:$PORT` for Cloud Run; local clients connect to
-`127.0.0.1:$PORT`, not to `0.0.0.0`. Hosted submissions require a signed
-problem challenge, and hosted fast submissions additionally require the
-externally signed post-commit challenge; offline fast mode is a local-validator
-policy, not a server fallback.
+`127.0.0.1:$PORT`, not to `0.0.0.0`. Every hosted submission requires the
+ordinary signed problem challenge embedded in its public statement; fast does
+not add an issuer interaction.
 
 ## 8. Data layout and performance design
 
@@ -373,12 +377,11 @@ uses a file-backed Ed25519 key. Deployments must provide protected key material
 and configure request, concurrency, and platform time limits for their resource
 budget.
 
-The service intentionally stores no challenge, precommitment, proof, result, or
+The service intentionally stores no challenge, proof, result, or
 leaderboard state. Signed objects authenticate their bytes and timestamps, but
 statelessness cannot enforce:
 
 - one use of a problem challenge;
-- one post-commit nonce per commitment;
 - replay rejection;
 - one certificate per solver or problem; or
 - a global or per-problem best residual.
@@ -413,11 +416,10 @@ The current development implementation includes:
 - deterministic template finalization, signed problem challenges, literal local
   mode, and a generator-owned succinct public evaluator;
 - a strict common artifact container and exhaustive direct/exact/fast dispatch;
-- one-stage direct and exact proving, two-stage external or explicit-offline fast
-  proving, backend-specific human-readable verification, and typed certificate
-  scores; and
-- stateless HTTP issuance and hosted validation for all three profiles, with an
-  external post-commit challenge required for hosted fast validation.
+- one-step noninteractive proving for all three profiles, optional local fast
+  stage diagnostics, backend-specific human-readable verification, and typed
+  certificate scores; and
+- stateless HTTP problem issuance and hosted validation for all three profiles.
 
 Production release still requires published cross-repository golden vectors,
 coverage-guided decoder fuzzing, applicable Miri/sanitizer runs, fresh benchmark

@@ -42,11 +42,12 @@ framing are not the comparison of interest. Report:
 proof_to_solution_ratio = transmitted_proof_bytes / raw_solution_bytes.
 ```
 
-For exact mode, `transmitted_proof_bytes` is the complete outer artifact. For
-fast external mode, report the precommitment, signed commitment challenge, final
-artifact, and their sum. A table may also show final-artifact bytes alone, but it
-must not hide independently transmitted protocol objects. Report the signed
-problem challenge separately when comparing hosted and offline operation.
+For exact and fast mode, `transmitted_proof_bytes` is the complete outer
+artifact. The fast artifact already contains its canonical precommitment; a
+precommitment file produced by the diagnostic staged commands is not an
+additional wire object. Report the ordinary signed problem challenge separately
+when measuring hosted operation, and state whether it is amortized across more
+than one submission.
 
 ### 2.2 Direct validation
 
@@ -88,8 +89,9 @@ For every row of a comparison table, freeze and report:
 - validation manifest bytes and digest;
 - backend and all protocol versions;
 - solution digest and how `x` was obtained; and
-- whether the challenge mode is local, hosted problem only, fast external, or
-  fast offline Fiat--Shamir.
+- whether the public statement uses a literal local problem or a signed hosted
+  problem challenge. Proof challenges in both cases are noninteractive
+  Fiat--Shamir challenges.
 
 Use one deterministic seed series for regression benchmarks. Random exploratory
 runs are useful only when the seed is recorded and failures reproduce.
@@ -126,9 +128,10 @@ already-built binaries from `target/release`.
 
 ## 5. Process measurements
 
-Run commit, prove, verify, and service tests as separate processes so allocator
-history from one phase does not contaminate another phase's peak RSS. On Linux,
-an initial portable method is:
+Run prove, verify, and service tests as separate processes so allocator history
+from one phase does not contaminate another phase's peak RSS. When measuring the
+fast implementation stages, also run `fast-commit` and `fast-prove` as separate
+processes. On Linux, an initial portable method is:
 
 ```sh
 /usr/bin/time -v target/release/<binary> <recorded arguments>
@@ -184,10 +187,15 @@ Also report matrix and RHS public-evaluator term counts and arithmetic operation
 
 ### 6.3 Fast path
 
-Measure external commit and prove as separate processes and report their maximum
-RSS individually as well as the maximum of the two. Report:
+Use one-step `sparse-prover prove` for user-visible latency, RSS, and artifact
+size. To compare phase costs with the research implementation or isolate memory
+peaks, additionally measure local `fast-commit` and `fast-prove` as separate
+processes and report their maximum RSS individually as well as the maximum of the
+two. These commands implement the same noninteractive transcript and introduce
+no issuer interaction. Report:
 
-- precommitment, signed nonce, artifact, and total transmitted bytes;
+- complete artifact bytes and, when staged measurements are included, the
+  diagnostic precommitment-file bytes without adding them to transmitted bytes;
 - codeword length and the 1-to-64 distinct recursive query trajectories reused
   across rounds;
 - sumcheck rounds and scalar values;
@@ -216,8 +224,10 @@ request size, configured body limit, timeout, concurrency, instance resources,
 warm/cold status, response size, and whether the client and service share a
 region.
 
-Stateless replay or repeated challenge requests are not throughput substitutes
-for a stateful one-shot workload.
+If deployment policy limits repeated submissions under one signed problem
+challenge, report the quota, authentication, expiry, rate limiting, and logging
+configuration used by the load test. Those infrastructure controls are distinct
+from the noninteractive proof transcript.
 
 ## 7. Correctness gates before recording a number
 

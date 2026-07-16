@@ -1,17 +1,11 @@
 use ed25519_dalek::SigningKey;
 use ssv_backends::{BackendVerifierReport, prove_single_stage};
 use ssv_canonical::Digest;
-use ssv_fast::{FastBackend, FastProverContext};
 use ssv_problem::ProblemTemplate;
 use ssv_service::{ServiceConfig, ServiceError, StatelessValidatorService};
-use ssv_service_protocol::{
-    CertifiedScore, CommitmentChallengeRequest, CommitmentChallengeRequestSchema, ProofProtocol,
-    SignedChallenge, ValidationManifest,
-};
+use ssv_service_protocol::{CertifiedScore, ProofProtocol, SignedChallenge, ValidationManifest};
 use ssv_solution::Solution;
-use ssv_validation::{
-    ArtifactPrelude, PrecommitBackend, PublicStatement, ValidationBackend, encode_artifact,
-};
+use ssv_validation::{ArtifactPrelude, PublicStatement, encode_artifact};
 
 fn service() -> StatelessValidatorService {
     StatelessValidatorService::new(
@@ -56,42 +50,6 @@ fn statement(
 fn single_stage_proof(statement: &PublicStatement, solution: &Solution) -> Vec<u8> {
     let (payload, _) = prove_single_stage(statement, solution).unwrap();
     encode_artifact(statement, &payload).unwrap()
-}
-
-#[test]
-fn stateless_post_commit_challenge_binds_the_requested_root_digest() {
-    let service = service();
-    let request = CommitmentChallengeRequest {
-        schema: CommitmentChallengeRequestSchema::V1,
-        problem_digest: Digest::from_bytes([1; 32]),
-        validation_manifest_digest: Digest::from_bytes([2; 32]),
-        protocol: ProofProtocol::FastBinary64UnitCircleV2,
-        commitment_digest: Digest::from_bytes([3; 32]),
-    };
-    let challenge = service
-        .issue_commitment_challenge(&request, Digest::from_bytes([4; 32]), 1_000)
-        .unwrap();
-    challenge
-        .verify(
-            &service.verifying_key(),
-            "integration-test",
-            "integration-key-v1",
-            1_001,
-            5,
-        )
-        .unwrap();
-    assert_eq!(
-        challenge.payload.commitment_digest,
-        request.commitment_digest
-    );
-    assert_eq!(challenge.payload.problem_digest, request.problem_digest);
-
-    let mut unsupported = request;
-    unsupported.protocol = ProofProtocol::WhirField192L2V4;
-    assert!(matches!(
-        service.issue_commitment_challenge(&unsupported, Digest::from_bytes([5; 32]), 1_000),
-        Err(ServiceError::CommitmentChallengeUnsupported)
-    ));
 }
 
 #[test]
@@ -270,54 +228,62 @@ fn hosted_exact_backend_returns_an_exact_dyadic_certificate() {
 }
 
 #[test]
-fn hosted_fast_backend_requires_and_certifies_the_post_commit_challenge() {
+fn hosted_fast_and_exact_followup_share_the_signed_problem_header() {
     let service = service();
     let template = challenge_template();
     let problem_challenge = service
         .issue_challenge(&template, Digest::from_bytes([31; 32]), 1_000)
         .unwrap();
+    let expected_challenge_digest = problem_challenge.digest();
     let problem = template
         .finalize_with_challenge_context(&problem_challenge.payload_canonical_bytes())
         .unwrap();
     let fast_manifest = ValidationManifest {
-        protocol: ProofProtocol::FastBinary64UnitCircleV2,
+        protocol: ProofProtocol::FastBinary64UnitCircleV3,
         max_solution_elements: 1_024,
         ..ValidationManifest::default()
     };
-    let statement = statement(problem, fast_manifest, Some(problem_challenge));
+    let fast_statement = statement(
+        problem.clone(),
+        fast_manifest,
+        Some(problem_challenge.clone()),
+    );
     let solution = Solution::new(vec![1.0; 16], 16).unwrap();
-    let (commitment, _) = <FastBackend as PrecommitBackend>::commit(&statement, &solution).unwrap();
-    let request = CommitmentChallengeRequest {
-        schema: CommitmentChallengeRequestSchema::V1,
-        problem_digest: statement.problem_digest(),
-        validation_manifest_digest: statement.manifest_digest(),
-        protocol: ProofProtocol::FastBinary64UnitCircleV2,
-        commitment_digest: commitment.digest(),
-    };
-    let commitment_challenge = service
-        .issue_commitment_challenge(&request, Digest::from_bytes([32; 32]), 1_001)
+    let fast_proof = single_stage_proof(&fast_statement, &solution);
+    let fast_certificate = service
+        .validate_and_certify(&fast_proof, 1_001, 1_002)
         .unwrap();
-    let context = FastProverContext::external_signed(commitment, commitment_challenge.clone());
-    let (payload, _) =
-        <FastBackend as ValidationBackend>::prove(&statement, &solution, &context).unwrap();
-    let proof = encode_artifact(&statement, &payload).unwrap();
-    let certified = service.validate_and_certify(&proof, 1_002, 1_003).unwrap();
     assert_eq!(
-        certified.certificate.payload.commitment_challenge_digest,
-        Some(commitment_challenge.digest())
+        fast_certificate.certificate.payload.challenge_digest,
+        expected_challenge_digest
     );
     assert!(matches!(
-        certified.certificate.payload.score,
+        fast_certificate.certificate.payload.score,
         CertifiedScore::FastBinary64SquaredL2V1 { .. }
     ));
+    let certificate_json = serde_json::to_value(&fast_certificate.certificate).unwrap();
+    let certificate_payload = certificate_json.get("payload").unwrap();
+    assert_eq!(
+        certificate_payload.get("schema").unwrap(),
+        "sparse-solve/validation-certificate/v3"
+    );
 
-    let (offline_commitment, _) = FastBackend::commit_offline(&statement, &solution).unwrap();
-    let offline_context = FastProverContext::offline_fiat_shamir(offline_commitment);
-    let (offline_payload, _) =
-        <FastBackend as ValidationBackend>::prove(&statement, &solution, &offline_context).unwrap();
-    let offline_proof = encode_artifact(&statement, &offline_payload).unwrap();
+    let exact_manifest = ValidationManifest {
+        protocol: ProofProtocol::WhirField192L2V4,
+        max_solution_elements: 1_024,
+        ..ValidationManifest::default()
+    };
+    let exact_statement = statement(problem, exact_manifest, Some(problem_challenge));
+    let exact_proof = single_stage_proof(&exact_statement, &solution);
+    let exact_certificate = service
+        .validate_and_certify(&exact_proof, 1_001, 1_002)
+        .unwrap();
+    assert_eq!(
+        exact_certificate.certificate.payload.challenge_digest,
+        expected_challenge_digest
+    );
     assert!(matches!(
-        service.validate_submission(&offline_proof, 1_002),
-        Err(ServiceError::SignedCommitmentChallengeRequired)
+        exact_certificate.certificate.payload.score,
+        CertifiedScore::ExactDyadicSquaredL2V1 { .. }
     ));
 }

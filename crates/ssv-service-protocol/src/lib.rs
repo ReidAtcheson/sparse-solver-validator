@@ -15,17 +15,13 @@ use ssv_canonical::{
 use thiserror::Error;
 
 const CHALLENGE_SIGNATURE_DOMAIN: &[u8] = b"sparse-solve/challenge-signature/ed25519/v1";
-const COMMITMENT_CHALLENGE_SIGNATURE_DOMAIN: &[u8] =
-    b"sparse-solve/commitment-challenge-signature/ed25519/v1";
-const CERTIFICATE_SIGNATURE_DOMAIN: &[u8] = b"sparse-solve/certificate-signature/ed25519/v1";
+const CERTIFICATE_SIGNATURE_DOMAIN: &[u8] = b"sparse-solve/certificate-signature/ed25519/v3";
 const CHALLENGE_DIGEST_DOMAIN: &[u8] = b"sparse-solve/challenge/v1";
-const COMMITMENT_CHALLENGE_DIGEST_DOMAIN: &[u8] = b"sparse-solve/commitment-challenge/v1";
 const MANIFEST_DIGEST_DOMAIN: &[u8] = b"sparse-solve/validation-manifest/v1";
-const CERTIFICATE_DIGEST_DOMAIN: &[u8] = b"sparse-solve/certificate/v1";
+const CERTIFICATE_DIGEST_DOMAIN: &[u8] = b"sparse-solve/certificate/v3";
 
 pub const MAX_ID_BYTES: usize = 256;
 pub const MAX_CHALLENGE_BYTES: usize = 2 * 1024;
-pub const MAX_COMMITMENT_CHALLENGE_BYTES: usize = 2 * 1024;
 pub const MAX_SOLUTION_ELEMENTS_LIMIT: u64 = 1 << 30;
 pub const MAX_PUBLIC_EVALUATION_TERMS_LIMIT: u64 = 1 << 20;
 const DEFAULT_PUBLIC_EVALUATION_TERMS: u64 = 4_096;
@@ -126,58 +122,6 @@ pub struct SignedChallenge {
     pub signature: SignatureBytes,
 }
 
-/// Schema for a challenge issued only after a prover fixes a commitment.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
-pub enum CommitmentChallengeSchema {
-    #[serde(rename = "sparse-solve/commitment-challenge/v1")]
-    V1,
-}
-
-/// Backend-neutral post-commit challenge payload.
-///
-/// A stateless issuer can sign this object without retaining the commitment.
-/// The signature establishes ordering and timestamp provenance, but the v1
-/// replay policy does not enforce single use.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CommitmentChallengePayload {
-    pub schema: CommitmentChallengeSchema,
-    pub issuer: String,
-    pub key_id: String,
-    pub issued_at_unix_seconds: i64,
-    pub expires_at_unix_seconds: i64,
-    pub entropy: Digest,
-    pub problem_digest: Digest,
-    pub validation_manifest_digest: Digest,
-    pub protocol: ProofProtocol,
-    pub commitment_digest: Digest,
-    pub retry_policy: RetryPolicy,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SignedCommitmentChallenge {
-    pub payload: CommitmentChallengePayload,
-    pub signature: SignatureBytes,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
-pub enum CommitmentChallengeRequestSchema {
-    #[serde(rename = "sparse-solve/commitment-challenge-request/v1")]
-    V1,
-}
-
-/// Stateless request to timestamp and challenge an already fixed commitment.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CommitmentChallengeRequest {
-    pub schema: CommitmentChallengeRequestSchema,
-    pub problem_digest: Digest,
-    pub validation_manifest_digest: Digest,
-    pub protocol: ProofProtocol,
-    pub commitment_digest: Digest,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum ValidationSchema {
     #[serde(rename = "sparse-solve/validation/v1")]
@@ -193,8 +137,8 @@ pub enum ProofProtocol {
     #[serde(rename = "whir-field192-l2-v4")]
     WhirField192L2V4,
     /// Experimental binary64 metric certificate with unit-circle openings.
-    #[serde(rename = "fast-binary64-unit-circle-v2")]
-    FastBinary64UnitCircleV2,
+    #[serde(rename = "fast-binary64-unit-circle-v3")]
+    FastBinary64UnitCircleV3,
 }
 
 impl ProofProtocol {
@@ -204,7 +148,7 @@ impl ProofProtocol {
         match self {
             Self::DirectReferenceV1 => 1,
             Self::WhirField192L2V4 => 2,
-            Self::FastBinary64UnitCircleV2 => 3,
+            Self::FastBinary64UnitCircleV3 => 4,
         }
     }
 
@@ -214,7 +158,7 @@ impl ProofProtocol {
         match value {
             1 => Some(Self::DirectReferenceV1),
             2 => Some(Self::WhirField192L2V4),
-            3 => Some(Self::FastBinary64UnitCircleV2),
+            4 => Some(Self::FastBinary64UnitCircleV3),
             _ => None,
         }
     }
@@ -357,8 +301,8 @@ pub enum CertifiedScore {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum CertificateSchema {
-    #[serde(rename = "sparse-solve/validation-certificate/v2")]
-    V2,
+    #[serde(rename = "sparse-solve/validation-certificate/v3")]
+    V3,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -368,8 +312,7 @@ pub struct CertificatePayload {
     pub issuer: String,
     pub key_id: String,
     pub issued_at_unix_seconds: i64,
-    pub challenge_digest: Option<Digest>,
-    pub commitment_challenge_digest: Option<Digest>,
+    pub challenge_digest: Digest,
     pub problem_digest: Digest,
     pub validation_manifest_digest: Digest,
     pub proof_digest: Digest,
@@ -417,8 +360,6 @@ pub enum ProtocolError {
     InvalidFastConsistency,
     #[error("certificate contains an invalid exact residual denominator")]
     InvalidExactDenominator,
-    #[error("certificate challenge provenance does not match its proof protocol")]
-    CertificateProvenanceMismatch,
     #[error("invalid canonical challenge: {0}")]
     Canonical(String),
 }
@@ -591,192 +532,6 @@ impl SignedChallenge {
     }
 }
 
-impl CommitmentChallengePayload {
-    pub fn validate(&self) -> Result<(), ProtocolError> {
-        validate_id("issuer", &self.issuer)?;
-        validate_id("key_id", &self.key_id)?;
-        if self.issued_at_unix_seconds < 0 || self.expires_at_unix_seconds < 0 {
-            return Err(ProtocolError::NegativeTimestamp);
-        }
-        if self.expires_at_unix_seconds <= self.issued_at_unix_seconds {
-            return Err(ProtocolError::InvalidChallengeWindow);
-        }
-        Ok(())
-    }
-}
-
-impl CanonicalEncode for CommitmentChallengePayload {
-    fn encode(&self, output: &mut Encoder) {
-        output.write_u16(1);
-        output.write_str(&self.issuer);
-        output.write_str(&self.key_id);
-        output.write_i64(self.issued_at_unix_seconds);
-        output.write_i64(self.expires_at_unix_seconds);
-        output.write_digest(&self.entropy);
-        output.write_digest(&self.problem_digest);
-        output.write_digest(&self.validation_manifest_digest);
-        output.write_u16(self.protocol.wire_id());
-        output.write_digest(&self.commitment_digest);
-        output.write_u16(1);
-    }
-}
-
-impl SignedCommitmentChallenge {
-    pub fn sign(
-        payload: CommitmentChallengePayload,
-        signing_key: &SigningKey,
-    ) -> Result<Self, ProtocolError> {
-        payload.validate()?;
-        let message = signature_message(
-            COMMITMENT_CHALLENGE_SIGNATURE_DOMAIN,
-            &encode_to_vec(&payload),
-        );
-        let signature = signing_key.sign(&message);
-        Ok(Self {
-            payload,
-            signature: SignatureBytes(signature.to_bytes()),
-        })
-    }
-
-    pub fn verify(
-        &self,
-        verifying_key: &VerifyingKey,
-        expected_issuer: &str,
-        expected_key_id: &str,
-        now_unix_seconds: i64,
-        maximum_future_skew_seconds: i64,
-    ) -> Result<(), ProtocolError> {
-        self.payload.validate()?;
-        if now_unix_seconds < 0 {
-            return Err(ProtocolError::NegativeTimestamp);
-        }
-        if maximum_future_skew_seconds < 0 {
-            return Err(ProtocolError::InvalidClockSkew);
-        }
-        if self.payload.issuer != expected_issuer {
-            return Err(ProtocolError::IssuerMismatch);
-        }
-        if self.payload.key_id != expected_key_id {
-            return Err(ProtocolError::KeyIdMismatch);
-        }
-        if self.payload.issued_at_unix_seconds
-            > now_unix_seconds.saturating_add(maximum_future_skew_seconds)
-        {
-            return Err(ProtocolError::ChallengeFromFuture);
-        }
-        if now_unix_seconds > self.payload.expires_at_unix_seconds {
-            return Err(ProtocolError::ChallengeExpired(
-                self.payload.expires_at_unix_seconds,
-            ));
-        }
-        let message = signature_message(
-            COMMITMENT_CHALLENGE_SIGNATURE_DOMAIN,
-            &encode_to_vec(&self.payload),
-        );
-        let signature = Signature::from_bytes(self.signature.as_bytes());
-        verifying_key
-            .verify_strict(&message, &signature)
-            .map_err(|_| ProtocolError::InvalidSignature)
-    }
-
-    #[must_use]
-    pub fn digest(&self) -> Digest {
-        domain_separated_digest(
-            COMMITMENT_CHALLENGE_DIGEST_DOMAIN,
-            &self.to_canonical_bytes(),
-        )
-    }
-
-    #[must_use]
-    pub fn to_canonical_bytes(&self) -> Vec<u8> {
-        let mut output = Encoder::with_capacity(384);
-        self.payload.encode(&mut output);
-        output.write_fixed_bytes(self.signature.as_bytes());
-        output.into_bytes()
-    }
-
-    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        let limits = DecodeLimits {
-            max_input_bytes: MAX_COMMITMENT_CHALLENGE_BYTES,
-            max_field_bytes: MAX_ID_BYTES,
-        };
-        let mut input = Reader::new(bytes, limits)
-            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
-        let schema = input
-            .read_u16()
-            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
-        if schema != 1 {
-            return Err(ProtocolError::Canonical(format!(
-                "unsupported commitment-challenge schema tag {schema}"
-            )));
-        }
-        let issuer = input
-            .read_str()
-            .map_err(|error| ProtocolError::Canonical(error.to_string()))?
-            .to_owned();
-        let key_id = input
-            .read_str()
-            .map_err(|error| ProtocolError::Canonical(error.to_string()))?
-            .to_owned();
-        let issued_at_unix_seconds = input
-            .read_i64()
-            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
-        let expires_at_unix_seconds = input
-            .read_i64()
-            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
-        let entropy = input
-            .read_digest()
-            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
-        let problem_digest = input
-            .read_digest()
-            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
-        let validation_manifest_digest = input
-            .read_digest()
-            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
-        let protocol = ProofProtocol::from_wire_id(
-            input
-                .read_u16()
-                .map_err(|error| ProtocolError::Canonical(error.to_string()))?,
-        )
-        .ok_or_else(|| ProtocolError::Canonical("unsupported proof protocol".to_owned()))?;
-        let commitment_digest = input
-            .read_digest()
-            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
-        let retry = input
-            .read_u16()
-            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
-        if retry != 1 {
-            return Err(ProtocolError::Canonical(format!(
-                "unsupported retry-policy tag {retry}"
-            )));
-        }
-        let signature = input
-            .read_array::<64>()
-            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
-        input
-            .finish()
-            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
-        let challenge = Self {
-            payload: CommitmentChallengePayload {
-                schema: CommitmentChallengeSchema::V1,
-                issuer,
-                key_id,
-                issued_at_unix_seconds,
-                expires_at_unix_seconds,
-                entropy,
-                problem_digest,
-                validation_manifest_digest,
-                protocol,
-                commitment_digest,
-                retry_policy: RetryPolicy::ReplayAllowedV1,
-            },
-            signature: SignatureBytes(signature),
-        };
-        challenge.payload.validate()?;
-        Ok(challenge)
-    }
-}
-
 impl ValidationManifest {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.max_solution_elements == 0
@@ -913,7 +668,7 @@ impl CertifiedScore {
                 }
             }
             (
-                ProofProtocol::FastBinary64UnitCircleV2,
+                ProofProtocol::FastBinary64UnitCircleV3,
                 Self::FastBinary64SquaredL2V1 {
                     squared_l2,
                     consistency,
@@ -958,18 +713,11 @@ impl CanonicalEncode for CertifiedScore {
 
 impl CanonicalEncode for CertificatePayload {
     fn encode(&self, output: &mut Encoder) {
-        output.write_u16(2);
+        output.write_u16(3);
         output.write_str(&self.issuer);
         output.write_str(&self.key_id);
         output.write_i64(self.issued_at_unix_seconds);
-        output.write_bool(self.challenge_digest.is_some());
-        if let Some(digest) = self.challenge_digest {
-            output.write_digest(&digest);
-        }
-        output.write_bool(self.commitment_challenge_digest.is_some());
-        if let Some(digest) = self.commitment_challenge_digest {
-            output.write_digest(&digest);
-        }
+        output.write_digest(&self.challenge_digest);
         output.write_digest(&self.problem_digest);
         output.write_digest(&self.validation_manifest_digest);
         output.write_digest(&self.proof_digest);
@@ -1030,18 +778,6 @@ impl CertificatePayload {
         if self.issued_at_unix_seconds < 0 {
             return Err(ProtocolError::NegativeTimestamp);
         }
-        if self.challenge_digest.is_none()
-            || matches!(
-                (self.protocol, self.commitment_challenge_digest),
-                (ProofProtocol::FastBinary64UnitCircleV2, None)
-                    | (
-                        ProofProtocol::DirectReferenceV1 | ProofProtocol::WhirField192L2V4,
-                        Some(_)
-                    )
-            )
-        {
-            return Err(ProtocolError::CertificateProvenanceMismatch);
-        }
         self.score.validate_for(self.protocol)
     }
 }
@@ -1099,38 +835,13 @@ mod tests {
     }
 
     #[test]
-    fn post_commit_challenge_binds_statement_backend_and_commitment() {
-        let key = signing_key();
-        let payload = CommitmentChallengePayload {
-            schema: CommitmentChallengeSchema::V1,
-            issuer: "test-issuer".to_owned(),
-            key_id: "test-key".to_owned(),
-            issued_at_unix_seconds: 1_000,
-            expires_at_unix_seconds: 2_000,
-            entropy: Digest::from_bytes([1; 32]),
-            problem_digest: Digest::from_bytes([2; 32]),
-            validation_manifest_digest: Digest::from_bytes([3; 32]),
-            protocol: ProofProtocol::FastBinary64UnitCircleV2,
-            commitment_digest: Digest::from_bytes([4; 32]),
-            retry_policy: RetryPolicy::ReplayAllowedV1,
-        };
-        let challenge = SignedCommitmentChallenge::sign(payload, &key).unwrap();
-        challenge
-            .verify(&key.verifying_key(), "test-issuer", "test-key", 1_500, 5)
-            .unwrap();
-        let encoded = challenge.to_canonical_bytes();
+    fn fast_v3_has_a_fresh_wire_id() {
+        assert_eq!(ProofProtocol::FastBinary64UnitCircleV3.wire_id(), 4);
         assert_eq!(
-            SignedCommitmentChallenge::from_canonical_bytes(&encoded).unwrap(),
-            challenge
+            ProofProtocol::from_wire_id(4),
+            Some(ProofProtocol::FastBinary64UnitCircleV3)
         );
-
-        let mut changed = challenge.clone();
-        changed.payload.commitment_digest = Digest::from_bytes([9; 32]);
-        assert!(
-            changed
-                .verify(&key.verifying_key(), "test-issuer", "test-key", 1_500, 5,)
-                .is_err()
-        );
+        assert_eq!(ProofProtocol::from_wire_id(3), None);
     }
 
     #[test]
@@ -1177,12 +888,11 @@ mod tests {
     fn certificate_signatures_bind_metrics_and_provenance() {
         let key = signing_key();
         let payload = CertificatePayload {
-            schema: CertificateSchema::V2,
+            schema: CertificateSchema::V3,
             issuer: "test-issuer".to_owned(),
             key_id: "test-key".to_owned(),
             issued_at_unix_seconds: 1_500,
-            challenge_digest: Some(Digest::from_bytes([1; 32])),
-            commitment_challenge_digest: None,
+            challenge_digest: Digest::from_bytes([1; 32]),
             problem_digest: Digest::from_bytes([2; 32]),
             validation_manifest_digest: Digest::from_bytes([3; 32]),
             proof_digest: Digest::from_bytes([4; 32]),
@@ -1201,6 +911,10 @@ mod tests {
         certificate
             .verify(&key.verifying_key(), "test-issuer", "test-key")
             .unwrap();
+        assert_eq!(
+            &encode_to_vec(&certificate.payload)[..2],
+            &3_u16.to_be_bytes()
+        );
 
         let mut changed = certificate.clone();
         changed.payload.score = CertifiedScore::DirectBinary64ResidualV1 {

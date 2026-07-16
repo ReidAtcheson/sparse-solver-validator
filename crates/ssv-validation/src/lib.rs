@@ -114,8 +114,10 @@ pub enum ValidationError {
 
 /// Common proving/verification contract for a complete backend.
 ///
-/// Commitment-first protocols add [`PrecommitBackend`]. Their backend-specific
-/// context carries the independently authenticated post-commit challenge.
+/// Commitment-first protocols may add [`PrecommitBackend`] when exposing the
+/// commitment as a separate local computation stage is useful. Whether that
+/// commitment is followed by Fiat--Shamir or interaction is a property of the
+/// concrete backend, not this common statement/framing layer.
 pub trait ValidationBackend {
     type ProverContext;
     type ProverReport;
@@ -163,7 +165,11 @@ pub trait ReferenceValidationBackend {
     ) -> Result<Self::VerifierReport, Self::Error>;
 }
 
-/// Additional lifecycle stage for protocols that must commit before a nonce.
+/// Optional local lifecycle stage for protocols that commit before proving.
+///
+/// A commitment returned here need not cross a trust boundary. In particular,
+/// a noninteractive backend can absorb it into its Fiat--Shamir transcript and
+/// expose this stage only for memory accounting, checkpointing, or tooling.
 pub trait PrecommitBackend: ValidationBackend {
     type Commitment;
     type CommitmentReport;
@@ -559,7 +565,7 @@ mod tests {
         for protocol in [
             ProofProtocol::DirectReferenceV1,
             ProofProtocol::WhirField192L2V4,
-            ProofProtocol::FastBinary64UnitCircleV2,
+            ProofProtocol::FastBinary64UnitCircleV3,
         ] {
             let statement = statement(protocol);
             let encoded = encode_artifact(&statement, &[1, 2, 3]).unwrap();

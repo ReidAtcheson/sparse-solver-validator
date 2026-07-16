@@ -22,9 +22,7 @@ use ssv_problem::{
     SuccinctPublicEvaluator,
 };
 use ssv_relation::{FixedWitness, RelationError};
-use ssv_service_protocol::{
-    MAX_COMMITMENT_CHALLENGE_BYTES, ProofProtocol, ProtocolError, SignedCommitmentChallenge,
-};
+use ssv_service_protocol::ProofProtocol;
 use ssv_solution::Solution;
 use ssv_validation::{PrecommitBackend, PublicStatement, ValidationBackend, VerifierStatement};
 use thiserror::Error;
@@ -49,54 +47,26 @@ use crate::transcript::{Transcript, TranscriptError};
 use crate::unit_circle::{ComplexValue, UnitCircleCodeword, UnitCircleError, fold_pair_at_index};
 
 const PRECOMMIT_MAGIC: &[u8; 8] = b"SSVFCM\0\0";
-const PRECOMMIT_VERSION: u16 = 3;
+const PRECOMMIT_VERSION: u16 = 4;
 const PAYLOAD_MAGIC: &[u8; 8] = b"SSVFST\0\0";
-const PAYLOAD_VERSION: u16 = 3;
-const PROOF_VERSION: u16 = 3;
+const PAYLOAD_VERSION: u16 = 4;
+const PROOF_VERSION: u16 = 4;
 const FINAL_FRAME: u16 = u16::MAX;
-const PRECOMMIT_DIGEST_DOMAIN: &[u8] = b"sparse-solve/fast-precommitment/v3";
-const PAYLOAD_DIGEST_DOMAIN: &[u8] = b"sparse-solve/fast-backend-payload/v3";
-const OFFLINE_NONCE_DOMAIN: &[u8] = b"sparse-solve/fast-offline-fiat-shamir-nonce/v1";
-const PROTOCOL_LABEL: &[u8] = b"sparse-solve/fast/coefficient-unit-circle-linear-opening/v3";
+const PRECOMMIT_DIGEST_DOMAIN: &[u8] = b"sparse-solve/fast-precommitment/v4";
+const PAYLOAD_DIGEST_DOMAIN: &[u8] = b"sparse-solve/fast-backend-payload/v4";
+const PROTOCOL_LABEL: &[u8] = b"sparse-solve/fast/coefficient-unit-circle-linear-opening/v4";
 const PUBLIC_EVALUATOR_ID: &[u8] = b"ssv-problem/succinct-public-evaluator/msb-mle/v1";
 const FLOAT_CONTRACT: &[u8] =
     b"binary64/rne/no-fma/reject-nan-inf-negzero-subnormal/unit-circle-coeff/v2";
 const CODE_BASIS: &[u8] =
     b"packed-[x||R]/msb-mle/bit-reversed-monomial-coefficients/unit-circle-rate-1/2";
-const ORACLE_TREE_LABEL: &[u8] = b"ssv-fast/v3/packed-unit-circle-oracle";
+const ORACLE_TREE_LABEL: &[u8] = b"ssv-fast/v4/packed-unit-circle-oracle";
 const MAX_PRECOMMITMENT_BYTES: usize = 4096;
 const MAX_PROOF_BYTES: usize = ssv_validation::MAX_SUCCINCT_PAYLOAD_BYTES;
 
-/// Explicit source of the challenge issued after the packed oracle is fixed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FastNonceMode {
-    /// A service records the precommitment and signs fresh entropy and time.
-    ExternalSigned,
-    /// The initial nonce is derived from the precommitment itself.  This mode
-    /// has no external timestamp and offers weaker practical grinding defense.
-    OfflineFiatShamir,
-}
-
-impl FastNonceMode {
-    const fn wire_id(self) -> u16 {
-        match self {
-            Self::ExternalSigned => 1,
-            Self::OfflineFiatShamir => 2,
-        }
-    }
-
-    const fn from_wire_id(value: u16) -> Option<Self> {
-        match value {
-            1 => Some(Self::ExternalSigned),
-            2 => Some(Self::OfflineFiatShamir),
-            _ => None,
-        }
-    }
-}
-
 /// Digests of the exact and binary64 sources used to create the packed oracle.
 ///
-/// They are timestamp/linkage metadata.  Soundness of the query-only verifier
+/// They are statement/linkage metadata. Soundness of the query-only verifier
 /// comes from the packed root and the linear opening, not from trusting these
 /// digest labels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -185,7 +155,6 @@ impl EvaluatorBinding {
 /// Canonical commitment fixed before the first algebraic challenge exists.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FastPrecommitment {
-    nonce_mode: FastNonceMode,
     statement_digest: Digest,
     problem_digest: Digest,
     manifest_digest: Digest,
@@ -198,11 +167,6 @@ pub struct FastPrecommitment {
 }
 
 impl FastPrecommitment {
-    #[must_use]
-    pub const fn nonce_mode(&self) -> FastNonceMode {
-        self.nonce_mode
-    }
-
     #[must_use]
     pub const fn logical_len(&self) -> usize {
         self.evaluator.logical_dimension
@@ -239,8 +203,7 @@ impl FastPrecommitment {
         let mut output = Encoder::with_capacity(384);
         output.write_fixed_bytes(PRECOMMIT_MAGIC);
         output.write_u16(PRECOMMIT_VERSION);
-        output.write_u16(ProofProtocol::FastBinary64UnitCircleV2.wire_id());
-        output.write_u16(self.nonce_mode.wire_id());
+        output.write_u16(ProofProtocol::FastBinary64UnitCircleV3.wire_id());
         output.write_u16(policy.policy_id);
         output.write_u64(policy.numeric_absolute_bits);
         output.write_u64(policy.numeric_relative_bits);
@@ -278,12 +241,10 @@ impl FastPrecommitment {
         }
         if input.read_u16().map_err(framing)? != PRECOMMIT_VERSION
             || input.read_u16().map_err(framing)?
-                != ProofProtocol::FastBinary64UnitCircleV2.wire_id()
+                != ProofProtocol::FastBinary64UnitCircleV3.wire_id()
         {
             return Err(FastError::UnsupportedVersion);
         }
-        let nonce_mode = FastNonceMode::from_wire_id(input.read_u16().map_err(framing)?)
-            .ok_or(FastError::UnsupportedVersion)?;
         let expected = POLICY_2.transcript_parameters();
         let policy = (
             input.read_u16().map_err(framing)?,
@@ -346,7 +307,6 @@ impl FastPrecommitment {
             return Err(FastError::TranscriptShape);
         }
         Ok(Self {
-            nonce_mode,
             statement_digest,
             problem_digest,
             manifest_digest,
@@ -360,41 +320,31 @@ impl FastPrecommitment {
     }
 }
 
-/// Post-commit context supplied to the prover.
+/// Locally staged commitment supplied to the noninteractive prover.
+///
+/// The commitment is fixed before any algebraic challenge. Every challenge is
+/// then derived by Fiat--Shamir from the public statement and transcript prefix;
+/// there is no backend-specific postcommit nonce or challenge mode.
 #[derive(Clone, Debug)]
-pub enum FastProverContext {
-    ExternalSigned {
-        commitment: FastPrecommitment,
-        challenge: Box<SignedCommitmentChallenge>,
-    },
-    OfflineFiatShamir {
-        commitment: FastPrecommitment,
-    },
+pub struct FastProverContext {
+    commitment: FastPrecommitment,
 }
 
 impl FastProverContext {
     #[must_use]
-    pub fn external_signed(
-        commitment: FastPrecommitment,
-        challenge: SignedCommitmentChallenge,
-    ) -> Self {
-        Self::ExternalSigned {
-            commitment,
-            challenge: Box::new(challenge),
-        }
+    pub const fn new(commitment: FastPrecommitment) -> Self {
+        Self { commitment }
     }
 
     #[must_use]
-    pub fn offline_fiat_shamir(commitment: FastPrecommitment) -> Self {
-        Self::OfflineFiatShamir { commitment }
+    pub const fn commitment(&self) -> &FastPrecommitment {
+        &self.commitment
     }
+}
 
-    const fn commitment(&self) -> &FastPrecommitment {
-        match self {
-            Self::ExternalSigned { commitment, .. } | Self::OfflineFiatShamir { commitment } => {
-                commitment
-            }
-        }
+impl From<FastPrecommitment> for FastProverContext {
+    fn from(commitment: FastPrecommitment) -> Self {
+        Self::new(commitment)
     }
 }
 
@@ -405,7 +355,6 @@ pub struct FastCommitmentReport {
     pub packed_codeword_root: MerkleRoot,
     pub logical_len: usize,
     pub codeword_len: usize,
-    pub nonce_mode: FastNonceMode,
 }
 
 #[derive(Clone, Debug)]
@@ -423,19 +372,15 @@ pub struct FastProverReport {
     pub nonzeros_scanned: u64,
 }
 
-/// Cheap, bounded authentication preflight for hosted validators.
+/// Cheap, bounded framing and statement-binding preflight for validators.
 ///
-/// This validates strict outer framing, the complete precommitment, nonce-mode
-/// consistency, public-statement binding, and commitment-challenge linkage. It
-/// deliberately does not decode or execute sumchecks and Merkle queries.  A
-/// service can authenticate the returned signed challenge before spending
-/// work on [`FastBackend::verify`].
+/// This validates strict outer framing and the complete precommitment against
+/// the public statement. It deliberately does not decode or execute sumchecks
+/// and Merkle queries.
 #[derive(Clone, Debug)]
 pub struct FastPreflight {
     pub payload_digest: Digest,
     pub precommitment_digest: Digest,
-    pub nonce_mode: FastNonceMode,
-    pub external_challenge: Option<SignedCommitmentChallenge>,
 }
 
 /// Verifier work counters make the succinctness boundary testable.
@@ -459,17 +404,14 @@ pub struct FastVerifierWork {
 
 /// Structurally authenticated metric result.
 ///
-/// A result is returned even when numerical defects exceed policy.  The
-/// certification layer must call [`Self::passes_policy`] and separately
-/// authenticate/freshness-check an external challenge before signing a result.
+/// A result is returned even when numerical defects exceed policy. The
+/// certification layer must call [`Self::passes_policy`] before accepting it.
 #[derive(Clone, Debug)]
 pub struct FastVerifierReport {
     pub payload_digest: Digest,
     pub precommitment_digest: Digest,
     pub sources: FastSourceDigests,
     pub packed_codeword_root: MerkleRoot,
-    pub nonce_mode: FastNonceMode,
-    pub external_challenge: Option<SignedCommitmentChallenge>,
     pub score: FastValidationScore,
     pub work: FastVerifierWork,
 }
@@ -483,11 +425,11 @@ impl FastVerifierReport {
 
 #[derive(Debug, Error)]
 pub enum FastError {
-    #[error("fast backend requires fast-binary64-unit-circle-v2")]
+    #[error("fast backend requires fast-binary64-unit-circle-v3")]
     WrongProtocol,
     #[error("fast artifact has an unrecognized magic value")]
     BadMagic,
-    #[error("unsupported fast precommitment, payload, policy, mode, or frame version")]
+    #[error("unsupported fast precommitment, payload, policy, or frame version")]
     UnsupportedVersion,
     #[error("fast artifact framing is invalid: {0}")]
     Framing(String),
@@ -499,10 +441,6 @@ pub enum FastError {
     EvaluatorMismatch,
     #[error("fast precommitment does not match the supplied solution")]
     PrecommitmentMismatch,
-    #[error("signed commitment challenge does not match statement, backend, or commitment")]
-    CommitmentChallengeMismatch,
-    #[error("fast precommitment and post-commit nonce modes disagree")]
-    NonceModeMismatch,
     #[error("fast policy parameters differ from frozen policy 2")]
     PolicyMismatch,
     #[error("fast transcript shape is inconsistent with the public statement")]
@@ -523,8 +461,6 @@ pub enum FastError {
     Transcript(#[from] TranscriptError),
     #[error("registered public evaluator failed: {0}")]
     PublicEvaluator(#[from] MleEvaluationError),
-    #[error("commitment challenge is malformed: {0}")]
-    ServiceProtocol(#[from] ProtocolError),
     #[error("binary64 protocol arithmetic produced a non-finite value")]
     NonFiniteComputation,
 }
@@ -581,27 +517,20 @@ struct DecodedPreflight<'a> {
 }
 
 impl FastBackend {
-    /// Builds an offline precommitment.  The trait-level [`PrecommitBackend`]
-    /// entry point deliberately defaults to the externally challenged mode.
-    pub fn commit_offline(
+    /// Fixes the packed oracle before any Fiat--Shamir challenge is derived.
+    ///
+    /// Proof construction remains a separate deterministic stage so callers
+    /// may persist or inspect the commitment without introducing an external
+    /// challenge lifecycle.
+    pub fn commit(
         statement: &PublicStatement,
         solution: &Solution,
     ) -> Result<(FastPrecommitment, FastCommitmentReport), FastError> {
-        commit_with_mode(statement, solution, FastNonceMode::OfflineFiatShamir)
+        commit_backend(statement, solution)
     }
 
-    /// Builds a precommitment with an explicit nonce lifecycle.
-    pub fn commit_with_mode(
-        statement: &PublicStatement,
-        solution: &Solution,
-        nonce_mode: FastNonceMode,
-    ) -> Result<(FastPrecommitment, FastCommitmentReport), FastError> {
-        commit_with_mode(statement, solution, nonce_mode)
-    }
-
-    /// Performs cheap framing and authentication preflight before algebraic
-    /// verification.  The returned external token still needs issuer-key and
-    /// freshness authentication by the application.
+    /// Performs cheap framing and statement-binding preflight before
+    /// algebraic verification.
     pub fn preflight(
         statement: &VerifierStatement<'_>,
         payload: &[u8],
@@ -616,7 +545,7 @@ impl ValidationBackend for FastBackend {
     type VerifierReport = FastVerifierReport;
     type Error = FastError;
 
-    const PROTOCOL: ProofProtocol = ProofProtocol::FastBinary64UnitCircleV2;
+    const PROTOCOL: ProofProtocol = ProofProtocol::FastBinary64UnitCircleV3;
 
     fn prove(
         statement: &PublicStatement,
@@ -642,14 +571,13 @@ impl PrecommitBackend for FastBackend {
         statement: &PublicStatement,
         solution: &Solution,
     ) -> Result<(Self::Commitment, Self::CommitmentReport), Self::Error> {
-        commit_with_mode(statement, solution, FastNonceMode::ExternalSigned)
+        commit_backend(statement, solution)
     }
 }
 
-fn commit_with_mode(
+fn commit_backend(
     statement: &PublicStatement,
     solution: &Solution,
-    nonce_mode: FastNonceMode,
 ) -> Result<(FastPrecommitment, FastCommitmentReport), FastError> {
     validate_prover_statement(statement)?;
     let material = prepare_material(statement.generated(), solution)?;
@@ -660,7 +588,6 @@ fn commit_with_mode(
         statement.problem_digest(),
         statement.manifest_digest(),
         evaluator,
-        nonce_mode,
         &material,
     )?;
     let report = FastCommitmentReport {
@@ -669,7 +596,6 @@ fn commit_with_mode(
         packed_codeword_root: commitment.packed_codeword_root,
         logical_len: commitment.logical_len(),
         codeword_len: commitment.codeword_len,
-        nonce_mode,
     };
     Ok((commitment, report))
 }
@@ -687,37 +613,12 @@ fn prove_backend(
         statement.problem_digest(),
         statement.manifest_digest(),
         EvaluatorBinding::from_metadata(statement.generated().public_evaluation_plan().metadata())?,
-        commitment.nonce_mode,
         &material,
     )?;
     if commitment != &expected {
         return Err(FastError::PrecommitmentMismatch);
     }
-    let external_challenge = match context {
-        FastProverContext::ExternalSigned {
-            challenge,
-            commitment: _,
-        } => {
-            if commitment.nonce_mode != FastNonceMode::ExternalSigned {
-                return Err(FastError::NonceModeMismatch);
-            }
-            validate_external_challenge(
-                statement.problem_digest(),
-                statement.manifest_digest(),
-                commitment,
-                challenge,
-            )?;
-            Some(challenge.as_ref())
-        }
-        FastProverContext::OfflineFiatShamir { .. } => {
-            if commitment.nonce_mode != FastNonceMode::OfflineFiatShamir {
-                return Err(FastError::NonceModeMismatch);
-            }
-            None
-        }
-    };
-
-    let mut transcript = initialize_transcript(commitment, external_challenge)?;
+    let mut transcript = initialize_transcript(commitment)?;
 
     // The norm endpoint is reused as the row-compression point, authenticating
     // one residual MLE value for both application relations.
@@ -874,7 +775,7 @@ fn prove_backend(
         folding,
     };
     let proof_bytes = encode_proof(&proof)?;
-    let payload = encode_backend_payload(commitment, external_challenge, &proof_bytes)?;
+    let payload = encode_backend_payload(commitment, &proof_bytes)?;
     if payload.len() > MAX_PROOF_BYTES {
         return Err(FastError::ResourceLimit);
     }
@@ -914,8 +815,7 @@ fn verify_backend(
     let padded_len = commitment.evaluator.padded_dimension;
     let variables = commitment.evaluator.variables;
     let opening_variables = variables + 1;
-    let mut transcript =
-        initialize_transcript(&commitment, preflight.report.external_challenge.as_ref())?;
+    let mut transcript = initialize_transcript(&commitment)?;
 
     if proof.residual_squared_l2 < 0.0 {
         return Err(FastError::TranscriptShape);
@@ -1110,8 +1010,6 @@ fn verify_backend(
         precommitment_digest: preflight.report.precommitment_digest,
         sources: commitment.sources,
         packed_codeword_root: commitment.packed_codeword_root,
-        nonce_mode: preflight.report.nonce_mode,
-        external_challenge: preflight.report.external_challenge,
         score,
         work,
     })
@@ -1121,13 +1019,13 @@ fn preflight_backend<'a>(
     statement: &VerifierStatement<'_>,
     payload_bytes: &'a [u8],
 ) -> Result<DecodedPreflight<'a>, FastError> {
-    if statement.protocol() != ProofProtocol::FastBinary64UnitCircleV2 {
+    if statement.protocol() != ProofProtocol::FastBinary64UnitCircleV3 {
         return Err(FastError::WrongProtocol);
     }
     if payload_bytes.len() > MAX_PROOF_BYTES {
         return Err(FastError::ResourceLimit);
     }
-    let (commitment, external_challenge, proof_bytes) = decode_backend_payload(payload_bytes)?;
+    let (commitment, proof_bytes) = decode_backend_payload(payload_bytes)?;
     let expected_evaluator =
         EvaluatorBinding::from_metadata(statement.public_evaluator().metadata())?;
     if commitment.statement_digest != statement.transcript_digest()
@@ -1138,22 +1036,10 @@ fn preflight_backend<'a>(
     {
         return Err(FastError::StatementMismatch);
     }
-    match (commitment.nonce_mode, external_challenge.as_ref()) {
-        (FastNonceMode::ExternalSigned, Some(challenge)) => validate_external_challenge(
-            statement.problem_digest(),
-            statement.manifest_digest(),
-            &commitment,
-            challenge,
-        )?,
-        (FastNonceMode::OfflineFiatShamir, None) => {}
-        _ => return Err(FastError::NonceModeMismatch),
-    }
     Ok(DecodedPreflight {
         report: FastPreflight {
             payload_digest: domain_separated_digest(PAYLOAD_DIGEST_DOMAIN, payload_bytes),
             precommitment_digest: commitment.digest(),
-            nonce_mode: commitment.nonce_mode,
-            external_challenge,
         },
         commitment,
         proof_bytes,
@@ -1161,7 +1047,7 @@ fn preflight_backend<'a>(
 }
 
 fn validate_prover_statement(statement: &PublicStatement) -> Result<(), FastError> {
-    if statement.manifest().protocol != ProofProtocol::FastBinary64UnitCircleV2 {
+    if statement.manifest().protocol != ProofProtocol::FastBinary64UnitCircleV3 {
         return Err(FastError::WrongProtocol);
     }
     validate_length(statement.generated().dimension())
@@ -1183,7 +1069,6 @@ fn make_precommitment(
     problem_digest: Digest,
     manifest_digest: Digest,
     evaluator: EvaluatorBinding,
-    nonce_mode: FastNonceMode,
     material: &PreparedMaterial,
 ) -> Result<FastPrecommitment, FastError> {
     if evaluator.logical_dimension != material.logical_len
@@ -1197,7 +1082,6 @@ fn make_precommitment(
         .ok_or(FastError::TranscriptShape)?;
     let codeword_len = material.codeword.evaluations().len();
     let commitment = FastPrecommitment {
-        nonce_mode,
         statement_digest,
         problem_digest,
         manifest_digest,
@@ -1313,48 +1197,21 @@ fn prepare_matvec_tables(
     })
 }
 
-fn validate_external_challenge(
-    problem_digest: Digest,
-    manifest_digest: Digest,
-    commitment: &FastPrecommitment,
-    challenge: &SignedCommitmentChallenge,
-) -> Result<(), FastError> {
-    challenge.payload.validate()?;
-    if challenge.payload.problem_digest != problem_digest
-        || challenge.payload.validation_manifest_digest != manifest_digest
-        || challenge.payload.protocol != ProofProtocol::FastBinary64UnitCircleV2
-        || challenge.payload.commitment_digest != commitment.digest()
-    {
-        return Err(FastError::CommitmentChallengeMismatch);
-    }
-    Ok(())
-}
-
-fn initialize_transcript(
-    commitment: &FastPrecommitment,
-    external_challenge: Option<&SignedCommitmentChallenge>,
-) -> Result<Transcript, FastError> {
+fn initialize_transcript(commitment: &FastPrecommitment) -> Result<Transcript, FastError> {
     let commitment_bytes = commitment.try_to_bytes()?;
     let mut transcript = Transcript::new(PROTOCOL_LABEL);
+    // The semantic public statement is fixed independently (and may carry the
+    // application's signed problem provenance). Absorb it before the packed
+    // oracle commitment so every subsequent challenge has the canonical
+    // noninteractive order `statement -> commitment -> prover message`.
+    transcript.absorb_bytes(
+        b"public-statement-digest",
+        commitment.statement_digest.as_bytes(),
+    );
     transcript.absorb_bytes(b"canonical-precommitment", &commitment_bytes);
     transcript.absorb_bytes(b"precommitment-digest", commitment.digest().as_bytes());
     transcript.absorb_bytes(b"code-basis", CODE_BASIS);
     transcript.absorb_bytes(b"float-contract", FLOAT_CONTRACT);
-    match (commitment.nonce_mode, external_challenge) {
-        (FastNonceMode::ExternalSigned, Some(challenge)) => {
-            transcript.absorb_u64(b"nonce-mode", 1);
-            transcript.absorb_bytes(
-                b"signed-commitment-challenge",
-                &challenge.to_canonical_bytes(),
-            );
-        }
-        (FastNonceMode::OfflineFiatShamir, None) => {
-            transcript.absorb_u64(b"nonce-mode", 2);
-            let nonce = domain_separated_digest(OFFLINE_NONCE_DOMAIN, &commitment_bytes);
-            transcript.absorb_bytes(b"offline-fiat-shamir-nonce", nonce.as_bytes());
-        }
-        _ => return Err(FastError::NonceModeMismatch),
-    }
     Ok(transcript)
 }
 
@@ -1689,30 +1546,16 @@ fn draw_unique_indices(
 
 fn encode_backend_payload(
     commitment: &FastPrecommitment,
-    external_challenge: Option<&SignedCommitmentChallenge>,
     proof: &[u8],
 ) -> Result<Vec<u8>, FastError> {
     let commitment_bytes = commitment.try_to_bytes()?;
-    let challenge_bytes = external_challenge
-        .map(SignedCommitmentChallenge::to_canonical_bytes)
-        .unwrap_or_default();
-    if commitment_bytes.len() > MAX_PRECOMMITMENT_BYTES
-        || challenge_bytes.len() > MAX_COMMITMENT_CHALLENGE_BYTES
-        || proof.len() > MAX_PROOF_BYTES
-    {
+    if commitment_bytes.len() > MAX_PRECOMMITMENT_BYTES || proof.len() > MAX_PROOF_BYTES {
         return Err(FastError::ResourceLimit);
     }
-    match (commitment.nonce_mode, challenge_bytes.is_empty()) {
-        (FastNonceMode::ExternalSigned, false) | (FastNonceMode::OfflineFiatShamir, true) => {}
-        _ => return Err(FastError::NonceModeMismatch),
-    }
-    let mut output =
-        Encoder::with_capacity(commitment_bytes.len() + challenge_bytes.len() + proof.len() + 64);
+    let mut output = Encoder::with_capacity(commitment_bytes.len() + proof.len() + 64);
     output.write_fixed_bytes(PAYLOAD_MAGIC);
     output.write_u16(PAYLOAD_VERSION);
-    output.write_u16(commitment.nonce_mode.wire_id());
     output.write_bytes(&commitment_bytes);
-    output.write_bytes(&challenge_bytes);
     output.write_bytes(proof);
     output.write_u16(FINAL_FRAME);
     output.write_u16(PAYLOAD_VERSION);
@@ -1723,9 +1566,7 @@ fn encode_backend_payload(
     Ok(payload)
 }
 
-fn decode_backend_payload(
-    bytes: &[u8],
-) -> Result<(FastPrecommitment, Option<SignedCommitmentChallenge>, &[u8]), FastError> {
+fn decode_backend_payload(bytes: &[u8]) -> Result<(FastPrecommitment, &[u8]), FastError> {
     let limits = DecodeLimits::new(MAX_PROOF_BYTES, MAX_PROOF_BYTES);
     let mut input = Reader::new(bytes, limits).map_err(framing)?;
     if input
@@ -1738,27 +1579,11 @@ fn decode_backend_payload(
     if input.read_u16().map_err(framing)? != PAYLOAD_VERSION {
         return Err(FastError::UnsupportedVersion);
     }
-    let mode = FastNonceMode::from_wire_id(input.read_u16().map_err(framing)?)
-        .ok_or(FastError::UnsupportedVersion)?;
     let commitment_bytes = input.read_bytes().map_err(framing)?;
     if commitment_bytes.len() > MAX_PRECOMMITMENT_BYTES {
         return Err(FastError::ResourceLimit);
     }
     let commitment = FastPrecommitment::from_bytes(commitment_bytes)?;
-    if commitment.nonce_mode != mode {
-        return Err(FastError::NonceModeMismatch);
-    }
-    let challenge_bytes = input.read_bytes().map_err(framing)?;
-    if challenge_bytes.len() > MAX_COMMITMENT_CHALLENGE_BYTES {
-        return Err(FastError::ResourceLimit);
-    }
-    let challenge = if challenge_bytes.is_empty() {
-        None
-    } else {
-        Some(SignedCommitmentChallenge::from_canonical_bytes(
-            challenge_bytes,
-        )?)
-    };
     let proof = input.read_bytes().map_err(framing)?;
     if input.read_u16().map_err(framing)? != FINAL_FRAME
         || input.read_u16().map_err(framing)? != PAYLOAD_VERSION
@@ -1766,11 +1591,7 @@ fn decode_backend_payload(
         return Err(FastError::UnsupportedVersion);
     }
     input.finish().map_err(framing)?;
-    match (mode, challenge.is_some()) {
-        (FastNonceMode::ExternalSigned, true) | (FastNonceMode::OfflineFiatShamir, false) => {}
-        _ => return Err(FastError::NonceModeMismatch),
-    }
-    Ok((commitment, challenge, proof))
+    Ok((commitment, proof))
 }
 
 fn encode_proof(proof: &FastProof) -> Result<Vec<u8>, FastError> {
@@ -1986,14 +1807,11 @@ fn framing(error: impl std::fmt::Display) -> FastError {
 
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::SigningKey;
     use ssv_problem::{
         BoundaryRule, DiagonalConstruction, InstanceSeed, MatrixSpec, OffDiagonalValues,
         ProblemTemplate, RequestedOutput, RhsSpec, TemplateRandomness, TemplateSchema,
     };
-    use ssv_service_protocol::{
-        CommitmentChallengePayload, CommitmentChallengeSchema, RetryPolicy, ValidationManifest,
-    };
+    use ssv_service_protocol::ValidationManifest;
 
     use super::*;
 
@@ -2022,7 +1840,7 @@ mod tests {
         let statement = PublicStatement::new(
             problem,
             ValidationManifest {
-                protocol: ProofProtocol::FastBinary64UnitCircleV2,
+                protocol: ProofProtocol::FastBinary64UnitCircleV3,
                 max_solution_elements: dimension as u64,
                 max_public_matrix_terms: 1024,
                 max_public_rhs_terms: 1024,
@@ -2035,22 +1853,20 @@ mod tests {
         (statement, solution)
     }
 
-    fn offline_round_trip(dimension: usize) -> (Vec<u8>, FastVerifierReport) {
+    fn round_trip(dimension: usize) -> (Vec<u8>, FastVerifierReport) {
         let (statement, solution) = fixture(dimension, 2);
-        let (commitment, _) = FastBackend::commit_offline(&statement, &solution).unwrap();
-        let context = FastProverContext::offline_fiat_shamir(commitment);
+        let (commitment, _) = FastBackend::commit(&statement, &solution).unwrap();
+        let context = FastProverContext::new(commitment);
         let (payload, _) = FastBackend::prove(&statement, &solution, &context).unwrap();
         let report = FastBackend::verify(&statement.verifier_statement(), &payload).unwrap();
         (payload, report)
     }
 
     #[test]
-    fn offline_query_only_backend_round_trips() {
+    fn noninteractive_query_only_backend_round_trips() {
         for dimension in [3, 5, 16] {
-            let (_, report) = offline_round_trip(dimension);
+            let (_, report) = round_trip(dimension);
             assert!(report.passes_policy(), "{:#?}", report.score);
-            assert_eq!(report.nonce_mode, FastNonceMode::OfflineFiatShamir);
-            assert!(report.external_challenge.is_none());
             assert_eq!(report.score.residual_squared_l2, 0.0);
             assert_eq!(report.work.generator_row_queries, 0);
             assert_eq!(report.work.solution_elements_materialized, 0);
@@ -2069,8 +1885,8 @@ mod tests {
     fn nonzero_residual_round_trip_checks_all_three_application_relations() {
         let (statement, _) = fixture(8, 2);
         let solution = Solution::new(vec![0.0; 8], 8).unwrap();
-        let (commitment, _) = FastBackend::commit_offline(&statement, &solution).unwrap();
-        let context = FastProverContext::offline_fiat_shamir(commitment);
+        let (commitment, _) = FastBackend::commit(&statement, &solution).unwrap();
+        let context = FastProverContext::new(commitment);
         let (payload, _) = FastBackend::prove(&statement, &solution, &context).unwrap();
         let report = FastBackend::verify(&statement.verifier_statement(), &payload).unwrap();
         assert!(report.passes_policy(), "{:#?}", report.score);
@@ -2092,8 +1908,8 @@ mod tests {
             Err(RelationError::ResidualOutOfRange { .. })
         ));
 
-        let (commitment, _) = FastBackend::commit_offline(&statement, &solution).unwrap();
-        let context = FastProverContext::offline_fiat_shamir(commitment);
+        let (commitment, _) = FastBackend::commit(&statement, &solution).unwrap();
+        let context = FastProverContext::new(commitment);
         let (payload, _) = FastBackend::prove(&statement, &solution, &context).unwrap();
         let report = FastBackend::verify(&statement.verifier_statement(), &payload).unwrap();
         assert!(report.passes_policy(), "{:#?}", report.score);
@@ -2101,43 +1917,61 @@ mod tests {
     }
 
     #[test]
-    fn external_signed_challenge_is_bound_and_returned_for_application_authentication() {
+    fn staged_fiat_shamir_is_deterministic_and_binds_statement_and_commitment() {
         let (statement, solution) = fixture(8, 2);
-        let (commitment, _) = FastBackend::commit(&statement, &solution).unwrap();
-        let challenge = SignedCommitmentChallenge::sign(
-            CommitmentChallengePayload {
-                schema: CommitmentChallengeSchema::V1,
-                issuer: "test-issuer".to_owned(),
-                key_id: "test-key".to_owned(),
-                issued_at_unix_seconds: 100,
-                expires_at_unix_seconds: 200,
-                entropy: Digest::from_bytes([9; 32]),
-                problem_digest: statement.problem_digest(),
-                validation_manifest_digest: statement.manifest_digest(),
-                protocol: ProofProtocol::FastBinary64UnitCircleV2,
-                commitment_digest: commitment.digest(),
-                retry_policy: RetryPolicy::ReplayAllowedV1,
-            },
-            &SigningKey::from_bytes(&[7; 32]),
-        )
-        .unwrap();
-        let context = FastProverContext::external_signed(commitment, challenge.clone());
+        let (commitment, commitment_report) = FastBackend::commit(&statement, &solution).unwrap();
+        let (same_commitment, same_report) = FastBackend::commit(&statement, &solution).unwrap();
+        assert_eq!(commitment, same_commitment);
+        assert_eq!(
+            commitment_report.precommitment_digest,
+            same_report.precommitment_digest
+        );
+
+        let context = FastProverContext::new(commitment.clone());
+        let same_context = FastProverContext::new(same_commitment);
         let (payload, _) = FastBackend::prove(&statement, &solution, &context).unwrap();
+        let (same_payload, _) = FastBackend::prove(&statement, &solution, &same_context).unwrap();
+        assert_eq!(payload, same_payload);
+
         let preflight = FastBackend::preflight(&statement.verifier_statement(), &payload).unwrap();
-        assert_eq!(preflight.nonce_mode, FastNonceMode::ExternalSigned);
-        assert_eq!(preflight.external_challenge, Some(challenge.clone()));
+        assert_eq!(preflight.precommitment_digest, commitment.digest());
         let report = FastBackend::verify(&statement.verifier_statement(), &payload).unwrap();
         assert!(report.passes_policy());
-        assert_eq!(report.nonce_mode, FastNonceMode::ExternalSigned);
-        assert_eq!(report.external_challenge, Some(challenge));
+
+        let first_challenge = initialize_transcript(&commitment)
+            .unwrap()
+            .challenge_dyadic_f64(b"binding-test")
+            .unwrap();
+        let mut changed_commitment = commitment.clone();
+        changed_commitment.packed_codeword_root[0] ^= 1;
+        let changed_commitment_first_challenge = initialize_transcript(&changed_commitment)
+            .unwrap()
+            .challenge_dyadic_f64(b"binding-test")
+            .unwrap();
+        assert_ne!(first_challenge, changed_commitment_first_challenge);
+
+        let mut changed_statement = commitment;
+        changed_statement.statement_digest = Digest::from_bytes([0x5a; 32]);
+        let changed_statement_challenge = initialize_transcript(&changed_statement)
+            .unwrap()
+            .challenge_dyadic_f64(b"binding-test")
+            .unwrap();
+        assert_ne!(first_challenge, changed_statement_challenge);
     }
 
     #[test]
     fn precommitment_and_payload_framing_are_strict_and_mutation_bound() {
         let (statement, solution) = fixture(8, 2);
-        let (commitment, _) = FastBackend::commit_offline(&statement, &solution).unwrap();
+        let (commitment, _) = FastBackend::commit(&statement, &solution).unwrap();
         let encoded = commitment.to_bytes();
         assert_eq!(FastPrecommitment::from_bytes(&encoded).unwrap(), commitment);
+        let mut legacy_mode_bearing = encoded.clone();
+        legacy_mode_bearing[PRECOMMIT_MAGIC.len()..PRECOMMIT_MAGIC.len() + 2]
+            .copy_from_slice(&3_u16.to_be_bytes());
+        assert!(matches!(
+            FastPrecommitment::from_bytes(&legacy_mode_bearing),
+            Err(FastError::UnsupportedVersion)
+        ));
         let mut trailing = encoded.clone();
         trailing.push(0);
         assert!(FastPrecommitment::from_bytes(&trailing).is_err());
@@ -2145,7 +1979,7 @@ mod tests {
             assert!(FastPrecommitment::from_bytes(&encoded[..length]).is_err());
         }
 
-        let context = FastProverContext::offline_fiat_shamir(commitment);
+        let context = FastProverContext::new(commitment);
         let (payload, _) = FastBackend::prove(&statement, &solution, &context).unwrap();
         let mut trailing = payload.clone();
         trailing.push(0);
@@ -2162,8 +1996,8 @@ mod tests {
     fn statement_binding_and_inner_float_encoding_are_strict() {
         let (statement, solution) = fixture(8, 2);
         let (other_statement, _) = fixture(8, 3);
-        let (commitment, _) = FastBackend::commit_offline(&statement, &solution).unwrap();
-        let context = FastProverContext::offline_fiat_shamir(commitment);
+        let (commitment, _) = FastBackend::commit(&statement, &solution).unwrap();
+        let context = FastProverContext::new(commitment);
         let (payload, _) = FastBackend::prove(&statement, &solution, &context).unwrap();
         assert!(matches!(
             FastBackend::preflight(&other_statement.verifier_statement(), &payload),
@@ -2174,12 +2008,11 @@ mod tests {
             Err(FastError::StatementMismatch)
         ));
 
-        let (commitment, challenge, proof) = decode_backend_payload(&payload).unwrap();
-        assert!(challenge.is_none());
+        let (commitment, proof) = decode_backend_payload(&payload).unwrap();
         let mut noncanonical = proof.to_vec();
         // proof-version u16, logical-length u64, then rho bits.
         noncanonical[10..18].copy_from_slice(&f64::NAN.to_bits().to_be_bytes());
-        let changed = encode_backend_payload(&commitment, None, &noncanonical).unwrap();
+        let changed = encode_backend_payload(&commitment, &noncanonical).unwrap();
         assert!(matches!(
             FastBackend::verify(&statement.verifier_statement(), &changed),
             Err(FastError::Float(FloatContractError::NonFinite))
@@ -2187,42 +2020,14 @@ mod tests {
 
         let mut inner_trailing = proof.to_vec();
         inner_trailing.push(0);
-        let changed = encode_backend_payload(&commitment, None, &inner_trailing).unwrap();
+        let changed = encode_backend_payload(&commitment, &inner_trailing).unwrap();
         assert!(FastBackend::verify(&statement.verifier_statement(), &changed).is_err());
     }
 
     #[test]
-    fn external_challenge_cannot_be_rebound_to_another_commitment() {
-        let (statement, solution) = fixture(8, 2);
-        let (commitment, _) = FastBackend::commit(&statement, &solution).unwrap();
-        let challenge = SignedCommitmentChallenge::sign(
-            CommitmentChallengePayload {
-                schema: CommitmentChallengeSchema::V1,
-                issuer: "test-issuer".to_owned(),
-                key_id: "test-key".to_owned(),
-                issued_at_unix_seconds: 100,
-                expires_at_unix_seconds: 200,
-                entropy: Digest::from_bytes([9; 32]),
-                problem_digest: statement.problem_digest(),
-                validation_manifest_digest: statement.manifest_digest(),
-                protocol: ProofProtocol::FastBinary64UnitCircleV2,
-                commitment_digest: Digest::from_bytes([0; 32]),
-                retry_policy: RetryPolicy::ReplayAllowedV1,
-            },
-            &SigningKey::from_bytes(&[7; 32]),
-        )
-        .unwrap();
-        let context = FastProverContext::external_signed(commitment, challenge);
-        assert!(matches!(
-            FastBackend::prove(&statement, &solution, &context),
-            Err(FastError::CommitmentChallengeMismatch)
-        ));
-    }
-
-    #[test]
     fn verifier_work_uses_only_the_succinct_capability_and_scales_with_description() {
-        let (small_payload, small) = offline_round_trip(64);
-        let (large_payload, large) = offline_round_trip(256);
+        let (small_payload, small) = round_trip(64);
+        let (large_payload, large) = round_trip(256);
         for report in [&small, &large] {
             assert_eq!(report.work.generator_row_queries, 0);
             assert_eq!(report.work.solution_elements_materialized, 0);

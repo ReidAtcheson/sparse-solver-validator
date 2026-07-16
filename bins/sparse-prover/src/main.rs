@@ -3,18 +3,14 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use ssv_backends::{BackendProverReport, prove_single_stage};
-use ssv_fast::{FastBackend, FastNonceMode, FastPrecommitment, FastProverContext};
+use ssv_fast::{FastBackend, FastPrecommitment, FastProverContext, FastProverReport};
 use ssv_problem::FinalizedProblem;
-use ssv_service_protocol::{
-    CommitmentChallengeRequest, CommitmentChallengeRequestSchema, ProofProtocol, SignedChallenge,
-    SignedCommitmentChallenge, ValidationManifest,
-};
+use ssv_service_protocol::{ProofProtocol, SignedChallenge, ValidationManifest};
 use ssv_solution::Solution;
 use ssv_validation::{
-    ArtifactPrelude, MAX_ARTIFACT_BYTES, PrecommitBackend, PublicStatement, ValidationBackend,
-    encode_artifact,
+    ArtifactPrelude, MAX_ARTIFACT_BYTES, PublicStatement, ValidationBackend, encode_artifact,
 };
 
 const MAX_CONTEXT_JSON_BYTES: usize = 1024 * 1024;
@@ -33,30 +29,21 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Prove with direct-reference-v1 or whir-field192-l2-v4.
+    /// Build a complete proof with the manifest-selected backend.
     Prove(CommonProofArgs),
-    /// Fix the fast packed-codeword root before an external nonce exists.
+    /// Materialize the fast precommitment as a local diagnostic stage.
     FastCommit {
         #[command(flatten)]
         inputs: CommonInputArgs,
-        #[arg(long, value_enum, default_value_t = FastModeArg::External)]
-        nonce_mode: FastModeArg,
         #[arg(long)]
         precommitment: PathBuf,
-        /// Optional JSON request ready for POST /v1/commitment-challenges.
-        #[arg(long)]
-        challenge_request: Option<PathBuf>,
     },
-    /// Complete a fast proof from the recorded precommitment and nonce policy.
+    /// Complete a fast proof from a local noninteractive precommitment.
     FastProve {
         #[command(flatten)]
         inputs: CommonInputArgs,
         #[arg(long)]
         precommitment: PathBuf,
-        /// Signed JSON returned by /v1/commitment-challenges. Must be absent
-        /// for an explicitly offline Fiat--Shamir precommitment.
-        #[arg(long)]
-        commitment_challenge: Option<PathBuf>,
         #[arg(long)]
         proof: PathBuf,
     },
@@ -70,8 +57,7 @@ struct CommonInputArgs {
     validation: PathBuf,
     #[arg(long)]
     solution: PathBuf,
-    /// Signed problem challenge for hosted mode. Omit only for a literal local
-    /// problem; this is distinct from the fast post-commit challenge.
+    /// Signed problem challenge for hosted mode. Omit for a literal local problem.
     #[arg(long)]
     challenge: Option<PathBuf>,
 }
@@ -84,21 +70,6 @@ struct CommonProofArgs {
     proof: PathBuf,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum FastModeArg {
-    External,
-    Offline,
-}
-
-impl From<FastModeArg> for FastNonceMode {
-    fn from(value: FastModeArg) -> Self {
-        match value {
-            FastModeArg::External => Self::ExternalSigned,
-            FastModeArg::Offline => Self::OfflineFiatShamir,
-        }
-    }
-}
-
 struct LoadedInputs {
     statement: PublicStatement,
     solution: Solution,
@@ -109,26 +80,13 @@ fn main() -> Result<()> {
         Command::Prove(args) => prove(&args),
         Command::FastCommit {
             inputs,
-            nonce_mode,
             precommitment,
-            challenge_request,
-        } => fast_commit(
-            &inputs,
-            nonce_mode.into(),
-            &precommitment,
-            challenge_request.as_deref(),
-        ),
+        } => fast_commit(&inputs, &precommitment),
         Command::FastProve {
             inputs,
             precommitment,
-            commitment_challenge,
             proof,
-        } => fast_prove(
-            &inputs,
-            &precommitment,
-            commitment_challenge.as_deref(),
-            &proof,
-        ),
+        } => fast_prove(&inputs, &precommitment, &proof),
     }
 }
 
@@ -166,48 +124,23 @@ fn prove(args: &CommonProofArgs) -> Result<()> {
                 report.accounted_high_watermark_bytes
             );
         }
-        BackendProverReport::Fast(_) => unreachable!("single-stage registry excludes fast"),
+        BackendProverReport::Fast(report) => {
+            print_fast_prover_report(&report);
+        }
     }
     print_artifact_summary(summary, &args.proof);
     Ok(())
 }
 
-fn fast_commit(
-    args: &CommonInputArgs,
-    nonce_mode: FastNonceMode,
-    precommitment_path: &Path,
-    challenge_request_path: Option<&Path>,
-) -> Result<()> {
+fn fast_commit(args: &CommonInputArgs, precommitment_path: &Path) -> Result<()> {
     let inputs = load_inputs(args)?;
     require_fast(&inputs.statement)?;
-    let (commitment, report) = match nonce_mode {
-        FastNonceMode::ExternalSigned => {
-            <FastBackend as PrecommitBackend>::commit(&inputs.statement, &inputs.solution)
-        }
-        FastNonceMode::OfflineFiatShamir => {
-            FastBackend::commit_offline(&inputs.statement, &inputs.solution)
-        }
-    }
-    .context("could not construct fast precommitment")?;
+    let (commitment, report) = FastBackend::commit(&inputs.statement, &inputs.solution)
+        .context("could not construct noninteractive fast precommitment")?;
     write_bytes(precommitment_path, &commitment.to_bytes())?;
 
-    if let Some(path) = challenge_request_path {
-        if nonce_mode != FastNonceMode::ExternalSigned {
-            bail!("--challenge-request is valid only with --nonce-mode external");
-        }
-        let request = CommitmentChallengeRequest {
-            schema: CommitmentChallengeRequestSchema::V1,
-            problem_digest: inputs.statement.problem_digest(),
-            validation_manifest_digest: inputs.statement.manifest_digest(),
-            protocol: ProofProtocol::FastBinary64UnitCircleV2,
-            commitment_digest: commitment.digest(),
-        };
-        write_pretty_json(path, &request)?;
-        println!("commitment_challenge_request_file={}", path.display());
-    }
-
-    println!("proof_kind=fast-binary64-unit-circle-v2");
-    println!("nonce_mode={:?}", report.nonce_mode);
+    println!("proof_kind=fast-binary64-unit-circle-v3");
+    println!("challenge_mode=noninteractive-fiat-shamir");
     println!("precommitment_digest={}", report.precommitment_digest);
     println!(
         "packed_codeword_root={}",
@@ -219,33 +152,13 @@ fn fast_commit(
     Ok(())
 }
 
-fn fast_prove(
-    args: &CommonInputArgs,
-    precommitment_path: &Path,
-    commitment_challenge_path: Option<&Path>,
-    proof_path: &Path,
-) -> Result<()> {
+fn fast_prove(args: &CommonInputArgs, precommitment_path: &Path, proof_path: &Path) -> Result<()> {
     let inputs = load_inputs(args)?;
     require_fast(&inputs.statement)?;
     let commitment =
         FastPrecommitment::from_bytes(&read_bounded(precommitment_path, MAX_PRECOMMITMENT_BYTES)?)
             .context("invalid fast precommitment")?;
-    let context = match commitment.nonce_mode() {
-        FastNonceMode::ExternalSigned => {
-            let path = commitment_challenge_path
-                .context("external fast mode requires --commitment-challenge")?;
-            let challenge: SignedCommitmentChallenge =
-                serde_json::from_slice(&read_bounded(path, MAX_CONTEXT_JSON_BYTES)?)
-                    .with_context(|| format!("invalid commitment challenge {}", path.display()))?;
-            FastProverContext::external_signed(commitment, challenge)
-        }
-        FastNonceMode::OfflineFiatShamir => {
-            if commitment_challenge_path.is_some() {
-                bail!("offline fast mode rejects --commitment-challenge");
-            }
-            FastProverContext::offline_fiat_shamir(commitment)
-        }
-    };
+    let context = FastProverContext::new(commitment);
     let (payload, report) =
         <FastBackend as ValidationBackend>::prove(&inputs.statement, &inputs.solution, &context)
             .context("could not construct fast proof")?;
@@ -253,7 +166,14 @@ fn fast_prove(
     let summary = ArtifactPrelude::parse(&encoded)?.summary();
     write_bytes(proof_path, &encoded)?;
 
-    println!("proof_kind=fast-binary64-unit-circle-v2");
+    print_fast_prover_report(&report);
+    print_artifact_summary(summary, proof_path);
+    Ok(())
+}
+
+fn print_fast_prover_report(report: &FastProverReport) {
+    println!("proof_kind=fast-binary64-unit-circle-v3");
+    println!("challenge_mode=noninteractive-fiat-shamir");
     println!("precommitment_digest={}", report.precommitment_digest);
     println!("residual_squared_l2={:.17e}", report.residual_squared_l2);
     println!(
@@ -262,8 +182,6 @@ fn fast_prove(
     );
     println!("prover_rows_scanned={}", report.rows_scanned);
     println!("prover_nonzeros_scanned={}", report.nonzeros_scanned);
-    print_artifact_summary(summary, proof_path);
-    Ok(())
 }
 
 fn load_inputs(args: &CommonInputArgs) -> Result<LoadedInputs> {
@@ -300,8 +218,8 @@ fn load_inputs(args: &CommonInputArgs) -> Result<LoadedInputs> {
 }
 
 fn require_fast(statement: &PublicStatement) -> Result<()> {
-    if statement.manifest().protocol != ProofProtocol::FastBinary64UnitCircleV2 {
-        bail!("fast command requires a fast-binary64-unit-circle-v2 validation manifest");
+    if statement.manifest().protocol != ProofProtocol::FastBinary64UnitCircleV3 {
+        bail!("fast command requires a fast-binary64-unit-circle-v3 validation manifest");
     }
     Ok(())
 }
@@ -316,12 +234,6 @@ fn print_artifact_summary(summary: ssv_validation::ArtifactSummary, path: &Path)
     println!("payload_bytes={}", summary.payload_bytes);
     println!("artifact_bytes={}", summary.artifact_bytes);
     println!("proof_file={}", path.display());
-}
-
-fn write_pretty_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
-    let mut bytes = serde_json::to_vec_pretty(value)?;
-    bytes.push(b'\n');
-    write_bytes(path, &bytes)
 }
 
 fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {

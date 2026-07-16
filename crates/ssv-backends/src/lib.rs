@@ -11,10 +11,9 @@
 
 use ssv_direct::{DirectBackend, DirectError, DirectProverReport, DirectVerifierReport};
 use ssv_exact::{ExactBackend, ExactError, ExactProverReport, ExactVerifierReport};
-use ssv_fast::{FastBackend, FastError, FastProverReport, FastVerifierReport};
+use ssv_fast::{FastBackend, FastError, FastProverContext, FastProverReport, FastVerifierReport};
 use ssv_service_protocol::{
-    CertifiedScore, DefectMetrics, FastConsistencyMetrics, ProofProtocol,
-    SignedCommitmentChallenge, Unsigned192,
+    CertifiedScore, DefectMetrics, FastConsistencyMetrics, ProofProtocol, Unsigned192,
 };
 use ssv_solution::Solution;
 use ssv_validation::{
@@ -53,12 +52,13 @@ pub enum BackendError {
     FastConsistencyPolicy,
     #[error("exact residual numerator does not fit the certificate's unsigned-192 field")]
     ExactScoreOverflow,
-    #[error("fast proving requires the explicit precommitment lifecycle")]
-    FastRequiresPrecommitment,
 }
 
-/// Proves either registered single-stage backend. Fast proving deliberately
-/// has no implicit offline fallback and uses `ssv-fast`'s explicit commit API.
+/// Proves any registered backend as one application operation.
+///
+/// The fast path still fixes its packed-oracle commitment before deriving any
+/// Fiat--Shamir challenge. This wrapper simply keeps that local staging detail
+/// out of applications that do not need checkpointing or phase accounting.
 pub fn prove_single_stage(
     statement: &PublicStatement,
     solution: &Solution,
@@ -74,7 +74,13 @@ pub fn prove_single_stage(
                 <ExactBackend as ValidationBackend>::prove(statement, solution, &())?;
             Ok((payload, BackendProverReport::Exact(report)))
         }
-        ProofProtocol::FastBinary64UnitCircleV2 => Err(BackendError::FastRequiresPrecommitment),
+        ProofProtocol::FastBinary64UnitCircleV3 => {
+            let (commitment, _) = FastBackend::commit(statement, solution)?;
+            let context = FastProverContext::new(commitment);
+            let (payload, report) =
+                <FastBackend as ValidationBackend>::prove(statement, solution, &context)?;
+            Ok((payload, BackendProverReport::Fast(report)))
+        }
     }
 }
 
@@ -87,7 +93,7 @@ pub fn verify(prelude: &ArtifactPrelude<'_>) -> Result<BackendVerifierReport, Ba
         ProofProtocol::WhirField192L2V4 => Ok(BackendVerifierReport::Exact(
             prelude.verify_with::<ExactBackend>()?,
         )),
-        ProofProtocol::FastBinary64UnitCircleV2 => Ok(BackendVerifierReport::Fast(Box::new(
+        ProofProtocol::FastBinary64UnitCircleV3 => Ok(BackendVerifierReport::Fast(Box::new(
             prelude.verify_with::<FastBackend>()?,
         ))),
     }
@@ -99,15 +105,7 @@ impl BackendVerifierReport {
         match self {
             Self::Direct(_) => ProofProtocol::DirectReferenceV1,
             Self::Exact(_) => ProofProtocol::WhirField192L2V4,
-            Self::Fast(_) => ProofProtocol::FastBinary64UnitCircleV2,
-        }
-    }
-
-    #[must_use]
-    pub fn commitment_challenge(&self) -> Option<&SignedCommitmentChallenge> {
-        match self {
-            Self::Fast(report) => report.external_challenge.as_ref(),
-            Self::Direct(_) | Self::Exact(_) => None,
+            Self::Fast(_) => ProofProtocol::FastBinary64UnitCircleV3,
         }
     }
 
@@ -130,11 +128,6 @@ impl AcceptedBackendReport {
     #[must_use]
     pub const fn protocol(&self) -> ProofProtocol {
         self.0.protocol()
-    }
-
-    #[must_use]
-    pub fn commitment_challenge(&self) -> Option<&SignedCommitmentChallenge> {
-        self.0.commitment_challenge()
     }
 
     pub fn certified_score(&self) -> Result<CertifiedScore, BackendError> {

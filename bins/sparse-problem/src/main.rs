@@ -286,7 +286,7 @@ impl From<ProtocolArg> for ProofProtocol {
         match value {
             ProtocolArg::Direct => Self::DirectReferenceV1,
             ProtocolArg::Exact => Self::WhirField192L2V4,
-            ProtocolArg::Fast => Self::FastBinary64UnitCircleV2,
+            ProtocolArg::Fast => Self::FastBinary64UnitCircleV3,
         }
     }
 }

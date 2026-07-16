@@ -9,7 +9,7 @@ use ed25519_dalek::VerifyingKey;
 use ssv_backends::{BackendVerifierReport, verify as verify_backend};
 use ssv_canonical::Digest;
 use ssv_direct::{DirectArtifact, MAX_PROOF_BYTES};
-use ssv_fast::{FastBackend, FastNonceMode};
+use ssv_fast::FastBackend;
 use ssv_problem::{FinalizedRandomness, SuccinctPublicEvaluator};
 use ssv_service_protocol::{CertifiedScore, SignedCertificate};
 use ssv_validation::{ArtifactPrelude, MAX_ARTIFACT_BYTES};
@@ -42,9 +42,6 @@ enum Command {
         /// Explicitly permit an unsigned literal-v1 local problem.
         #[arg(long)]
         allow_literal: bool,
-        /// Explicitly permit fast mode without an externally timestamped nonce.
-        #[arg(long)]
-        allow_offline_fast: bool,
         #[arg(long)]
         public_key: Option<PathBuf>,
         #[arg(long)]
@@ -71,7 +68,6 @@ enum Command {
 
 struct VerificationPolicy<'a> {
     allow_literal: bool,
-    allow_offline_fast: bool,
     public_key_path: Option<&'a Path>,
     issuer: Option<&'a str>,
     key_id: Option<&'a str>,
@@ -86,7 +82,6 @@ fn main() -> Result<()> {
         Command::Verify {
             proof,
             allow_literal,
-            allow_offline_fast,
             public_key,
             issuer,
             key_id,
@@ -96,7 +91,6 @@ fn main() -> Result<()> {
             &proof,
             VerificationPolicy {
                 allow_literal,
-                allow_offline_fast,
                 public_key_path: public_key.as_deref(),
                 issuer: issuer.as_deref(),
                 key_id: key_id.as_deref(),
@@ -161,20 +155,15 @@ fn inspect_common(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(challenge) = prelude.statement().challenge() {
         print_problem_challenge(challenge);
     }
-    if summary.protocol == ssv_service_protocol::ProofProtocol::FastBinary64UnitCircleV2 {
+    if summary.protocol == ssv_service_protocol::ProofProtocol::FastBinary64UnitCircleV3 {
         let preflight =
             FastBackend::preflight(&prelude.statement().verifier_statement(), prelude.payload())
                 .context("fast payload preflight failed")?;
-        println!("fast_nonce_mode={:?}", preflight.nonce_mode);
         println!(
             "fast_precommitment_digest={}",
             preflight.precommitment_digest
         );
         println!("fast_payload_digest={}", preflight.payload_digest);
-        println!(
-            "has_signed_commitment_challenge={}",
-            preflight.external_challenge.is_some()
-        );
     }
     Ok(())
 }
@@ -224,17 +213,6 @@ fn verify_common(path: &Path, bytes: &[u8], policy: &VerificationPolicy<'_>) -> 
     let prelude = ArtifactPrelude::parse(bytes)
         .with_context(|| format!("could not decode envelope {}", path.display()))?;
     authenticate_problem_statement(prelude.statement(), policy)?;
-
-    // Hosted fast challenges are authenticated before the expensive proof
-    // path. The backend verifier reuses this exact structural preflight.
-    if prelude.statement().manifest().protocol
-        == ssv_service_protocol::ProofProtocol::FastBinary64UnitCircleV2
-    {
-        let preflight =
-            FastBackend::preflight(&prelude.statement().verifier_statement(), prelude.payload())
-                .context("fast payload preflight failed")?;
-        authenticate_fast_preflight(&preflight, prelude.statement().challenge(), policy)?;
-    }
 
     let report = verify_backend(&prelude).context("backend proof verification failed")?;
     if matches!(&report, BackendVerifierReport::Fast(fast) if !fast.passes_policy()) {
@@ -305,9 +283,8 @@ fn print_backend_report(report: &BackendVerifierReport) {
             );
         }
         BackendVerifierReport::Fast(report) => {
-            println!("proof_kind=fast-binary64-unit-circle-v2");
+            println!("proof_kind=fast-binary64-unit-circle-v3");
             println!("warning=provisional_metric_certificate_not_exact_field_soundness");
-            println!("fast_nonce_mode={:?}", report.nonce_mode);
             println!(
                 "residual_squared_l2={:.17e}",
                 report.score.residual_squared_l2
@@ -408,45 +385,6 @@ fn authenticate_problem_statement(
             )?;
         }
         _ => bail!("problem randomness and application challenge header disagree"),
-    }
-    Ok(())
-}
-
-fn authenticate_fast_preflight(
-    preflight: &ssv_fast::FastPreflight,
-    problem_challenge: Option<&ssv_service_protocol::SignedChallenge>,
-    policy: &VerificationPolicy<'_>,
-) -> Result<()> {
-    match (preflight.nonce_mode, preflight.external_challenge.as_ref()) {
-        (FastNonceMode::OfflineFiatShamir, None) => {
-            if !policy.allow_offline_fast {
-                bail!("offline fast proof requires --allow-offline-fast");
-            }
-        }
-        (FastNonceMode::ExternalSigned, Some(challenge)) => {
-            let (key, issuer, key_id) = trust_anchor(policy)?;
-            challenge
-                .verify(
-                    &key,
-                    issuer,
-                    key_id,
-                    policy.now_unix_seconds,
-                    policy.maximum_future_skew_seconds,
-                )
-                .context("signed fast commitment challenge is invalid")?;
-            validate_lifetime(
-                challenge.payload.issued_at_unix_seconds,
-                challenge.payload.expires_at_unix_seconds,
-                policy.maximum_challenge_lifetime_seconds,
-            )?;
-            if let Some(problem_challenge) = problem_challenge
-                && challenge.payload.issued_at_unix_seconds
-                    < problem_challenge.payload.issued_at_unix_seconds
-            {
-                bail!("fast commitment challenge predates the problem challenge");
-            }
-        }
-        _ => bail!("fast nonce mode and commitment challenge disagree"),
     }
     Ok(())
 }

@@ -21,15 +21,12 @@ use serde::Serialize;
 use ssv_canonical::Digest;
 use ssv_problem::ProblemTemplate;
 use ssv_service::{ServiceConfig, StatelessValidatorService, maximum_submission_bytes};
-use ssv_service_protocol::{
-    CommitmentChallengeRequest, SignedCertificate, SignedChallenge, SignedCommitmentChallenge,
-};
+use ssv_service_protocol::{SignedCertificate, SignedChallenge};
 use tokio::sync::Semaphore;
 use tower::limit::ConcurrencyLimitLayer;
 use zeroize::Zeroizing;
 
 const MAX_TEMPLATE_JSON_BYTES: usize = 1024 * 1024;
-const MAX_COMMITMENT_CHALLENGE_REQUEST_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -216,12 +213,6 @@ async fn serve(
             post(issue_challenge).layer(DefaultBodyLimit::max(MAX_TEMPLATE_JSON_BYTES)),
         )
         .route(
-            "/v1/commitment-challenges",
-            post(issue_commitment_challenge).layer(DefaultBodyLimit::max(
-                MAX_COMMITMENT_CHALLENGE_REQUEST_BYTES,
-            )),
-        )
-        .route(
             "/v1/validate",
             post(validate)
                 .layer::<_, std::convert::Infallible>(DefaultBodyLimit::max(max_proof_bytes))
@@ -237,7 +228,6 @@ async fn serve(
     println!("listening=http://{address}");
     println!("health_path=/healthz");
     println!("challenge_path=/v1/challenges");
-    println!("commitment_challenge_path=/v1/commitment-challenges");
     println!("validation_path=/v1/validate");
     println!("max_proof_bytes={max_proof_bytes}");
     println!("request_timeout_seconds={request_timeout_seconds}");
@@ -265,22 +255,6 @@ async fn issue_challenge(
         .issue_challenge(&template, Digest::from_bytes(entropy), now)
         .map(Json)
         .map_err(|error| ApiError::invalid("invalid-problem-template", error))
-}
-
-async fn issue_commitment_challenge(
-    State(state): State<AppState>,
-    Json(request): Json<CommitmentChallengeRequest>,
-) -> Result<Json<SignedCommitmentChallenge>, ApiError> {
-    let mut entropy = [0_u8; 32];
-    OsRng
-        .try_fill_bytes(&mut entropy)
-        .map_err(ApiError::internal)?;
-    let now = now_unix_seconds().map_err(ApiError::internal)?;
-    state
-        .service
-        .issue_commitment_challenge(&request, Digest::from_bytes(entropy), now)
-        .map(Json)
-        .map_err(|error| ApiError::invalid("invalid-commitment-challenge-request", error))
 }
 
 async fn validate(

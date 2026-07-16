@@ -28,7 +28,7 @@ pub mod transcript;
 pub mod unit_circle;
 
 pub use backend::{
-    FastBackend, FastCommitmentReport, FastError, FastNonceMode, FastPrecommitment, FastPreflight,
+    FastBackend, FastCommitmentReport, FastError, FastPrecommitment, FastPreflight,
     FastProverContext, FastProverReport, FastSourceDigests, FastVerifierReport, FastVerifierWork,
 };
 

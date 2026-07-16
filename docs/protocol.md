@@ -29,7 +29,7 @@ Three proof kinds are registered:
 | --- | --- | ---: | ---: |
 | `direct-reference-v1` | Independent binary64 relation computation | yes | yes |
 | `whir-field192-l2-v4` | Exact integer statement for Q63.64 `x` | no | no |
-| `fast-binary64-unit-circle-v2` | Provisional sampled metric consistency | no | no |
+| `fast-binary64-unit-circle-v3` | Provisional sampled metric consistency | no | no |
 
 The direct profile is not succinct. The exact and fast profiles receive a
 restricted verifier statement with the registered public-MLE evaluator but no
@@ -374,7 +374,7 @@ queries and materializes zero solution or residual elements.
 
 ### 9.1 Semantics and floating contract
 
-`fast-binary64-unit-circle-v2` is a provisional metric certificate. It applies
+`fast-binary64-unit-circle-v3` is a provisional metric certificate. It applies
 the exact path's one-time Q63.64 witness conversion, converts that witness back
 to binary64 deterministically, and computes `R = Ax-b` under a frozen binary64
 policy. Solver input rejects negative zero; internal source normalization maps
@@ -396,40 +396,40 @@ W = [x_0, ..., x_(N-1), R_0, ..., R_(N-1)].
 many complex roots of unity as coefficients. The resulting rate-one-half
 unit-circle codeword is committed with a BLAKE3 Merkle root.
 
-The strict precommitment binds the statement, problem, manifest, public-evaluator
-metadata, numerical policy, code basis, source digests, shapes, nonce mode, and
-packed codeword root before the first algebraic challenge. Source digests are
-linkage metadata; the root plus opening protocol supplies proof binding.
+The strict precommitment binds the statement, problem, manifest,
+public-evaluator metadata, numerical policy, code basis, source digests, shapes,
+and packed codeword root before the first algebraic challenge. Source digests
+are linkage metadata; the root plus opening protocol supplies proof binding.
 
-### 9.3 External and offline nonce modes
+### 9.3 Noninteractive challenge derivation
 
-External mode sends the canonical precommitment digest to
-`POST /v1/commitment-challenges`. The signed response contains:
+The prover and validator initialize the fast transcript from the complete
+canonical precommitment and public statement. Each challenge is then derived by
+Fiat--Shamir only after absorbing every message on which it depends:
 
 ```text
-issuer and key ID
-issued-at and expiry timestamps
-fresh entropy
-problem digest
-validation-manifest digest
-fast protocol ID
-commitment digest
-replay-allowed-v1 policy
+precommitment = H(statement, policy, shapes, source digests, packed root)
+challenge_0   = FS(precommitment, first claim)
+challenge_k   = FS(all transcript messages through round k)
 ```
 
-The response uses its own Ed25519 signature domain. The backend checks statement
-and commitment binding and absorbs the complete signed object at the fixed
-post-commit transcript point. The service layer additionally verifies issuer,
-key, signature, lifetime, and freshness before certification.
+There is no proof-specific issuer interaction. The ordinary signed problem
+header, when present, is already part of the public statement: it fixes `A,b`,
+provides issuance time and fresh instance entropy, and is authenticated before
+proof work. Local literal problems use the same proof transcript after their
+different, explicitly tagged seed origin is bound.
 
-Offline mode is separately encoded in the precommitment. It derives a
-domain-separated nonce from the canonical precommitment bytes and has no external
-timestamp. Missing or invalid external data never causes a fallback to offline
-mode.
+Fiat--Shamir binds challenges to a chosen root; it does not stop a prover from
+trying several roots after learning the signed problem header. Authentication,
+short header lifetimes, issuance and submission quotas, per-principal rate
+limits, and audit logs can constrain service abuse, but cannot prove that only
+one local commitment was attempted. Fast remains a provisional metric result.
+An exact proof for the same finalized problem and signed header is the assurance
+follow-up when exact field soundness is required.
 
 ### 9.4 Proof schedule
 
-After nonce binding, the transcript is fixed as follows:
+After precommitment binding, the transcript is fixed as follows:
 
 1. residual-norm binary64 product sumcheck, yielding `R_tilde(u)`;
 2. sparse matvec binary64 product sumcheck, using generator-owned
@@ -492,13 +492,12 @@ profile when exact assurance is required.
 
 ## 10. Signed certificate
 
-Certificate schema `sparse-solve/validation-certificate/v2` binds:
+Certificate schema `sparse-solve/validation-certificate/v3` binds:
 
 ```text
 issuer and key ID
 certificate issue time
 required problem-challenge digest
-fast-only commitment-challenge digest
 problem digest
 validation-manifest digest
 proof digest
@@ -510,7 +509,7 @@ validator-build identifier
 The Ed25519 signature message is:
 
 ```text
-bytes("sparse-solve/certificate-signature/ed25519/v1")
+bytes("sparse-solve/certificate-signature/ed25519/v3")
 || bytes(canonical_certificate_payload)
 ```
 
@@ -521,12 +520,11 @@ The score variants are deliberately different:
 - fast: binary64 squared L2 plus four consistency summaries and the distinct
   recursive-query-trajectory count.
 
-A v2 certificate always carries the signed problem-challenge digest. It carries
-the post-commit challenge digest if and only if its protocol is fast: that field
-is required for fast and forbidden for direct or exact. A score/protocol or
-challenge-field/protocol mismatch is invalid. A relying party verifies the
-signature with an external trust anchor and pins whatever problem, manifest,
-proof, challenge, time, and quality policy its application requires.
+A v3 certificate always carries the signed problem-challenge digest. Fast needs
+no additional signed challenge field. A score/protocol mismatch is invalid. A
+relying party verifies the signature with an external trust anchor and pins
+whatever problem, manifest, proof, challenge, time, and quality policy its
+application requires.
 
 A certificate reports one submitted proof's result. It does not claim that the
 residual is good, globally best, attributable to a solver identity, or based on a
@@ -539,7 +537,6 @@ The HTTP adapter exposes:
 ```text
 GET  /healthz
 POST /v1/challenges
-POST /v1/commitment-challenges
 POST /v1/validate
 ```
 
@@ -548,11 +545,9 @@ use binary bodies; signed challenges and certificates are returned as typed JSON
 whose signatures reconstruct canonical payload bytes.
 
 Every hosted submission must carry a valid service-issued problem challenge.
-Hosted fast validation additionally requires external nonce mode and a valid
-service-issued post-commit challenge bound to that artifact's problem, manifest,
-protocol, and commitment. The post-commit challenge may not predate the problem
-challenge. The hosted service rejects literal problems and offline fast mode;
-those modes require explicit local-validator flags.
+Direct, exact, and fast artifacts use that same provenance rule; fast proof
+construction adds no issuer round trip. The hosted service rejects literal
+problems, which require the explicit local-validator flag.
 
 The service captures validation start time before proof work and completion time
 after it. It refuses certification when the challenge expires during validation
@@ -562,13 +557,12 @@ body, concurrency, and deadline controls.
 For Cloud Run, the listener binds `0.0.0.0:$PORT`. `0.0.0.0` is not a client URL;
 local clients use `127.0.0.1:$PORT` and deployed clients use the service URL.
 
-The service stores no challenge, commitment, proof, or certificate state. Its
+The service stores no challenge, proof, or certificate state. Its
 explicit retry policy is therefore `replay-allowed-v1`. Expiry and fresh entropy
 do not provide one-shot semantics. Without durable transactional state the
 service cannot:
 
 - reject reuse or replay;
-- issue exactly one nonce for a commitment;
 - limit certificates per challenge;
 - compare against prior submissions; or
 - certify a global or per-problem best residual.
@@ -591,7 +585,7 @@ byte-for-byte vectors for:
 5. exact transcript challenges, digit openings, and WHIR acceptance;
 6. fast transcript challenges, code roots, folds, query indices, multiproofs,
    and normalized scores;
-7. external and offline challenge-mode separation;
+7. one-step and locally staged fast proving producing the same transcript;
 8. mutation, cross-kind, cross-version, cross-statement, truncation, resource,
    and trailing-byte rejection; and
 9. exact and fast verifier work counters showing zero generator-row queries and

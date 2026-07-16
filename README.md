@@ -17,7 +17,7 @@ numerical audit.
 
 > `direct-reference-v1` is not succinct and does not hide `x`.
 > `whir-field192-l2-v4` proves an exact integer statement about once-quantized
-> Q63.64 `x`. `fast-binary64-unit-circle-v2` is an experimental metric
+> Q63.64 `x`. `fast-binary64-unit-circle-v3` is an experimental metric
 > certificate with no completed global numerical soundness theorem. None of the
 > profiles claims zero knowledge.
 
@@ -28,8 +28,8 @@ numerical audit.
   generator-owned succinct matrix/RHS MLE evaluator
 - `ssv-solution`: strict binary64 solution-vector input
 - `ssv-relation`: shared Q63.64 conversion and exact integer residual relation
-- `ssv-service-protocol`: manifests, signed problem/post-commit challenges, and
-  typed certificates
+- `ssv-service-protocol`: manifests, signed problem challenges, and typed
+  certificates
 - `ssv-validation`: common statements, restricted succinct-verifier view,
   artifact framing, and backend lifecycle traits
 - `ssv-direct`: non-succinct independent streaming `Ax-b` checker
@@ -103,8 +103,9 @@ the relation and constructs a validated result.
 
 ## Local exact and fast workflows
 
-Use release builds for the proof backends. The exact profile is a one-stage
-Fiat--Shamir proof over the same finalized problem and solution:
+Use release builds for the proof backends. Both succinct profiles are
+noninteractive Fiat--Shamir artifacts over the same finalized problem and
+solution. The validation manifest selects the backend:
 
 ```sh
 cargo run --release -p sparse-prover -- prove \
@@ -116,32 +117,22 @@ cargo run --release -p sparse-prover -- prove \
 cargo run --release -p sparse-validator -- verify \
   --proof /tmp/exact.proof \
   --allow-literal
-```
 
-For local fast testing, select the explicitly encoded offline Fiat--Shamir
-mode. It is not an automatic fallback when a signed post-commit challenge is
-missing:
-
-```sh
-cargo run --release -p sparse-prover -- fast-commit \
+cargo run --release -p sparse-prover -- prove \
   --problem /tmp/problem.json \
   --validation examples/fast-validation.json \
   --solution /tmp/x.json \
-  --nonce-mode offline \
-  --precommitment /tmp/fast.precommitment
-
-cargo run --release -p sparse-prover -- fast-prove \
-  --problem /tmp/problem.json \
-  --validation examples/fast-validation.json \
-  --solution /tmp/x.json \
-  --precommitment /tmp/fast.precommitment \
   --proof /tmp/fast.proof
 
 cargo run --release -p sparse-validator -- verify \
   --proof /tmp/fast.proof \
-  --allow-literal \
-  --allow-offline-fast
+  --allow-literal
 ```
+
+`fast-commit` and `fast-prove` remain available as local diagnostic stages for
+separate process-memory measurements. They use the same noninteractive
+Fiat--Shamir transcript and never contact an issuer; ordinary users should use
+the one-step `prove` command.
 
 The fast validator enforces the frozen consistency policy but does not apply a
 caller-selected residual-quality threshold. Its reported residual is a
@@ -235,33 +226,16 @@ cargo run -p sparse-validator -- verify-certificate \
 It does not re-run the proof, check certificate freshness, or compare the
 certificate's digests with local proof or challenge files.
 
-The exact hosted flow is identical except that the prover uses
-`examples/exact-validation.json`. Fast external mode adds a commitment-bound
-challenge between its two prover stages:
+The exact and fast hosted flows use the same one-step command. For a provisional
+fast check-in, select the fast manifest and retain the original signed problem
+header:
 
 ```sh
-cargo run --release -p sparse-prover -- fast-commit \
+cargo run --release -p sparse-prover -- prove \
   --problem /tmp/hosted-problem.json \
   --validation examples/fast-validation.json \
   --solution /tmp/x.json \
   --challenge /tmp/challenge.json \
-  --nonce-mode external \
-  --precommitment /tmp/fast.precommitment \
-  --challenge-request /tmp/commitment-request.json
-
-curl --fail --silent --show-error \
-  -H 'content-type: application/json' \
-  --data-binary @/tmp/commitment-request.json \
-  http://127.0.0.1:8080/v1/commitment-challenges \
-  -o /tmp/commitment-challenge.json
-
-cargo run --release -p sparse-prover -- fast-prove \
-  --problem /tmp/hosted-problem.json \
-  --validation examples/fast-validation.json \
-  --solution /tmp/x.json \
-  --challenge /tmp/challenge.json \
-  --precommitment /tmp/fast.precommitment \
-  --commitment-challenge /tmp/commitment-challenge.json \
   --proof /tmp/fast-hosted.proof
 
 curl --fail --silent --show-error \
@@ -271,9 +245,27 @@ curl --fail --silent --show-error \
   -o /tmp/fast-certificate.json
 ```
 
-The signed post-commit challenge authenticates that the exact fast commitment
-digest preceded fresh service entropy and its timestamp. Because the service is
-stateless, it still cannot make the challenge one-shot or prevent replay.
+For final assurance, submit an exact proof derived from the same problem,
+solution, and signed header:
+
+```sh
+cargo run --release -p sparse-prover -- prove \
+  --problem /tmp/hosted-problem.json \
+  --validation examples/exact-validation.json \
+  --solution /tmp/x.json \
+  --challenge /tmp/challenge.json \
+  --proof /tmp/exact-hosted.proof
+
+curl --fail --silent --show-error \
+  -H 'content-type: application/octet-stream' \
+  --data-binary @/tmp/exact-hosted.proof \
+  http://127.0.0.1:8080/v1/validate \
+  -o /tmp/exact-certificate.json
+```
+
+The shared signed header fixes the same public `A,b`; the fast and exact
+manifests, proofs, and certificates remain distinct. Fast is intended as the
+provisional check-in, with exact validation as the assurance follow-up.
 
 For Cloud Run, leave the host as `0.0.0.0` and let the platform set `PORT`.
 Clients connect to the service URL, never to `0.0.0.0`. This repository provides
@@ -292,15 +284,19 @@ budget; the service derives its proof-body cap from that value.
 - The service reports residual metrics for one submission. It applies no quality
   threshold and does not call the result “best.”
 - The challenge endpoint signs fresh entropy for a caller-selected, digest-bound
-  template. A relying party treating certificates as benchmark credentials must
-  pin the expected template/problem; otherwise trivial families and seed
-  grinding are intentionally possible.
+  template. This prevents preparing a proof for a particular instance before
+  the header is issued. A relying party treating certificates as benchmark
+  credentials must still pin the expected template and problem.
+- Fast algebraic challenges are derived noninteractively from the signed public
+  statement and each transcript prefix. A prover can nevertheless retry
+  commitments after seeing the signed header. Authentication, short challenge
+  lifetimes, issuance/submission quotas, audit logs, and per-principal rate
+  limits are infrastructure policy; they limit service abuse but do not turn the
+  provisional fast metric into an exact or one-shot proof.
 - The service is stateless. Expiry is enforced, but replay prevention, one-shot
   challenges, and a global best residual require durable transactional state.
-- External fast mode requires a second signed challenge after witness
-  commitment. The initial matrix challenge cannot substitute for that nonce;
-  local offline mode is separately tagged and must be explicitly allowed by the
-  validator.
+- An exact proof under the same signed problem header is the required follow-up
+  when exact field soundness is needed.
 - The built-in timeout, body limit, and validation concurrency cap are local
   safety controls. Production authentication, quotas/rate limits, bounded edge
   admission, and protected key management remain deployment responsibilities.
