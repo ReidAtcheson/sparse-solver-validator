@@ -1,15 +1,19 @@
 [package]
-name = "ssv-direct"
+name = "ssv-fast"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-serde_json.workspace = true
+blake3.workspace = true
 ssv-canonical = { path = "../ssv-canonical" }
 ssv-problem = { path = "../ssv-problem" }
+ssv-relation = { path = "../ssv-relation" }
 ssv-service-protocol = { path = "../ssv-service-protocol" }
 ssv-solution = { path = "../ssv-solution" }
 ssv-validation = { path = "../ssv-validation" }
 thiserror.workspace = true
+
+[dev-dependencies]
+ed25519-dalek.workspace = true

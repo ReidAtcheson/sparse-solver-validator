@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::VerifyingKey;
 use ssv_canonical::Digest;
 use ssv_problem::{FinalizedProblem, ProblemTemplate, RhsSpec};
-use ssv_service_protocol::{SignedChallenge, ValidationManifest};
+use ssv_service_protocol::{ProofProtocol, SignedChallenge, ValidationManifest};
 use ssv_solution::Solution;
 
 const MAX_JSON_BYTES: usize = 1024 * 1024;
@@ -68,10 +68,12 @@ enum Command {
         #[arg(long)]
         rhs: PathBuf,
     },
-    /// Write the direct-reference-v1 validation manifest.
+    /// Write a validation manifest for a registered backend.
     InitValidation {
         #[arg(long)]
         output: PathBuf,
+        #[arg(long, value_enum, default_value_t = ProtocolArg::Direct)]
+        protocol: ProtocolArg,
         #[arg(long, default_value_t = 16 * 1024 * 1024)]
         max_solution_elements: u64,
     },
@@ -113,8 +115,9 @@ fn main() -> Result<()> {
         } => export(&problem, &matrix, &rhs),
         Command::InitValidation {
             output,
+            protocol,
             max_solution_elements,
-        } => init_validation(&output, max_solution_elements),
+        } => init_validation(&output, protocol.into(), max_solution_elements),
         Command::ManufacturedSolution { problem, solution } => {
             manufactured_solution(&problem, &solution)
         }
@@ -271,8 +274,26 @@ fn export(problem_path: &Path, matrix_path: &Path, rhs_path: &Path) -> Result<()
     Ok(())
 }
 
-fn init_validation(path: &Path, max_solution_elements: u64) -> Result<()> {
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProtocolArg {
+    Direct,
+    Exact,
+    Fast,
+}
+
+impl From<ProtocolArg> for ProofProtocol {
+    fn from(value: ProtocolArg) -> Self {
+        match value {
+            ProtocolArg::Direct => Self::DirectReferenceV1,
+            ProtocolArg::Exact => Self::WhirField192L2V4,
+            ProtocolArg::Fast => Self::FastBinary64UnitCircleV2,
+        }
+    }
+}
+
+fn init_validation(path: &Path, protocol: ProofProtocol, max_solution_elements: u64) -> Result<()> {
     let manifest = ValidationManifest {
+        protocol,
         max_solution_elements,
         ..ValidationManifest::default()
     };

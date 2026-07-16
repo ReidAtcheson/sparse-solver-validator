@@ -1,15 +1,13 @@
 [package]
-name = "ssv-direct"
+name = "ssv-relation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-serde_json.workspace = true
-ssv-canonical = { path = "../ssv-canonical" }
+num-bigint.workspace = true
+num-traits.workspace = true
 ssv-problem = { path = "../ssv-problem" }
-ssv-service-protocol = { path = "../ssv-service-protocol" }
 ssv-solution = { path = "../ssv-solution" }
-ssv-validation = { path = "../ssv-validation" }
 thiserror.workspace = true

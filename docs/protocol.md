@@ -1,71 +1,76 @@
 # Challenge, proof, and certificate protocol
 
-**Status:** implemented development protocol v1. Numeric tags, domains, limits,
-and encodings are frozen by the current code and tests, but this release has not
-undergone an external cryptographic or numerical audit.
+**Status:** development protocol. The Rust implementation and tests are
+normative until this repository publishes a complete independent wire appendix
+and cross-repository golden vectors. The exact backend follows the reviewed
+`whir-field192-l2-v4` relation; the fast backend is an experimental metric
+protocol, not a substitute for exact soundness.
 
-Until the repository publishes a complete wire-format appendix and independent
-golden vectors, the Rust implementation and its tests are normative for v1. This
-document records the major objects, bindings, and framing, but is not by itself a
-sufficient clean-room implementation specification. In particular, consult the
-current code for every canonical encoding, generator component label, generator
-sampling detail, and validation limit. Changing any of those values still
-requires a new protocol or generator version.
+Changing a canonical field, tag, byte order, digest domain, generator rule,
+transcript checkpoint, numerical operation order, tolerance, commitment
+parameter, or output meaning requires a new version.
 
-This document describes the protocol that exists in this repository. The only
-implemented validation backend is `direct-reference-v1`; exact and fast
-succinct backends are later immutable proof kinds.
+## 1. Statements and proof kinds
 
-## 1. Objects and trust boundaries
-
-The protocol uses these typed objects:
+All profiles validate the same public statement:
 
 ```text
-ProblemTemplate          seed policy plus public matrix/RHS recipe
-SignedChallenge          issuer entropy, timestamps, template digest, signature
-FinalizedProblem         template fields plus literal or derived seed provenance
-Solution                 solver-produced x
-ValidationManifest       proof backend and resource policy
-DirectArtifact           self-contained validation submission
-SignedCertificate        one verified submission's residual and provenance
+FinalizedProblem          versioned generator for public A,b
+ValidationManifest       backend and resource policy
+optional SignedChallenge hosted problem provenance
 ```
 
-JSON is the bounded presentation format for templates, finalized problems,
-solutions, manifests, signed challenges, and signed certificates. Parsers use
-closed typed structs and reject unknown fields. Semantic identities and
-signatures never hash raw JSON: each type has a separately defined canonical
-binary encoding.
+The public statement produces a problem digest, manifest digest, protocol ID,
+and transcript digest. Backend proof bytes cannot change any of them.
 
-The direct proof is a strict binary container. It embeds the finalized problem
-and validation manifest as bounded typed JSON context, plus the canonical binary
-signed challenge header. Reformatting embedded JSON changes the proof digest but
-does not change the recomputed problem or manifest digest.
+Three proof kinds are registered:
 
-Public keys are externally configured trust anchors. A key carried by an
-artifact would not become trusted merely by verifying its own signature.
-Issuer, key, and validator-build identifiers are nonempty visible ASCII without
-spaces and are capped at 256 bytes, preventing control characters in logs and
-canonical payloads.
+| Protocol | Meaning | Carries `x` | Validator row scan |
+| --- | --- | ---: | ---: |
+| `direct-reference-v1` | Independent binary64 relation computation | yes | yes |
+| `whir-field192-l2-v4` | Exact integer statement for Q63.64 `x` | no | no |
+| `fast-binary64-unit-circle-v2` | Provisional sampled metric consistency | no | no |
 
-## 2. Canonical primitives
+The direct profile is not succinct. The exact and fast profiles receive a
+restricted verifier statement with the registered public-MLE evaluator but no
+sparse row or RHS-entry interface.
 
-Canonical integers are fixed-width big-endian. Booleans are one byte, exactly
-`0` or `1`. A byte string or UTF-8 string is:
+None of the profiles claims zero knowledge.
+
+## 2. Canonical encoding and strict parsing
+
+Canonical fixed-width integers are big-endian unless an inner protocol
+explicitly freezes a different legacy order. A length-delimited byte or UTF-8
+string is:
 
 ```text
 length     u64 big-endian
 payload    exactly length bytes
 ```
 
-A digest is exactly 32 bytes. Human-readable digests and seeds are exactly 64
-lowercase hexadecimal characters. An Ed25519 signature is 64 bytes and appears
-as exactly 128 lowercase hexadecimal characters in JSON.
+Booleans are exactly one byte, `0` or `1`. Digests are exactly 32 bytes. JSON
+digests, seeds, and signatures use one lowercase hexadecimal spelling. Typed JSON
+parsers reject unknown fields.
 
-Bounded readers check the total input and every declared field before slicing or
-allocating. Unknown tags, overflow, truncation, noncanonical values, invalid
-UTF-8, oversized fields, missing final frames, and trailing bytes are errors.
+Semantic hashes and signatures are reconstructed from typed canonical bytes,
+never from JSON whitespace, object-key order, or decimal formatting. Proof
+containers may embed the compact typed JSON representation as public context;
+the parser first bounds it, parses it into closed Rust types, and recomputes
+semantic identities.
 
-The common domain-separated digest helper computes:
+Every untrusted decoder enforces limits before allocation and rejects:
+
+- unknown versions, proof kinds, flags, enum tags, and required frame tags;
+- length, count, offset, index, or allocation overflow;
+- truncation, missing frames, duplicated or reordered material;
+- noncanonical field or binary64 encodings; and
+- any bytes after the mandatory final frame.
+
+A valid prefix followed by trailing bytes is not a valid proof.
+
+### 2.1 Domain-separated digests
+
+The common digest helper computes:
 
 ```text
 BLAKE3(
@@ -75,46 +80,54 @@ BLAKE3(
 )
 ```
 
-Every use supplies a purpose-specific domain such as problem template, problem,
-manifest, challenge, proof, or certificate. A field-order or domain change
-requires a new version.
+Every object supplies a purpose-specific domain. BLAKE3 derive-key mode is used
+separately for problem seed expansion. A 32-byte digest from one domain is not a
+substitute for a digest from another.
 
-## 3. Problem template and generator
+## 3. Public problem and MLE semantics
 
-`ProblemTemplate` schema `sparse-solve/problem-template/v1` fixes:
+The problem schema fixes:
 
-- a literal or challenge-derived randomness policy;
-- `seeded-symmetric-tridiagonal-v1` parameters;
-- a registered RHS recipe;
-- dyadic coefficient scales and exact mantissa ranges; and
-- the requested `squared-l2-residual-v1` output.
+- literal or challenge-derived instance randomness;
+- the registered matrix family and parameters;
+- the RHS generator and parameters;
+- exact dyadic scalar formats;
+- dimensions, boundaries, and zero padding; and
+- the requested squared-L2 residual output.
 
-The initial matrix generator uses a seed-derived flat periodic table of negative
-off-diagonal dyadic mantissas. Edge `(i,i+1)` and its transpose use the same
-table entry. Each diagonal is constructed as the absolute off-diagonal row sum
-plus a positive margin. The result is symmetric, has positive diagonal,
-nonpositive off-diagonals, and is strictly row diagonally dominant. Boundary
-rows truncate rather than wrap.
+The current family is `seeded-symmetric-tridiagonal-v1`. Off-diagonal mantissas
+come from a seed-derived periodic table, symmetry reuses the same edge value, and
+the diagonal is the absolute off-diagonal row sum plus a positive margin.
+Boundary rows truncate instead of wrapping.
 
-Rows are produced in sorted order from a stack-backed iterator with at most
-three entries. The compiler stores only periodic lookup tables; it does not
-materialize dimension-sized `A` or `b`. The generator recomputes its structural,
-coefficient, dominance, and work certificate from trusted code.
+Both succinct backends interpret the same Boolean tables with
+most-significant-bit-first coordinates and a zero tail to the next power of two:
 
-The current generator is the direct backend's conformance family. A succinct
-backend must additionally provide a reviewed, cheap evaluator for the public
-multilinear extensions of `A` and `b`.
+```text
+A_tilde(u,v) = sum_(i,j) eq_i(u) eq_j(v) A_ij
+b_tilde(u)   = sum_i     eq_i(u) b_i.
+```
 
-## 4. Signed matrix-instance challenge
+The generator-owned `PublicEvaluationPlan` evaluates these endpoints without
+enumerating rows or RHS entries. It exposes the same reviewed operation plan to
+Field192 and binary64 interpreters, reports exact coefficient/no-wrap metadata,
+and returns deterministic work and binary64 roundoff diagnostics. Validation
+manifests cap matrix and RHS periodic terms before proving or verification.
 
-### 4.1 Payload
+For the current family, endpoint work depends on the registered periods and
+`log2(n)`, not on `n` or `nnz(A)`. A family without such a capability is not
+eligible for the succinct profiles merely because it has a sparse row iterator.
 
-The canonical challenge payload contains, in order:
+## 4. Problem-instance challenge
+
+### 4.1 Signed payload
+
+The canonical unsigned `ChallengePayload` contains:
 
 ```text
 schema tag                     u16 = 1
-issuer                         bounded string
-key_id                         bounded string
+issuer                         bounded visible-ASCII string
+key_id                         bounded visible-ASCII string
 issued_at_unix_seconds         i64
 expires_at_unix_seconds        i64
 entropy                        32 bytes
@@ -122,35 +135,26 @@ problem_template_digest        32 bytes
 retry_policy                   u16 = replay-allowed-v1
 ```
 
-`expires_at` must be later than `issued_at`. The server issues timestamps from a
-nonnegative Unix clock, chooses 32 bytes from the operating-system RNG, and
-binds the digest of the complete validated template. Its configured challenge
-lifetime is fixed for all challenges it later accepts.
+The server chooses 32 bytes from the operating-system RNG, uses a nonnegative
+Unix timestamp, and signs the digest of the complete validated template.
+`expires_at` must be later than `issued_at` and the configured service accepts
+only its expected challenge lifetime.
 
-The retry policy is explicit because the service is stateless. It does not imply
-one-shot use.
-
-### 4.2 Signature
-
-The Ed25519 signature preimage is the canonical encoding:
+The Ed25519 signature message is:
 
 ```text
 bytes("sparse-solve/challenge-signature/ed25519/v1")
-bytes(canonical_challenge_payload)
+|| bytes(canonical_unsigned_payload)
 ```
 
-where `bytes` is the `u64` big-endian length-delimited encoding above. The
-signature is excluded from its own preimage.
+where `bytes` is the canonical length-delimited encoding. Verification uses
+strict Ed25519 and an externally configured public key, issuer, and key ID. An
+artifact-carried key would be an identifier, not a trust anchor.
 
-Validators select a trusted key from externally expected issuer and key ID,
-perform strict Ed25519 verification, reject a challenge issued too far in the
-future, and reject validation after expiry. They recompute the template digest
-instead of trusting the redundant payload field.
+### 4.2 Instance seed
 
-### 4.3 Instance seed
-
-The challenge context is the canonical unsigned payload bytes, not its JSON and
-not its signature. The problem layer derives:
+The exact unsigned payload bytes are the challenge context. The signature and
+JSON spelling are excluded from seed derivation:
 
 ```text
 hasher = BLAKE3-DERIVE-KEY("sparse-solve/problem-instance-seed/v1")
@@ -160,120 +164,126 @@ hasher.update(challenge_context)
 instance_seed = hasher.finalize_xof()[0..32]
 ```
 
-The template digest appears both before the context and inside the payload. This
-redundancy is intentional and checked. Re-signing an identical payload does not
-change `A,b`; changing issuer, key ID, time, entropy, template, or retry policy
-does.
+The template digest is deliberately present both before the context and inside
+the signed payload. The validator recomputes both occurrences. Re-signing an
+identical payload leaves `A,b` unchanged; changing issuer, key ID, time, entropy,
+template, or retry policy changes the seed.
 
-Generator components derive independent streams with
-`BLAKE3-DERIVE-KEY("sparse-solve/problem-subseed/v1")`, the instance seed, and a
-length-delimited component label. Matrix and RHS labels are distinct.
+Generator components derive separate streams with the fixed
+`sparse-solve/problem-subseed/v1` derive-key context plus a length-delimited
+component label. Matrix and RHS labels are distinct.
 
-`FinalizedProblem` records the template digest, exact challenge-context bytes,
-context digest, and redundant derived seed. Parsing recomputes and compares all
-of them. The direct artifact separately carries the complete signed challenge,
-and validation requires its unsigned payload to equal the embedded context.
+The finalized problem records the template digest, exact challenge-context
+bytes, context digest, and redundant derived seed. Parsing recomputes them. A
+self-contained hosted artifact also carries the full signed challenge, and its
+unsigned payload must equal the finalized problem's recorded context.
 
-## 5. Explicit literal local mode
+### 4.3 Explicit local mode
 
-A local template may instead contain:
+Local templates use the distinct form:
 
 ```json
 {
   "kind": "literal-v1",
-  "seed": "<32 lowercase-hex bytes>"
+  "seed": "<64 lowercase hexadecimal characters>"
 }
 ```
 
-This is an explicit variant; an all-zero seed is valid if deliberately written.
-An absent header, empty bytes, invalid signature, or expired challenge never
-falls back to local mode.
+An all-zero literal is valid when explicitly written. An absent header, empty
+bytes, bad signature, expired challenge, or unknown version never falls back to
+literal mode. The offline validator requires explicit permission; the hosted
+service rejects literal submissions.
 
-The offline validator requires `--allow-literal`. The hosted service rejects
-literal artifacts unconditionally. Local and hosted problems share generator
-code only after obtaining their instance seed.
+## 5. Validation manifest and common statement
 
-## 6. Validation manifest and solution input
-
-The implemented manifest is:
+`ValidationManifest` schema `sparse-solve/validation/v1` contains:
 
 ```text
-schema                  sparse-solve/validation/v1
-protocol                direct-reference-v1
-max_solution_elements   positive bounded u64
+protocol                    one registered ProofProtocol
+max_solution_elements       positive bounded u64
+max_public_matrix_terms     positive bounded u64
+max_public_rhs_terms        positive bounded u64
 ```
 
-It has its own canonical digest and is not part of matrix-seed derivation. A
-future exact or fast manifest can therefore validate the same public instance.
-The hosted service has an independent maximum solution-element policy. It does
-not issue challenges above that dimension and rejects manifests whose declared
-cap is larger, before allocating the packed solution.
+It has its own canonical digest and is excluded from matrix-seed derivation. One
+finalized problem can therefore be validated under several reviewed profiles.
+The proof cannot weaken limits or switch protocols because the outer header,
+manifest, statement digest, backend dispatch, and certificate all bind the same
+protocol ID.
 
-The solver-facing solution JSON uses schema
-`sparse-solve/solution/binary64-v1` and a flat array of decimal strings. Parsing
-produces contiguous binary64 values and rejects wrong length, NaN, infinity,
-negative zero, and subnormals. Proof artifacts store the already validated IEEE
-bits, not decimal text.
-
-## 7. Direct proof container
-
-`direct-reference-v1` uses this big-endian prelude:
+The common statement constructor validates problem/challenge consistency,
+compiles the generator, checks dimension and public-evaluator term limits, and
+derives:
 
 ```text
-magic                         "SSVPRF\0\0"
+transcript_digest = H(
+    protocol_id,
+    problem_digest,
+    validation_manifest_digest
+)
+```
+
+before any backend message exists.
+
+## 6. Proof framing
+
+### 6.1 Shared artifact
+
+All newly produced direct, exact, and fast payloads use the strict
+backend-neutral `SSVART` container:
+
+```text
+magic                         "SSVART\0\0"
 container_version             u16 = 1
-proof_kind                    u16 = 1
-proof_version                 u16 = 1
-transcript_suite              u16 = 0
+protocol_id                   u16
 flags                         u32
-application_header_length     u64
-application_header            bytes
-public_context_length         u64
-public_context                bytes
-```
+problem_challenge_length      u64
+problem_challenge             canonical SignedChallenge or empty
+problem_json_length           u64
+problem_json                  canonical compact typed JSON
+manifest_json_length          u64
+manifest_json                 canonical compact typed JSON
 
-Flag bit zero says that the application header contains a canonical
-`SignedChallenge`. No other flag is recognized. Literal mode has zero flags and
-an empty header; presence and flag must agree.
+payload tag                   u16 = 1
+payload frame version         u16 = 1
+payload length                u64
+backend payload               exact payload length
 
-The public context contains two length-delimited strict JSON documents:
-
-```text
-finalized_problem_json
-validation_manifest_json
-```
-
-The only payload frame is:
-
-```text
-tag                           u16 = 1
-frame_version                 u16 = 1
-payload_length                u64
-solution_element_count        u64
-solution_bits                 count packed u64 IEEE encodings
-```
-
-A mandatory final frame follows:
-
-```text
-tag                           u16 = 65535
-frame_version                 u16 = 1
-payload_length                u64 = 0
+final tag                     u16 = 65535
+final frame version           u16 = 1
+final payload length          u64 = 0
 physical EOF
 ```
 
-The parser checks context, proof, field, manifest, dimension, element, and
-allocation limits before numerical work. The proof digest covers the complete
-container under the `sparse-solve/direct-proof-artifact/v1` digest domain.
+The one recognized flag states whether a signed problem challenge is present.
+Flag and bytes must agree. The parser rejects a header/manifest protocol mismatch,
+noncanonical compact public JSON, resource-policy excess, a missing final frame,
+and trailing bytes. Succinct backend decoders apply a tighter payload limit than
+the outer direct-reference ceiling.
 
-The artifact reveals all of `x`, is linear in `n`, and takes `O(nnz(A))`
-validation work. It is not a succinct or zero-knowledge proof.
+The complete outer artifact has its own domain-separated proof digest. Each
+backend also owns strict, versioned inner framing; a common envelope is not a
+generic proof instruction language. Direct verification is dispatched through a
+separate reference-backend trait that receives the full public statement, while
+exact and fast receive the restricted no-row-access verifier statement.
 
-## 8. Direct validation semantics
+### 6.2 Direct-reference payload and legacy container
 
-The validator compiles `A,b` from the finalized problem, streams rows in
-increasing order, and iterates each row in increasing column order. For every
-row it computes:
+Inside `SSVART`, `direct-reference-v1` uses a strict `SSVDIR` payload whose only
+data frame contains an element count and packed canonical IEEE binary64 bits,
+followed by a mandatory final frame and EOF.
+
+The library retains the original strict `SSVPRF` direct container as a legacy
+compatibility API and byte-format oracle. Current CLI output uses `SSVART`; a
+transport migration must not silently reinterpret historical `SSVPRF` bytes.
+
+The profile reveals all of `x`, is linear in `n`, and scans every sparse row. It
+exists for integration and independent relation checks only.
+
+## 7. Direct validation semantics
+
+The direct validator compiles public `A,b`, visits rows and columns in fixed
+increasing order, and evaluates:
 
 ```text
 ax = 0
@@ -283,122 +293,311 @@ for (column, value) in row:
 residual = ax - binary64(rhs[row])
 ```
 
-The row and squared-norm reductions are sequential and do not deliberately use
-fused multiply-add. Validation rejects non-finite arithmetic, a nonzero
-residual whose binary64 square underflows to zero, overflow of the accumulated
-squared norm, and a nonzero squared norm whose mean underflows to zero. Thus a
-reported zero norm means every computed binary64 residual was zero. The output
-reports:
+It deliberately does not request fused multiply-add and performs sequential
+norm reduction. It rejects non-finite arithmetic and underflow cases that could
+turn a nonzero residual or mean into a reported zero. The proof carries no
+trusted residual claim. Output includes squared L2, L2, RMS, maximum absolute
+residual, rows visited, and nonzeros visited.
+
+Direct binary64 semantics are a baseline; they are not identical to the exact
+profile's once-quantized Q63.64 statement for every possible input.
+
+## 8. Exact sparse-solve profile
+
+### 8.1 Statement
+
+`whir-field192-l2-v4` converts the solver's validated binary64 output once to a
+signed Q63.64 integer vector `X`. For a matrix mantissa scale `2^-f`, RHS scale
+`2^-g`, and the generator-derived alignment shift, it constructs an exact integer
+residual `R`. In the common `f=4`, `g=64` case:
 
 ```text
-squared_l2, l2, rms, max_abs, rows_visited, nonzeros_visited
+R_i = sum_j m_ij X_j - 2^f B_i
+(Ax-b)_i = R_i * 2^-(64+f)
+rho = sum_i R_i^2
+||Ax-b||_2^2 = rho * 2^(-2(64+f)).
 ```
 
-The proof supplies no trusted residual claim. The validator recomputes all
-metrics. No quality threshold is applied: a correctly bound poor solution is a
-valid direct artifact with a large residual.
+`X` spans signed 128-bit Q63.64. The profile constrains each residual to the
+signed 69-bit representation `[-2^68, 2^68-1]`. Generator-derived row, RHS, and
+norm bounds are checked against the Field192 modulus before a field identity is
+interpreted as an integer identity.
 
-## 9. Signed certificate
+“Exact” means exact for this quantized witness and dyadic public problem. It does
+not mean the original floating-point solver executed exact arithmetic.
 
-After successful hosted validation, the canonical certificate payload contains:
+### 8.2 Commitment layout
+
+Each witness integer is decomposed into 31 nibbles, a top-three-bit value, and a
+sign bit. Each residual uses 17 nibbles and a sign bit. These 51 logical columns
+are packed into one `64 x L` table, where
 
 ```text
-schema
-issuer
-key_id
-issued_at_unix_seconds
-optional challenge_digest
-problem_digest
-validation_manifest_digest
-proof_digest
+L = next_power_of_two(max(n, 64)).
+```
+
+Unused selector columns and the logical row tail are zero. Six leading Boolean
+coordinates select one of 64 slots; remaining coordinates select a row. One
+pinned Field192/WHIR commitment binds the packed table.
+
+### 8.3 Transcript schedule
+
+The exact proof uses one self-contained Fiat--Shamir transcript with this fixed
+composition:
+
+1. bind the fixed WHIR profile, public statement digest, exact protocol header,
+   commitment, and claimed `rho`;
+2. range/padding sumcheck over all digit columns and tail masks;
+3. compressed sparse matvec sumcheck, ending at public
+   `A_tilde(u,v)` and `b_tilde(u)` plus authenticated private endpoints;
+4. residual-norm sumcheck binding `rho` to the committed residual; and
+5. one WHIR opening proof authenticating all packed digit endpoints, followed by
+   WHIR's deferred final check and strict inner EOF.
+
+The range argument gives field values their bounded integer meaning. The matvec
+argument binds residual to `AX-B`. The norm argument binds `rho` to `R`. WHIR
+binds all private scalar endpoints to the original table. Omitting any one of
+these connections changes the statement.
+
+The WHIR profile pins Field192, unique decoding, inverse rate two, folding factor
+four, BLAKE3 Merkle hashing, no proof-of-work bits, and a computed security target
+of at least 128 bits. Neither a manifest nor proof supplies these parameters.
+
+### 8.4 Exact output and verifier work
+
+The accepted output is an unsigned exact numerator and dyadic denominator power.
+An approximate decimal is a display convenience only. The verifier constructs
+public endpoints through `PublicEvaluationPlan`; it performs zero generator-row
+queries and materializes zero solution or residual elements.
+
+## 9. Fast metric profile
+
+### 9.1 Semantics and floating contract
+
+`fast-binary64-unit-circle-v2` is a provisional metric certificate. It applies
+the exact path's one-time Q63.64 witness conversion, converts that witness back
+to binary64 deterministically, and computes `R = Ax-b` under a frozen binary64
+policy. Solver input rejects negative zero; internal source normalization maps
+either arithmetic zero sign to positive zero, while transcript decoders reject a
+negative-zero encoding. NaN, infinity, and source/transcript subnormals are
+rejected. Protocol arithmetic rejects non-finite results and flushes subnormal
+results to positive zero. The operation order is fixed and does not silently
+introduce FMA.
+
+The profile pads `x` and `R` to `N = next_power_of_two(n)` and packs:
+
+```text
+W = [x_0, ..., x_(N-1), R_0, ..., R_(N-1)].
+```
+
+### 9.2 Precommitment and unit-circle code
+
+`W` is bit-reversed into monomial-coefficient order and evaluated on twice as
+many complex roots of unity as coefficients. The resulting rate-one-half
+unit-circle codeword is committed with a BLAKE3 Merkle root.
+
+The strict precommitment binds the statement, problem, manifest, public-evaluator
+metadata, numerical policy, code basis, source digests, shapes, nonce mode, and
+packed codeword root before the first algebraic challenge. Source digests are
+linkage metadata; the root plus opening protocol supplies proof binding.
+
+### 9.3 External and offline nonce modes
+
+External mode sends the canonical precommitment digest to
+`POST /v1/commitment-challenges`. The signed response contains:
+
+```text
+issuer and key ID
+issued-at and expiry timestamps
+fresh entropy
+problem digest
+validation-manifest digest
+fast protocol ID
+commitment digest
+replay-allowed-v1 policy
+```
+
+The response uses its own Ed25519 signature domain. The backend checks statement
+and commitment binding and absorbs the complete signed object at the fixed
+post-commit transcript point. The service layer additionally verifies issuer,
+key, signature, lifetime, and freshness before certification.
+
+Offline mode is separately encoded in the precommitment. It derives a
+domain-separated nonce from the canonical precommitment bytes and has no external
+timestamp. Missing or invalid external data never causes a fallback to offline
+mode.
+
+### 9.4 Proof schedule
+
+After nonce binding, the transcript is fixed as follows:
+
+1. residual-norm binary64 product sumcheck, yielding `R_tilde(u)`;
+2. sparse matvec binary64 product sumcheck, using generator-owned
+   `b_tilde(u)` and `A_tilde(u,v)` and yielding `x_tilde(v)`;
+3. a batching challenge and linear-opening sumcheck for
+   `x_tilde(v) + alpha R_tilde(u)` against committed `W`;
+4. one child Merkle root after each coefficient-aligned unit-circle fold, with
+   the child committed before the next challenge;
+5. transcript-derived unique recursive query trajectories only after every root
+   is fixed; and
+6. canonical joint Merkle multiproofs for each queried `z/-z` parent pair and
+   child, ending in a verified two-leaf constant oracle.
+
+The third sumcheck is required. A Merkle root and sampled code proximity do not
+by themselves authenticate an arbitrary MLE endpoint supplied by the prover.
+
+### 9.5 Tolerance and score semantics
+
+Fast policy 2 freezes ordinary sumcheck and endpoint tolerance at:
+
+```text
+absolute = 2^-42
+relative = 4096 * epsilon_binary64
+```
+
+and unit-circle fold tolerance at:
+
+```text
+absolute = 2^-38
+relative = 131072 * epsilon_binary64.
+```
+
+It derives between 1 and 64 distinct recursive query trajectories. Each check
+reports a defect normalized by a validator-computed
+absolute-plus-scale-relative allowance.
+The scale includes operation inputs, not only a possibly tiny post-cancellation
+result. The score records count, threshold exceedances, maximum absolute defect,
+maximum normalized defect, and RMS normalized defect for:
+
+- residual-norm sumcheck;
+- sparse matvec sumcheck;
+- linear-opening sumcheck; and
+- unit-circle folds.
+
+Consistency passes only when every category has no exceedance and maximum
+normalized defect at most one. The residual magnitude remains separate caller
+policy.
+
+For `q` distinct trajectories, the reported per-round conditional miss curve
+for a fixed bad fraction `phi` is `(1-phi)^q`. The implementation reports
+examples for 1%, 5%, and 10% bad fractions. These values are not multiplied
+across rounds because the same trajectories are reused and the composition has
+no theorem justifying such multiplication.
+
+The fast verifier authenticates framing, commitments, openings, sampled folds,
+and public endpoints and returns zero row queries and zero materialized solution,
+residual, or codeword elements. Its unresolved global metric soundness statement
+is why this profile remains provisional and should be followed by the exact
+profile when exact assurance is required.
+
+## 10. Signed certificate
+
+Certificate schema `sparse-solve/validation-certificate/v2` binds:
+
+```text
+issuer and key ID
+certificate issue time
+required problem-challenge digest
+fast-only commitment-challenge digest
+problem digest
+validation-manifest digest
+proof digest
 proof protocol
-squared_l2, l2, rms, max_abs as canonical IEEE bits
-validator_build identifier
+one protocol-matched typed score
+validator-build identifier
 ```
 
-The signature preimage uses the certificate-specific domain:
+The Ed25519 signature message is:
 
 ```text
 bytes("sparse-solve/certificate-signature/ed25519/v1")
-bytes(canonical_certificate_payload)
+|| bytes(canonical_certificate_payload)
 ```
 
-The JSON certificate is only a transport spelling of the typed payload and
-lowercase-hex signature. Verification reconstructs canonical bytes and uses an
-external issuer, key ID, and public key.
+The score variants are deliberately different:
 
-The implemented `verify-certificate` command authenticates that signed payload.
-It does not re-run the proof, check certificate freshness or expiry, or compare
-the recorded challenge/problem/proof digests with caller-supplied files. Those
-are separate application-policy checks.
+- direct: binary64 squared L2, L2, RMS, and maximum absolute residual;
+- exact: unsigned residual numerator plus dyadic denominator power; and
+- fast: binary64 squared L2 plus four consistency summaries and the distinct
+  recursive-query-trajectory count.
 
-A certificate reports the residual for one specific proof digest. It does not
-say that the residual is globally best, acceptable under some unrecorded
-threshold, or attributable to a particular solver identity.
+A v2 certificate always carries the signed problem-challenge digest. It carries
+the post-commit challenge digest if and only if its protocol is fast: that field
+is required for fast and forbidden for direct or exact. A score/protocol or
+challenge-field/protocol mismatch is invalid. A relying party verifies the
+signature with an external trust anchor and pins whatever problem, manifest,
+proof, challenge, time, and quality policy its application requires.
 
-## 10. Stateless service and HTTP
+A certificate reports one submitted proof's result. It does not claim that the
+residual is good, globally best, attributable to a solver identity, or based on a
+one-shot challenge.
+
+## 11. Stateless service semantics
 
 The HTTP adapter exposes:
 
 ```text
 GET  /healthz
-POST /v1/challenges   JSON ProblemTemplate -> JSON SignedChallenge
-POST /v1/validate     binary DirectArtifact -> JSON SignedCertificate
+POST /v1/challenges
+POST /v1/commitment-challenges
+POST /v1/validate
 ```
 
-Template and proof bodies have separate size limits; the proof-body limit is
-derived from the configured solution-element cap. CPU-heavy validation runs on
-the blocking pool behind both an early per-route concurrency limit and an owned
-work permit, while a request deadline bounds slow bodies. Core service logic
-receives explicit time and entropy and contains no HTTP, filesystem, or RNG
-dependency.
+Problem templates and challenge requests use bounded typed JSON; proof artifacts
+use binary bodies; signed challenges and certificates are returned as typed JSON
+whose signatures reconstruct canonical payload bytes.
 
-The HTTP adapter captures one time before relation checking and a fresh time
-after it finishes. Certificate issuance uses the latter and is refused if the
-challenge expired during validation or if the clock moved behind the start time.
+Every hosted submission must carry a valid service-issued problem challenge.
+Hosted fast validation additionally requires external nonce mode and a valid
+service-issued post-commit challenge bound to that artifact's problem, manifest,
+protocol, and commitment. The post-commit challenge may not predate the problem
+challenge. The hosted service rejects literal problems and offline fast mode;
+those modes require explicit local-validator flags.
 
-Cloud Run listens on `0.0.0.0:$PORT`. Local clients connect to
-`127.0.0.1:$PORT`; `0.0.0.0` is a bind address, not a destination URL.
+The service captures validation start time before proof work and completion time
+after it. It refuses certification when the challenge expires during validation
+or the clock moves behind required events. CPU work runs on a blocking pool behind
+body, concurrency, and deadline controls.
 
-The service checks expiry but stores no challenge, proof, or certificate state.
-It therefore cannot enforce one-time use, reject replay, limit certificates per
-challenge, or remember a global/per-problem best residual. Those properties
-require durable storage and atomic updates.
+For Cloud Run, the listener binds `0.0.0.0:$PORT`. `0.0.0.0` is not a client URL;
+local clients use `127.0.0.1:$PORT` and deployed clients use the service URL.
 
-Challenge issuance accepts a caller-selected template and signs fresh entropy
-bound to its digest. This supports arbitrary registered families, but it does
-not certify that a family is difficult or prevent repeated issuance for seed
-grinding. Any benchmark or reward policy must pin its accepted template/problem
-and apply authentication, quotas, and rate limits outside this stateless core.
+The service stores no challenge, commitment, proof, or certificate state. Its
+explicit retry policy is therefore `replay-allowed-v1`. Expiry and fresh entropy
+do not provide one-shot semantics. Without durable transactional state the
+service cannot:
 
-## 11. Separate fast post-commit challenge
+- reject reuse or replay;
+- issue exactly one nonce for a commitment;
+- limit certificates per challenge;
+- compare against prior submissions; or
+- certify a global or per-problem best residual.
 
-The signed challenge above exists before solving and determines public `A,b`.
-A future external-challenge fast proof must first commit to its solution/residual
-encoding and then obtain a second nonce bound to that commitment digest. The
-matrix challenge cannot substitute for this later event.
+A signed problem challenge also does not attest that a caller-selected template
+is difficult. Benchmark or reward systems must pin allowed templates/problems
+and apply authentication, quotas, and durable state outside this stateless core.
 
-A stateless service can return a signed token containing the commitment digest,
-nonce, and timestamp, which attests to ordering. It still cannot stop repeated
-nonce requests or replay without durable state. Offline Fiat--Shamir mode must be
-an explicitly different manifest and never an automatic fallback.
+## 12. Conformance and release requirements
 
-The exact Field192/WHIR path can remain fully Fiat--Shamir and does not need the
-fast path's external post-commit nonce.
+The research implementation is the protocol/conformance oracle, not a source of
+current-repository performance results. Before a production release, publish
+byte-for-byte vectors for:
 
-## 12. Versioning and required tests
+1. canonical template, problem, manifest, statement, challenge, precommitment,
+   proof, and certificate encodings;
+2. instance and component seed derivation;
+3. matrix rows, RHS values, and generator certificates;
+4. exact and binary64 public MLE endpoints at Boolean and non-Boolean points;
+5. exact transcript challenges, digit openings, and WHIR acceptance;
+6. fast transcript challenges, code roots, folds, query indices, multiproofs,
+   and normalized scores;
+7. external and offline challenge-mode separation;
+8. mutation, cross-kind, cross-version, cross-statement, truncation, resource,
+   and trailing-byte rejection; and
+9. exact and fast verifier work counters showing zero generator-row queries and
+   zero private-vector materialization.
 
-Changing a canonical field, tag, field order, byte order, domain, generator
-rule, numerical operation order, signature preimage, proof schedule, or output
-meaning requires a new version.
-
-The current suite covers canonical boundary/mutation parsing, strict JSON,
-digest and seed binding, row structure and generator certificates, unbiased
-sampling, signed challenge mutation, expiry, template rebinding, explicit local
-mode, final-frame/EOF enforcement, exact manufactured-solution residuals, and
-certificate signature verification.
-
-Before a production release, add published byte-for-byte golden vectors,
-coverage-guided fuzzing of every untrusted decoder, independent generator and
-residual implementations, signature key-rotation tests, deployment load tests,
-and release benchmarks for artifact size, time, and peak memory.
+Coverage-guided fuzzing of every untrusted decoder, independent relation and
+generator implementations, key-rotation tests, and deployment load tests remain
+required. Performance measurement requirements are in
+[benchmarking.md](benchmarking.md).

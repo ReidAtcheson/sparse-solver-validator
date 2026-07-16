@@ -8,9 +8,12 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+hex.workspace = true
+serde.workspace = true
 serde_json.workspace = true
-ssv-direct = { path = "../../crates/ssv-direct" }
+ssv-backends = { path = "../../crates/ssv-backends" }
+ssv-fast = { path = "../../crates/ssv-fast" }
 ssv-problem = { path = "../../crates/ssv-problem" }
 ssv-service-protocol = { path = "../../crates/ssv-service-protocol" }
 ssv-solution = { path = "../../crates/ssv-solution" }
-
+ssv-validation = { path = "../../crates/ssv-validation" }

@@ -15,7 +15,6 @@ rand_core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ssv-canonical = { path = "../../crates/ssv-canonical" }
-ssv-direct = { path = "../../crates/ssv-direct" }
 ssv-problem = { path = "../../crates/ssv-problem" }
 ssv-service = { path = "../../crates/ssv-service" }
 ssv-service-protocol = { path = "../../crates/ssv-service-protocol" }

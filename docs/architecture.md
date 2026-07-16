@@ -1,431 +1,443 @@
 # Architecture
 
-**Status:** implemented direct-reference and stateless-service baseline, plus a
-roadmap for later succinct backends
+**Status:** implemented development system with direct, exact, and provisional
+fast profiles wired through the library registry, command-line tools, and
+stateless service. This is not a production-readiness or performance claim.
 
-This repository is a clean implementation of a service that validates one
-solution of one generated sparse linear system. The research repository remains
-a mathematical reference and regression oracle; it is not the module layout for
-this project and code should not be copied from it wholesale.
-
-The first usable backend is intentionally simple. It receives the complete
-solution vector, independently evaluates the public relation, and reports the
-residual. This establishes file formats, generator determinism, command-line
-workflows, and service signing before succinct proof machinery and independent
-cross-implementation vectors are introduced.
-
-`direct-reference-v1` is **not a succinct proof**. It carries `x`, takes linear
-space on the wire, and performs at least `O(nnz(A))` validation work. It exists
-only as an integration baseline and as an independent relation checker for the
-later exact and fast proof backends.
-
-## 1. Design principles
-
-1. `A` and `b` are public, deterministic outputs of a registered, versioned
-   generator. A proof never gets to redefine them.
-2. A problem template describes the matrix family, RHS recipe, and randomness
-   policy. A local template carries its explicit literal seed; a hosted template
-   receives its seed only after a signed challenge finalizes one instance.
-3. The mathematical problem is separate from the validation backend. The same
-   finalized `A,b` can be checked by the direct, exact, or fast backend.
-4. Proving and validation are separate processes. The prover reads `x` from a
-   file and writes an artifact; it does not share memory or implementation state
-   with the validator.
-5. Network transport is outside proof semantics. The same strict submission can
-   be verified by the offline validator or sent as an HTTP request.
-6. Signed challenge and certificate payloads have canonical binary encodings.
-   JSON is their strict transport spelling; signatures are reconstructed from
-   typed canonical bytes rather than raw JSON formatting.
-7. Each proof version has a fixed verifier. There is no prover-selected proof
-   program or generic interpreter.
-8. Hot numerical data is flat and contiguous. Parsers validate structure once at
-   the boundary, and validated types carry those invariants into hot loops.
-
-## 2. End-to-end flow
-
-The hosted path is:
+This repository turns the sparse-solve research prototype into a modular Rust
+system with explicit statement, generator, proof, service, and transport
+boundaries. It validates one solution of one public generated system at a time:
 
 ```text
-problem template
+A x = b,                     R = A x - b.
+```
+
+The proof establishes the residual score for the committed or transmitted
+solution. It does not decide whether that residual is useful; a caller applies
+its own quality policy.
+
+## 1. Source of protocol truth
+
+The `sparse-solution-stark` research repository, its design documents, and the
+validated-solution blog post are the protocol and conformance oracle for the
+exact and fast profiles. This means the rewrite should preserve reviewed
+mathematical statements, coordinate order, transcript order, numerical policy,
+commitment parameters, and test vectors.
+
+It does **not** mean copying the research repository's application structure or
+assuming that two similar implementations are independent evidence. Reusable
+components are extracted behind narrow contracts, and the simple direct relation
+checker remains an independent end-to-end oracle. Cross-repository fixtures
+should compare generated rows, public MLE endpoints, transcript challenges,
+residual values, proof acceptance, and malformed-proof rejection.
+
+The pinned upstream WHIR revision is also part of the exact profile. Its status
+as an academic prototype must remain visible; preserving a research configuration
+is not a production security audit.
+
+## 2. Architectural invariants
+
+1. `A` and `b` are public outputs of a registered, versioned generator. A proof
+   cannot redefine either object.
+2. A problem template and an instance-seed origin determine the mathematical
+   problem. A validation manifest independently selects direct, exact, or fast
+   validation.
+3. Provers may scan generated sparse rows. Succinct validators may not scan rows
+   or enumerate RHS entries; they receive only the generator-owned public-MLE
+   capability.
+4. Exact and fast profiles share statements, generators, framing, Q63.64 witness
+   conversion, and selected algebraic primitives. The exact profile constructs
+   an integer residual; the fast profile recomputes its residual in binary64.
+   They do not share a misleading lowest-common-denominator arithmetic or
+   soundness claim.
+5. Every backend is an immutable, versioned verifier schedule. There is no
+   prover-selected proof program.
+6. Network transport does not define proof semantics. Offline and hosted paths
+   verify the same strict artifact bytes.
+7. Local literal randomness, hosted problem challenges, external fast
+   post-commit challenges, and offline fast Fiat--Shamir are explicitly tagged
+   modes. None is an error fallback for another.
+8. Hot data uses flat contiguous storage and validated indices. Untrusted lengths
+   and resource policy are checked before large allocation or expensive work.
+
+## 3. End-to-end flows
+
+### 3.1 Hosted problem and validation
+
+```text
+ProblemTemplate
       |
+      | POST /v1/challenges
       v
-challenge service --signs--> signed challenge
-      |                              |
-      |                    template digest + entropy
-      |                              |
-      +------------------------------+
-                                     v
-                           finalized public A,b
-                                     |
-solution file x --> sparse-prover --> validation submission
-                                     |
-                                     v
-                           sparse-validator-server
-                                     |
-                        verify one submitted relation
-                                     |
-                                     v
-                              signed certificate
+SignedChallenge(template digest, entropy, time)
+      |
+      | canonical unsigned payload -> instance seed
+      v
+FinalizedProblem -> public generated A,b
+      |
+      +-------------------------+
+                                |
+solver writes x                 |
+      |                         |
+      v                         v
+sparse-prover ------------> validation artifact
+                                |
+                                | POST /v1/validate
+                                v
+                     sparse-validator-server
+                                |
+                         verify one artifact
+                                |
+                                v
+                        signed certificate
 ```
 
-The local path replaces the signed challenge with the explicitly tagged
-`literal-v1` seed origin. Empty bytes, a zero signature, or a missing
-challenge are never interpreted as local mode.
+The certificate identifies one problem, manifest, protocol, and proof digest. A
+stateless service does not claim that it is the first submission or the best
+residual.
 
-Repeated solves are repeated independent requests. The MVP neither batches
-solutions nor maintains a leaderboard.
+### 3.2 Local and offline validation
 
-## 3. Core domain objects
+A local template uses the explicit `literal-v1` seed form. The offline validator
+accepts it only when local mode is explicitly enabled. Exact proofs derive their
+interactive challenges from their pinned Fiat--Shamir transcript. The fast
+profile also has an explicit offline Fiat--Shamir precommitment mode, which has no
+external timestamp and weaker practical grinding resistance than its external
+mode.
 
-### 3.1 Problem template
+### 3.3 Fast external precommitment
 
-A `ProblemTemplate` fixes everything required to interpret public data except
-the instance seed:
-
-- matrix family and generator version;
-- dimensions, sparsity and boundary rules;
-- exact coefficient representation and generation parameters;
-- RHS generator and version; and
-- requested output, initially squared L2 residual.
-
-The template is canonical and content-addressed. A hosted challenge signs its
-template digest, so challenge entropy cannot later be applied to another family
-or dimension.
-
-### 3.2 Finalized problem
-
-A `FinalizedProblem` combines a validated template with a 32-byte instance seed.
-The seed comes from exactly one tagged origin:
-
-- `challenge-derived-v1`, derived from a verified challenge payload; or
-- `literal-v1`, supplied directly for tests, examples, and benchmarks.
-
-The current family derives one sub-seed for matrix off-diagonal values and, for
-the seeded RHS variant, one distinct RHS sub-seed. Its tridiagonal support and
-diagonal rule are deterministic and need no random stream. Generator code
-consumes an `InstanceSeed`; it does not need to know whether the seed was hosted
-or local.
-
-The problem digest identifies the complete finalized problem record, including
-its seed provenance, not merely an equivalence class of numerically identical
-`A,b`. Challenge provenance also has a separate digest bound into hosted
-certificates. Signature bytes do not affect `A,b`: re-signing an identical
-unsigned challenge payload leaves the instance seed unchanged.
-
-### 3.3 Solution file
-
-A solution file is a versioned, bounded vector input. The prover CLI takes it as
-a file; passing millions of values through command-line arguments is not
-supported. The implemented solver-facing format is JSON containing decimal
-strings. It normalizes into a validated contiguous `Box<[f64]>`, and the proof
-artifact contains canonical IEEE bits rather than the original JSON spelling.
-The parser rejects NaNs, infinities, negative zero, and subnormals. A future
-packed input format or fixed-point encoding would require its own explicit
-version; neither is currently accepted by the CLI.
-
-### 3.4 Validation manifest and backend artifact
-
-A validation manifest selects a registered backend and all of its security or
-numerical parameters. It is digested separately from the problem so a single
-problem can be validated by more than one backend.
-
-The backend artifact is backend-specific:
-
-- `direct-reference-v1` contains the complete canonical `x` vector;
-- an exact artifact will contain commitments, sumcheck messages, openings, and
-  an exact residual claim, but not `x`; and
-- a fast artifact will contain a committed numerical encoding and sampled
-  openings, but not `x`.
-
-Every artifact binds the problem digest, validation-manifest digest, backend ID,
-and backend version.
-
-### 3.5 Submission, result, and certificate
-
-A validation submission packages the finalized problem provenance, validation
-manifest, and backend artifact in one strict file. The core verifier returns a
-typed backend validation result; it has no signing key and performs no network
-I/O.
-
-The service signs a `ValidationCertificate` only after core verification. A
-certificate reports the residual established for **one submission**. It does not
-claim that the residual is globally best, that the solution is optimal, or that
-the challenge was used only once.
-
-## 4. Initial Rust workspace
-
-The initial workspace uses small crates with one-directional dependencies. Core
-crates do not depend on CLI, HTTP, or a concrete key-storage mechanism.
-
-| Crate | Responsibility | Explicitly does not own |
-| --- | --- | --- |
-| `ssv-canonical` | Canonical primitives, bounded readers/writers, typed digests, domain-separated BLAKE3 helpers, strict framing | Generators, signatures, numerical validation |
-| `ssv-problem` | Template parsing, seed finalization, family registry, deterministic row/RHS generation, generator certificates | Service policy, proof messages, HTTP |
-| `ssv-solution` | Strict solution-vector formats and validated flat storage | Matrix generation, proving, scoring |
-| `ssv-service-protocol` | Challenge, manifest, result, and certificate types; Ed25519 signing and verification; timestamp policy | Numerical relation checks, private-key persistence, HTTP server state |
-| `ssv-direct` | Independent `direct-reference-v1` prover/decoder and sparse relation checker | Succinctness or privacy claims, service signing |
-| `ssv-service` | Stateless challenge issuance, provenance checks, and post-validation certificate construction | HTTP, clocks, entropy sources, key files |
-
-Dependencies should flow approximately as follows:
+The fast profile has a second, later challenge lifecycle:
 
 ```text
-ssv-canonical
-   |-- ssv-problem
-   |-- ssv-solution
-   `-- ssv-service-protocol
-
-ssv-direct --> canonical + problem + solution + service-protocol types
-ssv-service --> direct + problem + service-protocol
+problem challenge -> fixes A,b -> solve -> commit to encoded [x || R]
+                                            |
+                                            | commitment digest
+                                            v
+                              signed post-commit challenge
+                                            |
+                                            v
+                                      finish proof
 ```
 
-If `ssv-direct` only needs shared validation output types, those types should live
-in a small neutral module rather than making protocol code depend back on a
-backend.
+The matrix-instance challenge cannot replace this post-commit event. The latter
+binds the problem digest, manifest digest, fast protocol, and commitment digest;
+it never changes `A,b`.
 
-Later exact and fast crates should be added around stable mathematical
-components, for example `ssv-transcript`, `ssv-sumcheck`, `ssv-exact`,
-`ssv-fast`, and backend-specific commitment crates. Sharing is earned by a clear
-common contract; exact field arithmetic and provisional binary64 checks should
-not be forced behind a misleading common arithmetic abstraction.
+## 4. Public problem and succinct evaluation
 
-## 5. Executable targets
+### 4.1 Template and finalized problem
+
+`ProblemTemplate` fixes the matrix family, dimensions, boundary rules, exact
+dyadic coefficient recipe, RHS recipe, requested metric, and seed policy. A
+hosted template omits a literal seed and is finalized from a verified signed
+challenge. A local template carries its literal 32-byte seed directly.
+
+The current registered matrix family is a seeded symmetric tridiagonal matrix.
+It uses a flat periodic table of negative dyadic off-diagonal mantissas and a
+diagonal constructed as the absolute off-diagonal row sum plus a positive
+margin. Rows are sorted, duplicate-free, truncated at boundaries, strictly row
+diagonally dominant, and contain at most three entries. Registered RHS variants
+include a manufactured-ones relation and a seeded periodic dyadic RHS.
+
+Compilation validates parameters and derives structural, coefficient, scale,
+dominance, work, and exact-arithmetic bounds from trusted code. Proof-supplied
+certificate fields are never trusted.
+
+### 4.2 Why random-access rows are insufficient
+
+Random-access sparse rows let a prover build a sumcheck in `O(nnz(A))` work, but
+they do not make verification succinct. Both application sumchecks end at public
+values of the form
+
+```text
+A_tilde(u, v) = sum_(i,j) eq_i(u) eq_j(v) A_ij
+b_tilde(u)    = sum_i     eq_i(u) b_i.
+```
+
+If a validator computes either endpoint by scanning rows or RHS entries, it has
+lost the intended validation complexity even if the private witness is
+committed.
+
+### 4.3 Generator-owned MLE capability
+
+`ssv-problem` compiles each registered family into a `PublicEvaluationPlan`. The
+`SuccinctPublicEvaluator` capability supplies matrix and RHS MLE evaluations,
+zero-padding semantics, exact arithmetic bounds, binary64 roundoff diagnostics,
+and deterministic work counters.
+
+The current plan has these invariants:
+
+- Boolean coordinates are most-significant-bit first;
+- logical indices occupy the low prefix of the next-power-of-two domain;
+- the padded tail is exactly zero;
+- exact and binary64 evaluators execute the same generator plan and operation
+  order; and
+- work depends on the registered period and `log2(n)`, not on `n` or `nnz(A)`.
+
+For the current family, matrix work is `O(P_A log n)` and RHS work is
+`O(P_b log n)`, where `P_A` and `P_b` are bounded periodic term counts recorded
+in metadata and capped by the validation manifest. The evaluator does not
+materialize dimension-sized public tables.
+
+The generator owns this capability. Exact and fast backends must not match on a
+matrix-family enum and duplicate its formulas. Adding a family therefore requires
+both a row generator and a reviewed public evaluator before succinct manifests
+can accept it. Arbitrary CSR input needs an authenticated public-data opening or
+another succinct evaluator; a hidden linear scan is not an acceptable fallback.
+
+### 4.4 Enforced verifier boundary
+
+`ssv-validation` exposes two statement views:
+
+```text
+PublicStatement
+    problem + generated rows + manifest + provenance
+    used by provers
+
+VerifierStatement
+    protocol + digests + dimension + PublicEvaluationPlan
+    used by succinct validators
+```
+
+`VerifierStatement` deliberately has no row iterator and no RHS-entry method.
+The exact and fast verifier reports also count generator row queries and
+dimension-sized private materialization; those counters must remain zero. This
+turns the succinctness boundary into an API and regression-test property.
+
+The direct reference backend is the intentional exception. Its job is to scan
+the relation after receiving all of `x`.
+
+## 5. Workspace boundaries
+
+| Crate | Responsibility |
+| --- | --- |
+| `ssv-canonical` | Canonical big-endian encoding, bounded decoding, typed digests, and domain-separated BLAKE3 |
+| `ssv-problem` | Templates, seed derivation, generator compilation, sparse rows, certificates, and the shared succinct public-MLE plan |
+| `ssv-solution` | Strict solver-facing binary64 vector input and contiguous validated storage |
+| `ssv-relation` | Proof-independent Q63.64 witness conversion, exact integer residual relation, and no-wrap bounds; fast reuses the witness conversion but computes its own binary64 residual |
+| `ssv-service-protocol` | Backend IDs, manifests, signed problem challenges, signed post-commit challenges, typed certificate scores, and Ed25519 verification |
+| `ssv-validation` | Backend-neutral public statements, restricted verifier statements, strict outer artifact framing, and backend lifecycle traits |
+| `ssv-direct` | Non-succinct artifact carrying `x` and independent streaming relation checker |
+| `ssv-field-sumcheck` | Reusable flat-table finite-field sumcheck with fixed coordinate and transcript conventions |
+| `ssv-whir-pcs` | Pinned Field192/WHIR commitment profile, opening composition, strict inner certificate framing, and work metrics |
+| `ssv-exact` | Q63.64/Field192 sparse-solve protocol composition and exact score report |
+| `ssv-fast` | Frozen binary64 contract, metric sumcheck, transcript, unit-circle code, Merkle multiproofs, tolerance scoring, and fast protocol composition |
+| `ssv-backends` | Exhaustive application dispatch across registered backends and conversion of accepted verifier reports into protocol-matched certificate scores |
+| `ssv-service` | Transport-independent stateless issuance, provenance checks, backend dispatch, and certificate construction |
+
+The dependency direction is intentional:
+
+```text
+canonical
+  |-- problem -- relation
+  |-- solution -----|
+  |-- service-protocol
+  `-- validation(statement + artifact lifecycle)
+          |-- exact ---- field-sumcheck + whir-pcs
+          |-- fast ----- metric primitives
+          `-- direct --- independent full relation
+
+ssv-backends -> exhaustive direct + exact + fast dispatch
+service -> ssv-backends + validation + service-protocol
+bins    -> library APIs
+```
+
+Shared framing does not imply shared backend payloads. Exact Field192 messages
+and fast binary64/Merkle messages remain individualized formats and verifiers.
+
+## 6. Validation profiles
+
+### 6.1 `direct-reference-v1`
+
+The direct profile stores the complete canonical binary64 solution in its
+artifact. Validation regenerates `A,b`, streams every sparse row in order,
+computes `Ax-b`, and reports squared L2, L2, RMS, and maximum absolute residual.
+
+It is `O(n)` on the wire, reveals `x`, and performs `O(nnz(A))` verifier work. It
+is not a succinct or zero-knowledge proof. Its role is integration, diagnosis,
+and independent relation checking for exact and fast fixtures.
+
+### 6.2 `whir-field192-l2-v4`
+
+The exact profile rounds solver output once to signed Q63.64 and proves an exact
+integer relation for that quantized witness. It digit-decomposes witness and
+residual values, packs them into one 64-selector table, commits with a fixed
+Field192/WHIR profile, and composes three finite-field sumchecks:
+
+1. digit range and zero-padding constraints;
+2. compressed sparse matrix-vector consistency; and
+3. the exact squared residual norm.
+
+WHIR authenticates every private endpoint used by those reductions. The
+generator-owned exact MLE evaluator supplies public matrix and RHS endpoints and
+no-wrap metadata without row scans. The result is an exact residual numerator and
+dyadic denominator for Q63.64 `x`; it is not a proof about unrounded solver
+arithmetic and it does not claim zero knowledge.
+
+### 6.3 `fast-binary64-unit-circle-v2`
+
+The fast profile converts the same Q63.64 witness back to a frozen binary64
+representation and computes `R = Ax-b` under its binary64 contract. It packs
+`W = [x || R]`, bit-reverses it into
+monomial-coefficient order, evaluates a rate-one-half complex unit-circle code,
+and commits its codeword with BLAKE3 Merkle trees.
+
+It composes:
+
+1. a binary64 residual-norm sumcheck;
+2. a binary64 sparse matvec sumcheck;
+3. a batched linear-opening sumcheck tying `x_tilde(v)` and `R_tilde(u)` to the
+   packed commitment; and
+4. recursively committed unit-circle folds with transcript-derived Merkle
+   multiproofs.
+
+The verifier derives query indices after all roots are committed and uses the
+same generator-owned public evaluator for `A_tilde` and `b_tilde`. It reports
+scale-normalized numerical defects under a frozen tolerance policy and a
+conditional sampling curve.
+
+This is a **provisional metric certificate**, not the exact profile with faster
+arithmetic. Structural framing, signatures, transcript binding, Merkle
+authentication, and public endpoint evaluation have ordinary discrete checks;
+the composition does not yet have one global theorem converting its local
+binary64 defect policy and sampled bad-fraction curves into a final numerical
+soundness bound. Passing consistency also says nothing about residual quality.
+
+## 7. Executable targets
 
 ### `sparse-problem`
 
-The problem helper owns generator-facing workflows:
-
-- validate and inspect a problem template;
-- finalize a template from a signed challenge or literal local seed;
-- print the derived seed and canonical digests;
-- materialize `A,b` for interoperability; and
-- export generated data to Matrix Market matrix and vector files.
-
-Exports are derived views, not new problem identities. The current Matrix Market
-files include the source problem digest and standard format dimensions; Matrix
-Market itself supplies the one-based index and scalar conventions. Dedicated
-CSR, solver-specific vector, export-manifest, and file-checksum formats are
-future work. The canonical generator specification remains the source of truth.
+Validates and finalizes problem templates, inspects generator-derived metadata,
+writes manufactured fixtures, and streams Matrix Market `A,b` exports. Exported
+files are interoperability views; the canonical generator and problem digest
+remain authoritative.
 
 ### `sparse-prover`
 
-The prover reads a finalized problem, validation manifest, `x` file, and a signed
-challenge for hosted problems. Literal local problems omit the challenge. It
-writes one self-contained backend artifact:
-
-```text
-sparse-prover prove --problem problem.json \
-                    --validation validation.json \
-                    --solution x.json \
-                    --challenge challenge.json \
-                    --proof validation.proof
-```
-
-For `direct-reference-v1`, this packages canonical `x`; it does not make the
-result succinct. Future exact and fast backends use the same file boundary while
-producing different, versioned payloads.
+Reads a finalized problem, validation manifest, and solver-owned `x` file.
+`prove` exhaustively dispatches the single-stage direct and exact profiles.
+`fast-commit` fixes the fast root and optionally writes the JSON request for an
+external nonce; `fast-prove` consumes that precommitment and either the signed
+nonce or the explicitly offline mode. Every path writes the same strict outer
+artifact format.
 
 ### `sparse-validator`
 
-The offline validator provides three distinct operations:
-
-- `verify` runs the same core relation and challenge-provenance checks as the
-  service and prints a stable human-readable result;
-- `inspect` prints a human-readable, explicitly non-authoritative proof view; and
-- `verify-certificate` authenticates a JSON certificate against an external key.
-
-Inspection must never imply verification. Unknown versions and malformed trailing
-bytes are errors even when the known prefix could be displayed. The implemented
-inspection output is human-readable key/value text; there is currently no JSON
-inspection mode.
-
-Offline proof verification applies caller-selected key, clock-skew, and maximum
-challenge-lifetime policy. The hosted service additionally applies its configured
-exact challenge lifetime and maximum solution-element policy. Certificate
-verification authenticates the signed payload and expected issuer/key; it does
-not re-run the proof, impose certificate freshness, or compare the recorded
-digests with caller-supplied files.
+Separates inspection from verification. Inspection is explicitly unverified.
+Verification authenticates required challenge provenance, dispatches to the
+manifest-selected backend, and prints the backend-specific exact or metric
+result. Certificate verification authenticates the signed payload against an
+external public key; applications must separately pin expected problem, proof,
+manifest, time, and score policy as needed.
 
 ### `sparse-validator-server`
 
-The server is a thin HTTP and signing layer around the same libraries:
+Provides health, problem-challenge, fast post-commit-challenge, and validation
+HTTP endpoints around the same library verification paths. It binds
+`0.0.0.0:$PORT` for Cloud Run; local clients connect to
+`127.0.0.1:$PORT`, not to `0.0.0.0`. Hosted submissions require a signed
+problem challenge, and hosted fast submissions additionally require the
+externally signed post-commit challenge; offline fast mode is a local-validator
+policy, not a server fallback.
 
-- `GET /healthz` performs a shallow liveness check;
-- `POST /v1/challenges` validates strict typed template JSON and returns a signed
-  challenge as JSON; and
-- `POST /v1/validate` accepts one canonical submission and returns a signed
-  certificate or a bounded, unsigned error response.
+## 8. Data layout and performance design
 
-A later fast backend may add a post-commit challenge endpoint. That challenge is
-separate from the problem-instance challenge; see `protocol.md`.
+- Solutions, residuals, sumcheck tables, digit columns, codewords, and Merkle
+  frontiers use flat contiguous vectors or boxed slices.
+- Sparse rows are generated on demand in sorted order; the direct checker and
+  provers do not materialize a dense matrix.
+- The exact prover folds sumcheck tables in place. The shared sumcheck retains a
+  serial path below a documented scheduling threshold and parallelizes large
+  exact reductions without changing field results.
+- The fast prover commits and opens flat complex codewords. Multiproofs carry one
+  canonical joint frontier rather than repeated paths.
+- Succinct validators retain transcript state, scalar claims, roots, public
+  evaluator state, and query frontiers—not `x`, `R`, a codeword, or generated
+  matrix rows.
+- Bounded readers validate lengths before allocation. The HTTP adapter
+  authenticates public context before backend proof work and limits concurrent
+  blocking validation.
 
-## 6. Generator and relation-checker boundaries
+Performance reports in backend structs are diagnostic work accounting, not RSS
+measurements or hard memory bounds. Current-repository performance claims require
+fresh release measurements. The research repository's published numbers are
+historical comparison targets only. See [benchmarking.md](benchmarking.md) for the
+required baseline and measurement method.
 
-A registered family should compile untrusted parameters into a validated plan.
-The logical interface provides:
+## 9. Service and state model
 
-```text
-identity and version
-logical dimensions and structural nonzero count
-deterministic sorted, duplicate-free row iteration
-deterministic RHS entry generation
-coefficient and work certificates
-canonical compiled parameters
-```
+Core service methods receive explicit entropy and time; HTTP, operating-system
+RNG access, key files, and socket binding remain adapter concerns. Development
+uses a file-backed Ed25519 key. Deployments must provide protected key material
+and configure request, concurrency, and platform time limits for their resource
+budget.
 
-Succinct backends additionally require public multilinear-extension evaluation.
-That capability belongs to a generator implementation or a reviewed evaluation
-plan, not to the proof payload. The initial direct checker can stream every row;
-an exact or fast manifest may later reject families without an appropriately
-cheap public evaluator.
+The service intentionally stores no challenge, precommitment, proof, result, or
+leaderboard state. Signed objects authenticate their bytes and timestamps, but
+statelessness cannot enforce:
 
-The direct relation checker keeps `x` contiguous and streams rows in increasing
-index order. It need not materialize `A`. A future CSR export should use three
-flat arrays (`row_offsets`, `column_indices`, and `values`) and establish sorted
-columns, unique entries, valid offsets, dimensions, and allocation bounds at
-construction time.
+- one use of a problem challenge;
+- one post-commit nonce per commitment;
+- replay rejection;
+- one certificate per solver or problem; or
+- a global or per-problem best residual.
 
-Residual evaluation has a named, frozen operation order. Parallel reductions,
-FMA contraction, and platform-dependent extended precision are not enabled
-silently because they can change binary64 certificate bits. There is currently
-one deliberately simple implementation. Any later optimized kernel must be
-tested against that path on the same generator rows.
+Those properties require durable storage and atomic check-and-record or
+compare-and-update operations. Cloud Run instance memory and logs are not
+correctness mechanisms.
 
-## 7. Service deployment model
+## 10. Test and review strategy
 
-The service is horizontally scalable and keeps no request or result state in
-process memory or local disk. The current service owns a concrete Ed25519 signing
-key loaded from a hexadecimal file by the HTTP binary. A narrow signer interface
-and direct managed-signing-service integration are future work; a deployment can
-currently provide the key file through an appropriately protected secret mount.
+The repository should maintain four complementary layers:
 
-For Cloud Run, the HTTP listener binds to:
+1. **Primitive conformance:** canonical encodings, transcripts, field elements,
+   float policy, Merkle frontiers, sumcheck rounds, and WHIR wrappers.
+2. **Generator equivalence:** public MLE evaluators match complete materialized
+   scans at Boolean and non-Boolean points in exact and binary64 arithmetic.
+3. **Backend relations:** exact and fast honest proofs match the direct relation
+   on deterministic solutions; statement, message, root, opening, and trailing
+   byte mutations are rejected or, for allowed metric perturbations, scored.
+4. **Succinctness regressions:** exact and fast verifier row-query and private
+   materialization counters remain zero while public-evaluator work follows the
+   registered period/logarithmic bound.
 
-```text
-0.0.0.0:$PORT
-```
+Published cross-repository golden vectors, decoder fuzzing, Miri/sanitizers where
+applicable, deployment load tests, and independent review remain required before
+production use.
 
-where `PORT` comes from the environment. `0.0.0.0` is a listen address, not a
-client destination. Local clients connect to `http://127.0.0.1:$PORT`; deployed
-clients use the Cloud Run service URL. Local development may explicitly bind to
-`127.0.0.1` when external access is undesirable.
+## 11. Delivery status and release gates
 
-The server applies request-size, decoded-element, dimension, nonzero, and
-proof-size limits before expensive allocation or work. CPU-heavy validation runs
-outside the asynchronous I/O executor behind a configured concurrency limit and
-an owned work permit that survives client cancellation. The proof-body cap is
-derived from the decoded-element cap, and the adapter enforces a request
-deadline. Authentication, rate limits/quotas, edge admission, and any tighter
-platform deadline remain deployment configuration.
+The current development implementation includes:
 
-Statelessness has important semantic limits:
+- deterministic template finalization, signed problem challenges, literal local
+  mode, and a generator-owned succinct public evaluator;
+- a strict common artifact container and exhaustive direct/exact/fast dispatch;
+- one-stage direct and exact proving, two-stage external or explicit-offline fast
+  proving, backend-specific human-readable verification, and typed certificate
+  scores; and
+- stateless HTTP issuance and hosted validation for all three profiles, with an
+  external post-commit challenge required for hosted fast validation.
 
-- it cannot remember that a challenge has already been submitted;
-- it cannot enforce a truly one-shot nonce or prevent replay;
-- it cannot compare a residual with all prior residuals; and
-- it cannot maintain a global or per-problem best result.
+Production release still requires published cross-repository golden vectors,
+coverage-guided decoder fuzzing, applicable Miri/sanitizer runs, fresh benchmark
+results from this repository, deployment load tests, protected key management,
+abuse controls, and independent cryptographic and numerical review. Stateful
+one-shot or best-score products additionally require durable transactional
+storage; they are not hidden inside the current service.
 
-Expiry checks and unpredictable entropy reduce accidental or stale use but do not
-provide those properties. One-shot use or a leaderboard requires durable,
-transactional state keyed by challenge or problem digest. Per-instance memory in
-a serverless container is not a substitute because instances restart, scale out,
-and handle requests concurrently.
+## 12. Non-goals and extensions
 
-## 8. Trust and security boundaries
-
-- Generator parameters, solution files, submissions, and HTTP bodies are
-  untrusted and decoded with hard limits.
-- A challenge public key comes from validator configuration. An embedded key is
-  an identifier, not a trust anchor.
-- Private service keys never enter problem, solution, or proof crates; only the
-  transport-independent service/signing layers receive them.
-- The validator recomputes the template digest, instance seed, problem digest,
-  validation-manifest digest, public generator values, and relation endpoints.
-- Service errors do not echo arbitrary input bytes or secret key material.
-- A signed timestamp is an assertion by the configured issuer's clock, not an
-  independent trusted timestamp authority.
-- Validating a proof establishes its versioned relation and metric. A separate
-  application policy decides whether the reported residual is useful.
-- Challenge issuance accepts caller-selected templates and returns fresh signed
-  entropy bound to their digest. Benchmark consumers must pin the intended
-  template or problem; the signature alone does not assert difficulty.
-
-## 9. Delivery roadmap
-
-### Stage 0: deterministic foundations (partially implemented)
-
-- Canonical framing, digest domains, and solution encoding are implemented;
-  published golden vectors remain.
-- Implement one well-tested sparse family and RHS generator with literal local
-  seeds.
-- Cross-check generator rows and materialized exports against a simple independent
-  reference (remaining).
-- Establish release benchmarks for generation, parsing, and residual evaluation
-  (remaining).
-
-### Stage 1: direct local MVP (implemented)
-
-- Implement all four CLIs with offline problem finalization, file-based `x`,
-  `direct-reference-v1`, strict inspection, and verification.
-- Compute the residual independently rather than trusting a claimed value.
-- Use this backend as the oracle for every later proof backend.
-
-This stage proves integration correctness, not succinctness.
-
-### Stage 2: signed stateless service MVP (implemented)
-
-- Add Ed25519 challenge and certificate signing, template-digest binding,
-  expiration checks, and the canonical submission envelope.
-- Expose the challenge and validation HTTP endpoints through a Cloud Run-compatible
-  listener. Container and deployment manifests remain deployment-specific and are
-  not included in this repository.
-- Document clearly that a certificate is for one submission and that no replay
-  or global-best state exists.
-
-### Stage 3: exact succinct backend
-
-- Port the reviewed fixed-point relation, no-wrap bounds, range/padding checks,
-  sparse matvec and residual-norm sumchecks, and polynomial openings into modular
-  crates.
-- Pin one immutable transcript and artifact version. Do not allow proof-supplied
-  field, layout, security, or commitment parameters.
-- Compare exact outputs with `direct-reference-v1` on deterministic fixtures,
-  malformed proofs, scale-separated systems, and boundary values.
-- Gate release on proof size, prover RSS, validator RSS, and validator-time
-  benchmarks.
-
-The exact backend is the first target that can make a cryptographic succinctness
-claim.
-
-### Stage 4: fast metric backend
-
-- Freeze the binary64 numerical contract and tolerance provenance.
-- Add commit-before-challenge framing, a distinct signed post-commit nonce,
-  floating sumchecks, the unit-circle code, folds, and Merkle multiproofs.
-- Keep external and local Fiat--Shamir challenge modes explicitly different and
-  reject downgrades.
-- Compare the metric certificate with both direct and exact results over a
-  documented operating envelope.
-
-The fast backend remains a provisional, probabilistic numerical consistency
-certificate. It is not silently promoted to the semantics of the exact backend.
-
-### Stage 5: families, optimization, and stateful products
-
-- Add new generator families only with versioned row rules, public-evaluator
-  capabilities, certificates, and reference tests.
-- Profile before introducing parallel kernels, SIMD, memory mapping, or unsafe
-  code; retain reference paths.
-- Add durable replay protection or a best-residual leaderboard only as a separate
-  stateful service with explicit transactional semantics.
-- Consider batched or repeated-solve protocols after the single-submission path is
-  stable and measured.
-
-## 10. Initial non-goals
+Current non-goals are:
 
 - zero knowledge;
-- arbitrary prover-defined matrices or proof programs;
-- accepting an arbitrary CSR file as a succinct public instance without an
-  authenticated matrix-opening design;
-- global-best, one-shot, or replay-prevention claims from a stateless service;
-- copying the research repository's crate graph or application plumbing; and
-- optimizing before deterministic reference behavior and benchmarks exist.
+- arbitrary prover-defined proof programs or security parameters;
+- a hidden dense or row-scanning fallback for succinct verification;
+- global-best, one-shot, or replay-prevention claims from stateless operation;
+- treating fast metric acceptance as an exact field statement; and
+- presenting research-repository measurements as results of this rewrite.
+
+Additional matrix families should be admitted only with versioned row semantics,
+generator-derived bounds, a reviewed public MLE plan, reference equivalence
+tests, and explicit work limits. Stateful competitions, batch/repeated solves,
+and authenticated arbitrary sparse inputs are separate protocol extensions.

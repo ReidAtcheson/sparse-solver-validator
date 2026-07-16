@@ -11,7 +11,10 @@ clap.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
 serde_json.workspace = true
+ssv-backends = { path = "../../crates/ssv-backends" }
 ssv-canonical = { path = "../../crates/ssv-canonical" }
 ssv-direct = { path = "../../crates/ssv-direct" }
+ssv-fast = { path = "../../crates/ssv-fast" }
 ssv-problem = { path = "../../crates/ssv-problem" }
 ssv-service-protocol = { path = "../../crates/ssv-service-protocol" }
+ssv-validation = { path = "../../crates/ssv-validation" }

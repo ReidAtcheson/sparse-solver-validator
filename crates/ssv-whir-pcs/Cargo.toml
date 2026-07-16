@@ -1,0 +1,15 @@
+[package]
+name = "ssv-whir-pcs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+ark-ff.workspace = true
+bincode.workspace = true
+blake3.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+whir.workspace = true

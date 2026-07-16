@@ -7,13 +7,15 @@ rust-version.workspace = true
 
 [dependencies]
 ed25519-dalek.workspace = true
+ssv-backends = { path = "../ssv-backends" }
 ssv-canonical = { path = "../ssv-canonical" }
 ssv-direct = { path = "../ssv-direct" }
+ssv-fast = { path = "../ssv-fast" }
 ssv-problem = { path = "../ssv-problem" }
 ssv-service-protocol = { path = "../ssv-service-protocol" }
+ssv-validation = { path = "../ssv-validation" }
 thiserror.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
 ssv-solution = { path = "../ssv-solution" }
-

@@ -1,5 +1,5 @@
 [package]
-name = "ssv-direct"
+name = "ssv-validation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,5 +11,4 @@ ssv-canonical = { path = "../ssv-canonical" }
 ssv-problem = { path = "../ssv-problem" }
 ssv-service-protocol = { path = "../ssv-service-protocol" }
 ssv-solution = { path = "../ssv-solution" }
-ssv-validation = { path = "../ssv-validation" }
 thiserror.workspace = true

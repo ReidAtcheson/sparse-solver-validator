@@ -1,0 +1,18 @@
+[package]
+name = "ssv-field-sumcheck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon"]
+
+[dependencies]
+ark-ff.workspace = true
+blake3.workspace = true
+rayon = { workspace = true, optional = true }
+ssv-whir-pcs = { path = "../ssv-whir-pcs" }
+thiserror.workspace = true

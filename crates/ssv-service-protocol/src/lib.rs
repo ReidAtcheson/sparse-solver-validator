@@ -15,14 +15,24 @@ use ssv_canonical::{
 use thiserror::Error;
 
 const CHALLENGE_SIGNATURE_DOMAIN: &[u8] = b"sparse-solve/challenge-signature/ed25519/v1";
+const COMMITMENT_CHALLENGE_SIGNATURE_DOMAIN: &[u8] =
+    b"sparse-solve/commitment-challenge-signature/ed25519/v1";
 const CERTIFICATE_SIGNATURE_DOMAIN: &[u8] = b"sparse-solve/certificate-signature/ed25519/v1";
 const CHALLENGE_DIGEST_DOMAIN: &[u8] = b"sparse-solve/challenge/v1";
+const COMMITMENT_CHALLENGE_DIGEST_DOMAIN: &[u8] = b"sparse-solve/commitment-challenge/v1";
 const MANIFEST_DIGEST_DOMAIN: &[u8] = b"sparse-solve/validation-manifest/v1";
 const CERTIFICATE_DIGEST_DOMAIN: &[u8] = b"sparse-solve/certificate/v1";
 
 pub const MAX_ID_BYTES: usize = 256;
 pub const MAX_CHALLENGE_BYTES: usize = 2 * 1024;
+pub const MAX_COMMITMENT_CHALLENGE_BYTES: usize = 2 * 1024;
 pub const MAX_SOLUTION_ELEMENTS_LIMIT: u64 = 1 << 30;
+pub const MAX_PUBLIC_EVALUATION_TERMS_LIMIT: u64 = 1 << 20;
+const DEFAULT_PUBLIC_EVALUATION_TERMS: u64 = 4_096;
+
+const fn default_public_evaluation_terms() -> u64 {
+    DEFAULT_PUBLIC_EVALUATION_TERMS
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum ChallengeSchema {
@@ -116,6 +126,58 @@ pub struct SignedChallenge {
     pub signature: SignatureBytes,
 }
 
+/// Schema for a challenge issued only after a prover fixes a commitment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub enum CommitmentChallengeSchema {
+    #[serde(rename = "sparse-solve/commitment-challenge/v1")]
+    V1,
+}
+
+/// Backend-neutral post-commit challenge payload.
+///
+/// A stateless issuer can sign this object without retaining the commitment.
+/// The signature establishes ordering and timestamp provenance, but the v1
+/// replay policy does not enforce single use.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommitmentChallengePayload {
+    pub schema: CommitmentChallengeSchema,
+    pub issuer: String,
+    pub key_id: String,
+    pub issued_at_unix_seconds: i64,
+    pub expires_at_unix_seconds: i64,
+    pub entropy: Digest,
+    pub problem_digest: Digest,
+    pub validation_manifest_digest: Digest,
+    pub protocol: ProofProtocol,
+    pub commitment_digest: Digest,
+    pub retry_policy: RetryPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedCommitmentChallenge {
+    pub payload: CommitmentChallengePayload,
+    pub signature: SignatureBytes,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub enum CommitmentChallengeRequestSchema {
+    #[serde(rename = "sparse-solve/commitment-challenge-request/v1")]
+    V1,
+}
+
+/// Stateless request to timestamp and challenge an already fixed commitment.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommitmentChallengeRequest {
+    pub schema: CommitmentChallengeRequestSchema,
+    pub problem_digest: Digest,
+    pub validation_manifest_digest: Digest,
+    pub protocol: ProofProtocol,
+    pub commitment_digest: Digest,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum ValidationSchema {
     #[serde(rename = "sparse-solve/validation/v1")]
@@ -127,6 +189,35 @@ pub enum ProofProtocol {
     /// Integration/reference backend. The artifact carries the complete x.
     #[serde(rename = "direct-reference-v1")]
     DirectReferenceV1,
+    /// Exact Q63.64 relation with Field192 sumchecks and a pinned WHIR PCS.
+    #[serde(rename = "whir-field192-l2-v4")]
+    WhirField192L2V4,
+    /// Experimental binary64 metric certificate with unit-circle openings.
+    #[serde(rename = "fast-binary64-unit-circle-v2")]
+    FastBinary64UnitCircleV2,
+}
+
+impl ProofProtocol {
+    /// Stable discriminator used by common proof containers and signatures.
+    #[must_use]
+    pub const fn wire_id(self) -> u16 {
+        match self {
+            Self::DirectReferenceV1 => 1,
+            Self::WhirField192L2V4 => 2,
+            Self::FastBinary64UnitCircleV2 => 3,
+        }
+    }
+
+    /// Decodes a stable wire discriminator without accepting unknown backends.
+    #[must_use]
+    pub const fn from_wire_id(value: u16) -> Option<Self> {
+        match value {
+            1 => Some(Self::DirectReferenceV1),
+            2 => Some(Self::WhirField192L2V4),
+            3 => Some(Self::FastBinary64UnitCircleV2),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -135,6 +226,10 @@ pub struct ValidationManifest {
     pub schema: ValidationSchema,
     pub protocol: ProofProtocol,
     pub max_solution_elements: u64,
+    #[serde(default = "default_public_evaluation_terms")]
+    pub max_public_matrix_terms: u64,
+    #[serde(default = "default_public_evaluation_terms")]
+    pub max_public_rhs_terms: u64,
 }
 
 impl Default for ValidationManifest {
@@ -143,6 +238,8 @@ impl Default for ValidationManifest {
             schema: ValidationSchema::V1,
             protocol: ProofProtocol::DirectReferenceV1,
             max_solution_elements: 16 * 1024 * 1024,
+            max_public_matrix_terms: DEFAULT_PUBLIC_EVALUATION_TERMS,
+            max_public_rhs_terms: DEFAULT_PUBLIC_EVALUATION_TERMS,
         }
     }
 }
@@ -156,10 +253,112 @@ pub struct ResidualMetrics {
     pub max_abs: f64,
 }
 
+/// Canonical unsigned 192-bit integer, encoded as 48 lowercase hex digits.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct Unsigned192([u8; 24]);
+
+impl Unsigned192 {
+    #[must_use]
+    pub const fn from_be_bytes(bytes: [u8; 24]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_be_bytes(&self) -> &[u8; 24] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Unsigned192 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("Unsigned192")
+            .field(&hex::encode(self.0))
+            .finish()
+    }
+}
+
+impl fmt::Display for Unsigned192 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&hex::encode(self.0))
+    }
+}
+
+impl Serialize for Unsigned192 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Unsigned192 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        if encoded.len() != 48
+            || encoded
+                .as_bytes()
+                .iter()
+                .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(byte))
+        {
+            return Err(serde::de::Error::custom(
+                "unsigned 192-bit value must be exactly 48 lowercase hexadecimal characters",
+            ));
+        }
+        let decoded = hex::decode(encoded).map_err(serde::de::Error::custom)?;
+        Ok(Self(decoded.try_into().map_err(|_| {
+            serde::de::Error::custom("unsigned 192-bit value must decode to 24 bytes")
+        })?))
+    }
+}
+
+/// One category of normalized binary64 consistency observations.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DefectMetrics {
+    pub maximum_absolute_defect: f64,
+    pub maximum_normalized_defect: f64,
+    pub rms_normalized_defect: f64,
+    pub threshold_exceedances: u64,
+}
+
+/// Auditable summary of the provisional fast validator's four checks.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FastConsistencyMetrics {
+    pub norm_sumcheck: DefectMetrics,
+    pub matvec_sumcheck: DefectMetrics,
+    pub linear_opening: DefectMetrics,
+    pub unit_circle_folds: DefectMetrics,
+    pub recursive_query_trajectories: u32,
+}
+
+/// Protocol-specific score semantics carried by a signed certificate.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum CertifiedScore {
+    #[serde(rename = "direct-binary64-residual-v1")]
+    DirectBinary64ResidualV1 { residual: ResidualMetrics },
+    #[serde(rename = "exact-dyadic-squared-l2-v1")]
+    ExactDyadicSquaredL2V1 {
+        numerator: Unsigned192,
+        denominator_power: u32,
+    },
+    #[serde(rename = "fast-binary64-squared-l2-v1")]
+    FastBinary64SquaredL2V1 {
+        squared_l2: f64,
+        consistency: FastConsistencyMetrics,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum CertificateSchema {
-    #[serde(rename = "sparse-solve/validation-certificate/v1")]
-    V1,
+    #[serde(rename = "sparse-solve/validation-certificate/v2")]
+    V2,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -170,11 +369,12 @@ pub struct CertificatePayload {
     pub key_id: String,
     pub issued_at_unix_seconds: i64,
     pub challenge_digest: Option<Digest>,
+    pub commitment_challenge_digest: Option<Digest>,
     pub problem_digest: Digest,
     pub validation_manifest_digest: Digest,
     pub proof_digest: Digest,
     pub protocol: ProofProtocol,
-    pub residual: ResidualMetrics,
+    pub score: CertifiedScore,
     pub validator_build: String,
 }
 
@@ -207,8 +407,18 @@ pub enum ProtocolError {
     InvalidSignature,
     #[error("validation manifest allows an invalid number of solution elements")]
     InvalidSolutionLimit,
+    #[error("validation manifest allows an invalid public-evaluation term limit")]
+    InvalidPublicEvaluationLimit,
     #[error("certificate contains a non-finite or negative residual metric")]
     InvalidResidual,
+    #[error("certificate score semantics do not match its proof protocol")]
+    ScoreProtocolMismatch,
+    #[error("certificate contains invalid or policy-failing fast consistency metrics")]
+    InvalidFastConsistency,
+    #[error("certificate contains an invalid exact residual denominator")]
+    InvalidExactDenominator,
+    #[error("certificate challenge provenance does not match its proof protocol")]
+    CertificateProvenanceMismatch,
     #[error("invalid canonical challenge: {0}")]
     Canonical(String),
 }
@@ -381,12 +591,205 @@ impl SignedChallenge {
     }
 }
 
+impl CommitmentChallengePayload {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        validate_id("issuer", &self.issuer)?;
+        validate_id("key_id", &self.key_id)?;
+        if self.issued_at_unix_seconds < 0 || self.expires_at_unix_seconds < 0 {
+            return Err(ProtocolError::NegativeTimestamp);
+        }
+        if self.expires_at_unix_seconds <= self.issued_at_unix_seconds {
+            return Err(ProtocolError::InvalidChallengeWindow);
+        }
+        Ok(())
+    }
+}
+
+impl CanonicalEncode for CommitmentChallengePayload {
+    fn encode(&self, output: &mut Encoder) {
+        output.write_u16(1);
+        output.write_str(&self.issuer);
+        output.write_str(&self.key_id);
+        output.write_i64(self.issued_at_unix_seconds);
+        output.write_i64(self.expires_at_unix_seconds);
+        output.write_digest(&self.entropy);
+        output.write_digest(&self.problem_digest);
+        output.write_digest(&self.validation_manifest_digest);
+        output.write_u16(self.protocol.wire_id());
+        output.write_digest(&self.commitment_digest);
+        output.write_u16(1);
+    }
+}
+
+impl SignedCommitmentChallenge {
+    pub fn sign(
+        payload: CommitmentChallengePayload,
+        signing_key: &SigningKey,
+    ) -> Result<Self, ProtocolError> {
+        payload.validate()?;
+        let message = signature_message(
+            COMMITMENT_CHALLENGE_SIGNATURE_DOMAIN,
+            &encode_to_vec(&payload),
+        );
+        let signature = signing_key.sign(&message);
+        Ok(Self {
+            payload,
+            signature: SignatureBytes(signature.to_bytes()),
+        })
+    }
+
+    pub fn verify(
+        &self,
+        verifying_key: &VerifyingKey,
+        expected_issuer: &str,
+        expected_key_id: &str,
+        now_unix_seconds: i64,
+        maximum_future_skew_seconds: i64,
+    ) -> Result<(), ProtocolError> {
+        self.payload.validate()?;
+        if now_unix_seconds < 0 {
+            return Err(ProtocolError::NegativeTimestamp);
+        }
+        if maximum_future_skew_seconds < 0 {
+            return Err(ProtocolError::InvalidClockSkew);
+        }
+        if self.payload.issuer != expected_issuer {
+            return Err(ProtocolError::IssuerMismatch);
+        }
+        if self.payload.key_id != expected_key_id {
+            return Err(ProtocolError::KeyIdMismatch);
+        }
+        if self.payload.issued_at_unix_seconds
+            > now_unix_seconds.saturating_add(maximum_future_skew_seconds)
+        {
+            return Err(ProtocolError::ChallengeFromFuture);
+        }
+        if now_unix_seconds > self.payload.expires_at_unix_seconds {
+            return Err(ProtocolError::ChallengeExpired(
+                self.payload.expires_at_unix_seconds,
+            ));
+        }
+        let message = signature_message(
+            COMMITMENT_CHALLENGE_SIGNATURE_DOMAIN,
+            &encode_to_vec(&self.payload),
+        );
+        let signature = Signature::from_bytes(self.signature.as_bytes());
+        verifying_key
+            .verify_strict(&message, &signature)
+            .map_err(|_| ProtocolError::InvalidSignature)
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> Digest {
+        domain_separated_digest(
+            COMMITMENT_CHALLENGE_DIGEST_DOMAIN,
+            &self.to_canonical_bytes(),
+        )
+    }
+
+    #[must_use]
+    pub fn to_canonical_bytes(&self) -> Vec<u8> {
+        let mut output = Encoder::with_capacity(384);
+        self.payload.encode(&mut output);
+        output.write_fixed_bytes(self.signature.as_bytes());
+        output.into_bytes()
+    }
+
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        let limits = DecodeLimits {
+            max_input_bytes: MAX_COMMITMENT_CHALLENGE_BYTES,
+            max_field_bytes: MAX_ID_BYTES,
+        };
+        let mut input = Reader::new(bytes, limits)
+            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
+        let schema = input
+            .read_u16()
+            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
+        if schema != 1 {
+            return Err(ProtocolError::Canonical(format!(
+                "unsupported commitment-challenge schema tag {schema}"
+            )));
+        }
+        let issuer = input
+            .read_str()
+            .map_err(|error| ProtocolError::Canonical(error.to_string()))?
+            .to_owned();
+        let key_id = input
+            .read_str()
+            .map_err(|error| ProtocolError::Canonical(error.to_string()))?
+            .to_owned();
+        let issued_at_unix_seconds = input
+            .read_i64()
+            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
+        let expires_at_unix_seconds = input
+            .read_i64()
+            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
+        let entropy = input
+            .read_digest()
+            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
+        let problem_digest = input
+            .read_digest()
+            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
+        let validation_manifest_digest = input
+            .read_digest()
+            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
+        let protocol = ProofProtocol::from_wire_id(
+            input
+                .read_u16()
+                .map_err(|error| ProtocolError::Canonical(error.to_string()))?,
+        )
+        .ok_or_else(|| ProtocolError::Canonical("unsupported proof protocol".to_owned()))?;
+        let commitment_digest = input
+            .read_digest()
+            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
+        let retry = input
+            .read_u16()
+            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
+        if retry != 1 {
+            return Err(ProtocolError::Canonical(format!(
+                "unsupported retry-policy tag {retry}"
+            )));
+        }
+        let signature = input
+            .read_array::<64>()
+            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
+        input
+            .finish()
+            .map_err(|error| ProtocolError::Canonical(error.to_string()))?;
+        let challenge = Self {
+            payload: CommitmentChallengePayload {
+                schema: CommitmentChallengeSchema::V1,
+                issuer,
+                key_id,
+                issued_at_unix_seconds,
+                expires_at_unix_seconds,
+                entropy,
+                problem_digest,
+                validation_manifest_digest,
+                protocol,
+                commitment_digest,
+                retry_policy: RetryPolicy::ReplayAllowedV1,
+            },
+            signature: SignatureBytes(signature),
+        };
+        challenge.payload.validate()?;
+        Ok(challenge)
+    }
+}
+
 impl ValidationManifest {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.max_solution_elements == 0
             || self.max_solution_elements > MAX_SOLUTION_ELEMENTS_LIMIT
         {
             return Err(ProtocolError::InvalidSolutionLimit);
+        }
+        if self.max_public_matrix_terms == 0
+            || self.max_public_matrix_terms > MAX_PUBLIC_EVALUATION_TERMS_LIMIT
+            || self.max_public_rhs_terms == 0
+            || self.max_public_rhs_terms > MAX_PUBLIC_EVALUATION_TERMS_LIMIT
+        {
+            return Err(ProtocolError::InvalidPublicEvaluationLimit);
         }
         Ok(())
     }
@@ -403,10 +806,10 @@ impl ValidationManifest {
 impl CanonicalEncode for ValidationManifest {
     fn encode(&self, output: &mut Encoder) {
         output.write_u16(1);
-        output.write_u16(match self.protocol {
-            ProofProtocol::DirectReferenceV1 => 1,
-        });
+        output.write_u16(self.protocol.wire_id());
         output.write_u64(self.max_solution_elements);
+        output.write_u64(self.max_public_matrix_terms);
+        output.write_u64(self.max_public_rhs_terms);
     }
 }
 
@@ -432,9 +835,130 @@ impl CanonicalEncode for ResidualMetrics {
     }
 }
 
+impl CanonicalEncode for Unsigned192 {
+    fn encode(&self, output: &mut Encoder) {
+        output.write_fixed_bytes(&self.0);
+    }
+}
+
+impl DefectMetrics {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        let values = [
+            self.maximum_absolute_defect,
+            self.maximum_normalized_defect,
+            self.rms_normalized_defect,
+        ];
+        if values
+            .iter()
+            .any(|value| !value.is_finite() || value.is_sign_negative())
+            || self.maximum_normalized_defect > 1.0
+            || self.threshold_exceedances != 0
+        {
+            return Err(ProtocolError::InvalidFastConsistency);
+        }
+        Ok(())
+    }
+}
+
+impl CanonicalEncode for DefectMetrics {
+    fn encode(&self, output: &mut Encoder) {
+        output.write_u64(self.maximum_absolute_defect.to_bits());
+        output.write_u64(self.maximum_normalized_defect.to_bits());
+        output.write_u64(self.rms_normalized_defect.to_bits());
+        output.write_u64(self.threshold_exceedances);
+    }
+}
+
+impl FastConsistencyMetrics {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.norm_sumcheck.validate()?;
+        self.matvec_sumcheck.validate()?;
+        self.linear_opening.validate()?;
+        self.unit_circle_folds.validate()?;
+        // Query indices are distinct and transcript-derived. Small domains can
+        // contain fewer than the policy target of 64 unique trajectories.
+        if self.recursive_query_trajectories == 0 || self.recursive_query_trajectories > 64 {
+            return Err(ProtocolError::InvalidFastConsistency);
+        }
+        Ok(())
+    }
+}
+
+impl CanonicalEncode for FastConsistencyMetrics {
+    fn encode(&self, output: &mut Encoder) {
+        self.norm_sumcheck.encode(output);
+        self.matvec_sumcheck.encode(output);
+        self.linear_opening.encode(output);
+        self.unit_circle_folds.encode(output);
+        output.write_u32(self.recursive_query_trajectories);
+    }
+}
+
+impl CertifiedScore {
+    fn validate_for(&self, protocol: ProofProtocol) -> Result<(), ProtocolError> {
+        match (protocol, self) {
+            (ProofProtocol::DirectReferenceV1, Self::DirectBinary64ResidualV1 { residual }) => {
+                residual.validate()
+            }
+            (
+                ProofProtocol::WhirField192L2V4,
+                Self::ExactDyadicSquaredL2V1 {
+                    denominator_power, ..
+                },
+            ) => {
+                if *denominator_power == 0 || *denominator_power > 512 {
+                    Err(ProtocolError::InvalidExactDenominator)
+                } else {
+                    Ok(())
+                }
+            }
+            (
+                ProofProtocol::FastBinary64UnitCircleV2,
+                Self::FastBinary64SquaredL2V1 {
+                    squared_l2,
+                    consistency,
+                },
+            ) => {
+                if !squared_l2.is_finite() || squared_l2.is_sign_negative() {
+                    return Err(ProtocolError::InvalidResidual);
+                }
+                consistency.validate()
+            }
+            _ => Err(ProtocolError::ScoreProtocolMismatch),
+        }
+    }
+}
+
+impl CanonicalEncode for CertifiedScore {
+    fn encode(&self, output: &mut Encoder) {
+        match self {
+            Self::DirectBinary64ResidualV1 { residual } => {
+                output.write_u16(1);
+                residual.encode(output);
+            }
+            Self::ExactDyadicSquaredL2V1 {
+                numerator,
+                denominator_power,
+            } => {
+                output.write_u16(2);
+                numerator.encode(output);
+                output.write_u32(*denominator_power);
+            }
+            Self::FastBinary64SquaredL2V1 {
+                squared_l2,
+                consistency,
+            } => {
+                output.write_u16(3);
+                output.write_u64(squared_l2.to_bits());
+                consistency.encode(output);
+            }
+        }
+    }
+}
+
 impl CanonicalEncode for CertificatePayload {
     fn encode(&self, output: &mut Encoder) {
-        output.write_u16(1);
+        output.write_u16(2);
         output.write_str(&self.issuer);
         output.write_str(&self.key_id);
         output.write_i64(self.issued_at_unix_seconds);
@@ -442,13 +966,15 @@ impl CanonicalEncode for CertificatePayload {
         if let Some(digest) = self.challenge_digest {
             output.write_digest(&digest);
         }
+        output.write_bool(self.commitment_challenge_digest.is_some());
+        if let Some(digest) = self.commitment_challenge_digest {
+            output.write_digest(&digest);
+        }
         output.write_digest(&self.problem_digest);
         output.write_digest(&self.validation_manifest_digest);
         output.write_digest(&self.proof_digest);
-        output.write_u16(match self.protocol {
-            ProofProtocol::DirectReferenceV1 => 1,
-        });
-        self.residual.encode(output);
+        output.write_u16(self.protocol.wire_id());
+        self.score.encode(output);
         output.write_str(&self.validator_build);
     }
 }
@@ -504,7 +1030,19 @@ impl CertificatePayload {
         if self.issued_at_unix_seconds < 0 {
             return Err(ProtocolError::NegativeTimestamp);
         }
-        self.residual.validate()
+        if self.challenge_digest.is_none()
+            || matches!(
+                (self.protocol, self.commitment_challenge_digest),
+                (ProofProtocol::FastBinary64UnitCircleV2, None)
+                    | (
+                        ProofProtocol::DirectReferenceV1 | ProofProtocol::WhirField192L2V4,
+                        Some(_)
+                    )
+            )
+        {
+            return Err(ProtocolError::CertificateProvenanceMismatch);
+        }
+        self.score.validate_for(self.protocol)
     }
 }
 
@@ -561,6 +1099,41 @@ mod tests {
     }
 
     #[test]
+    fn post_commit_challenge_binds_statement_backend_and_commitment() {
+        let key = signing_key();
+        let payload = CommitmentChallengePayload {
+            schema: CommitmentChallengeSchema::V1,
+            issuer: "test-issuer".to_owned(),
+            key_id: "test-key".to_owned(),
+            issued_at_unix_seconds: 1_000,
+            expires_at_unix_seconds: 2_000,
+            entropy: Digest::from_bytes([1; 32]),
+            problem_digest: Digest::from_bytes([2; 32]),
+            validation_manifest_digest: Digest::from_bytes([3; 32]),
+            protocol: ProofProtocol::FastBinary64UnitCircleV2,
+            commitment_digest: Digest::from_bytes([4; 32]),
+            retry_policy: RetryPolicy::ReplayAllowedV1,
+        };
+        let challenge = SignedCommitmentChallenge::sign(payload, &key).unwrap();
+        challenge
+            .verify(&key.verifying_key(), "test-issuer", "test-key", 1_500, 5)
+            .unwrap();
+        let encoded = challenge.to_canonical_bytes();
+        assert_eq!(
+            SignedCommitmentChallenge::from_canonical_bytes(&encoded).unwrap(),
+            challenge
+        );
+
+        let mut changed = challenge.clone();
+        changed.payload.commitment_digest = Digest::from_bytes([9; 32]);
+        assert!(
+            changed
+                .verify(&key.verifying_key(), "test-issuer", "test-key", 1_500, 5,)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn mutation_and_wrong_context_fail() {
         let key = signing_key();
         let challenge = SignedChallenge::sign(payload(), &key).unwrap();
@@ -604,20 +1177,23 @@ mod tests {
     fn certificate_signatures_bind_metrics_and_provenance() {
         let key = signing_key();
         let payload = CertificatePayload {
-            schema: CertificateSchema::V1,
+            schema: CertificateSchema::V2,
             issuer: "test-issuer".to_owned(),
             key_id: "test-key".to_owned(),
             issued_at_unix_seconds: 1_500,
             challenge_digest: Some(Digest::from_bytes([1; 32])),
+            commitment_challenge_digest: None,
             problem_digest: Digest::from_bytes([2; 32]),
             validation_manifest_digest: Digest::from_bytes([3; 32]),
             proof_digest: Digest::from_bytes([4; 32]),
             protocol: ProofProtocol::DirectReferenceV1,
-            residual: ResidualMetrics {
-                squared_l2: 0.25,
-                l2: 0.5,
-                rms: 0.125,
-                max_abs: 0.5,
+            score: CertifiedScore::DirectBinary64ResidualV1 {
+                residual: ResidualMetrics {
+                    squared_l2: 0.25,
+                    l2: 0.5,
+                    rms: 0.125,
+                    max_abs: 0.5,
+                },
             },
             validator_build: "test-build".to_owned(),
         };
@@ -627,11 +1203,58 @@ mod tests {
             .unwrap();
 
         let mut changed = certificate.clone();
-        changed.payload.residual.squared_l2 = 0.5;
+        changed.payload.score = CertifiedScore::DirectBinary64ResidualV1 {
+            residual: ResidualMetrics {
+                squared_l2: 0.5,
+                l2: 0.5,
+                rms: 0.125,
+                max_abs: 0.5,
+            },
+        };
         assert!(
             changed
                 .verify(&key.verifying_key(), "test-issuer", "test-key")
                 .is_err()
         );
+
+        let mut wrong_semantics = certificate.clone();
+        wrong_semantics.payload.score = CertifiedScore::ExactDyadicSquaredL2V1 {
+            numerator: Unsigned192::from_be_bytes([0; 24]),
+            denominator_power: 136,
+        };
+        assert!(matches!(
+            wrong_semantics.payload.validate(),
+            Err(ProtocolError::ScoreProtocolMismatch)
+        ));
+    }
+
+    #[test]
+    fn fast_certificate_accepts_up_to_64_distinct_small_domain_queries() {
+        let zero = DefectMetrics {
+            maximum_absolute_defect: 0.0,
+            maximum_normalized_defect: 0.0,
+            rms_normalized_defect: 0.0,
+            threshold_exceedances: 0,
+        };
+        let mut consistency = FastConsistencyMetrics {
+            norm_sumcheck: zero,
+            matvec_sumcheck: zero,
+            linear_opening: zero,
+            unit_circle_folds: zero,
+            recursive_query_trajectories: 1,
+        };
+        assert!(consistency.validate().is_ok());
+        consistency.recursive_query_trajectories = 64;
+        assert!(consistency.validate().is_ok());
+        consistency.recursive_query_trajectories = 0;
+        assert!(matches!(
+            consistency.validate(),
+            Err(ProtocolError::InvalidFastConsistency)
+        ));
+        consistency.recursive_query_trajectories = 65;
+        assert!(matches!(
+            consistency.validate(),
+            Err(ProtocolError::InvalidFastConsistency)
+        ));
     }
 }
