@@ -1,0 +1,19 @@
+[package]
+name = "ssv-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+ssv-canonical = { path = "../ssv-canonical" }
+ssv-direct = { path = "../ssv-direct" }
+ssv-problem = { path = "../ssv-problem" }
+ssv-service-protocol = { path = "../ssv-service-protocol" }
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+ssv-solution = { path = "../ssv-solution" }
+

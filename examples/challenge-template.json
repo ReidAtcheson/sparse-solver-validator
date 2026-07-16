@@ -1,0 +1,32 @@
+{
+  "schema": "sparse-solve/problem-template/v1",
+  "randomness": {
+    "kind": "challenge-derived-v1",
+    "derivation": "blake3-xof-v1"
+  },
+  "matrix": {
+    "kind": "seeded-symmetric-tridiagonal-v1",
+    "dimension": 16,
+    "boundary": "truncate-v1",
+    "off_diagonal": {
+      "kind": "seeded-periodic-negative-dyadic-v1",
+      "period_bits": 3,
+      "fractional_bits": 8,
+      "minimum_magnitude_mantissa": "8",
+      "maximum_magnitude_mantissa": "24"
+    },
+    "diagonal": {
+      "kind": "absolute-row-sum-plus-margin-v1",
+      "margin_mantissa": "32"
+    }
+  },
+  "rhs": {
+    "kind": "manufactured-ones-v1"
+  },
+  "requested_outputs": [
+    {
+      "kind": "squared-l2-residual-v1"
+    }
+  ]
+}
+

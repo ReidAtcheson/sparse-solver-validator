@@ -1,0 +1,6 @@
+{
+  "schema": "sparse-solve/validation/v1",
+  "protocol": "direct-reference-v1",
+  "max_solution_elements": 16777216
+}
+

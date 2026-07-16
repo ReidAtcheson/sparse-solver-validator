@@ -1,0 +1,14 @@
+[package]
+name = "ssv-service-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+hex.workspace = true
+serde.workspace = true
+ssv-canonical = { path = "../ssv-canonical" }
+thiserror.workspace = true
+
