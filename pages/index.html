@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Generate and validate sparse linear-system proofs.">
+    <title>Sparse Solver Validator</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="explorer.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <h1>Sparse Solver Validator</h1>
+      <p><a href="https://github.com/ReidAtcheson/sparse-solver-validator">source code</a></p>
+    </header>
+
+    <main>
+      <section aria-labelledby="description-heading">
+        <h2 id="description-heading">Description</h2>
+        <p>
+          Sparse Solver Validator is a Rust toolkit for generating public sparse linear
+          systems and validating a solver-owned solution. Problems are reproducible from a
+          versioned generator. Validation can run locally, or a server can issue a signed,
+          expiring challenge and return a signed certificate for a submitted proof.
+        </p>
+        <p>
+          This is development software and has not received an external security or numerical
+          audit. The direct backend reveals the complete solution; the succinct backends do not
+          claim zero knowledge. See the repository documentation for protocol details and limits.
+        </p>
+      </section>
+
+      <section aria-labelledby="usage-heading">
+        <h2 id="usage-heading">Usage</h2>
+        <p>The hosted service exposes:</p>
+        <pre><code>POST ${SERVICE_URL}/v1/challenges
+POST ${SERVICE_URL}/v1/validate
+GET  ${SERVICE_URL}/health</code></pre>
+        <p>
+          Start with a problem template, ask the service to bind fresh signed randomness to it,
+          finalize the public matrix, solve it, create a proof, and submit that proof for a signed
+          certificate. The explorer below generates the exact template and commands for both this
+          hosted workflow and a completely local workflow.
+        </p>
+        <p>A minimal request/submit sequence looks like this (add an identity-token header for a private Cloud Run service):</p>
+        <pre><code>export SERVICE_URL="https://YOUR-SERVICE-URL"
+
+curl --fail --silent --show-error \
+  -H 'content-type: application/json' \
+  --data-binary @/tmp/template.json \
+  "${SERVICE_URL}/v1/challenges" \
+  -o /tmp/challenge.json
+
+# Finalize the challenge, solve the generated system, and create validation.proof.
+
+curl --fail --silent --show-error \
+  -H 'content-type: application/octet-stream' \
+  --data-binary @/tmp/validation.proof \
+  "${SERVICE_URL}/v1/validate" \
+  -o /tmp/certificate.json</code></pre>
+      </section>
+
+      <section class="explorer" aria-labelledby="explorer-heading">
+        <div class="explorer-intro">
+          <div>
+            <p class="eyebrow">Interactive tool</p>
+            <h2 id="explorer-heading">Matrix Explorer</h2>
+            <p>Choose a generator, inspect its sparsity pattern, then copy a runnable workflow.</p>
+          </div>
+          <div class="legend" aria-label="Spy plot legend">
+            <span><i class="swatch diagonal"></i> diagonal</span>
+            <span><i class="swatch off-diagonal"></i> off-diagonal</span>
+          </div>
+        </div>
+
+        <div class="explorer-grid">
+          <form id="generator-form" class="controls">
+            <label>
+              Matrix family
+              <select id="family" name="family">
+                <option value="seeded-symmetric-tridiagonal-v1">Seeded symmetric tridiagonal v1</option>
+              </select>
+            </label>
+
+            <div class="control-row">
+              <label>
+                Dimension
+                <input id="dimension" name="dimension" type="number" min="2" max="128" value="16">
+                <small>2–128 for visualization</small>
+              </label>
+              <label>
+                Period bits
+                <input id="period-bits" name="periodBits" type="number" min="0" max="16" value="3">
+              </label>
+            </div>
+
+            <div class="control-row">
+              <label>
+                Fractional bits
+                <input id="fractional-bits" name="fractionalBits" type="number" min="0" max="52" value="8">
+              </label>
+              <label>
+                Dominance margin
+                <input id="margin" name="margin" type="number" min="1" max="9007199254740991" value="32">
+              </label>
+            </div>
+
+            <div class="control-row">
+              <label>
+                Minimum magnitude
+                <input id="minimum" name="minimum" type="number" min="1" max="9007199254740991" value="8">
+              </label>
+              <label>
+                Maximum magnitude
+                <input id="maximum" name="maximum" type="number" min="1" max="9007199254740991" value="24">
+              </label>
+            </div>
+
+            <label>
+              Right-hand side
+              <select id="rhs" name="rhs">
+                <option value="manufactured-ones-v1">Manufactured ones (x = 1)</option>
+              </select>
+            </label>
+
+            <p id="form-error" class="form-error" role="alert" hidden></p>
+          </form>
+
+          <div class="plot-panel">
+            <div class="plot-heading">
+              <strong id="plot-title">16 × 16</strong>
+              <span id="plot-summary">46 structural nonzeros · 18.0% density</span>
+            </div>
+            <canvas id="spy-plot" width="640" height="640" aria-label="Matrix sparsity spy plot"></canvas>
+            <p class="plot-note">Rows run top to bottom; columns run left to right. Values vary with the finalized seed, but this family’s sparsity pattern does not.</p>
+          </div>
+        </div>
+
+        <div class="output-panel">
+          <div class="tabs" role="tablist" aria-label="Generated output">
+            <button type="button" role="tab" aria-selected="true" aria-controls="local-panel" id="local-tab" data-tab="local">Local</button>
+            <button type="button" role="tab" aria-selected="false" aria-controls="hosted-panel" id="hosted-tab" data-tab="hosted">Server validated</button>
+            <button type="button" role="tab" aria-selected="false" aria-controls="template-panel" id="template-tab" data-tab="template">Template JSON</button>
+          </div>
+
+          <section id="local-panel" role="tabpanel" aria-labelledby="local-tab">
+            <div class="code-header"><span>Local workflow</span><button class="copy" type="button" data-copy="local-code">Copy</button></div>
+            <pre><code id="local-code"></code></pre>
+          </section>
+
+          <section id="hosted-panel" role="tabpanel" aria-labelledby="hosted-tab" hidden>
+            <div class="host-config">
+              <label>Service URL <input id="service-url" value="https://YOUR-SERVICE-URL" spellcheck="false"></label>
+              <label>Issuer <input id="issuer" value="YOUR-ISSUER" spellcheck="false"></label>
+              <label>Key ID <input id="key-id" value="YOUR-KEY-ID" spellcheck="false"></label>
+              <label>Public key file <input id="public-key" value="/path/to/validator.pub" spellcheck="false"></label>
+              <label class="checkbox-label"><input id="private-service" type="checkbox" checked> Include a Cloud Run identity token</label>
+            </div>
+            <p class="timestamp-note">The server signs the challenge’s issue and expiry timestamps. The CLI verifies both before finalizing the matrix.</p>
+            <div class="code-header"><span>Signed, timestamped workflow</span><button class="copy" type="button" data-copy="hosted-code">Copy</button></div>
+            <pre><code id="hosted-code"></code></pre>
+          </section>
+
+          <section id="template-panel" role="tabpanel" aria-labelledby="template-tab" hidden>
+            <div class="template-actions">
+              <label>
+                Randomness
+                <select id="template-kind">
+                  <option value="literal">Literal seed (local)</option>
+                  <option value="challenge">Challenge-derived (server)</option>
+                </select>
+              </label>
+              <button id="download-template" type="button">Download JSON</button>
+            </div>
+            <div class="code-header"><span>Problem template</span><button class="copy" type="button" data-copy="template-code">Copy</button></div>
+            <pre><code id="template-code"></code></pre>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <p>Sparse Solver Validator · development software · Apache-2.0</p>
+    </footer>
+  </body>
+</html>
