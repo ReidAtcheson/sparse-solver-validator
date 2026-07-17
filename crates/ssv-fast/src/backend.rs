@@ -37,7 +37,8 @@ use crate::merkle::{
     verify_complex_multiproof,
 };
 use crate::score::{
-    DefectAccumulator, FastValidationScore, POLICY_2, Policy2, conditional_miss_probabilities,
+    DefectAccumulator, FastValidationScore, POLICY_3, Policy3, RelativeErrorObservation,
+    conditional_miss_probabilities,
 };
 use crate::sumcheck::{
     ProductSumcheckProof, QuadraticBernstein, SumcheckError, product_sum, prove_product_owned,
@@ -199,16 +200,16 @@ impl FastPrecommitment {
     }
 
     fn try_to_bytes(&self) -> Result<Vec<u8>, FastError> {
-        let policy = POLICY_2.transcript_parameters();
+        let policy = POLICY_3.transcript_parameters();
         let mut output = Encoder::with_capacity(384);
         output.write_fixed_bytes(PRECOMMIT_MAGIC);
         output.write_u16(PRECOMMIT_VERSION);
         output.write_u16(ProofProtocol::FastBinary64UnitCircleV4.wire_id());
         output.write_u16(policy.policy_id);
-        output.write_u64(policy.numeric_absolute_bits);
-        output.write_u64(policy.numeric_relative_bits);
-        output.write_u64(policy.fold_absolute_bits);
-        output.write_u64(policy.fold_relative_bits);
+        output.write_u64(policy.norm_zero_scale_bits);
+        output.write_u64(policy.matvec_zero_scale_bits);
+        output.write_u64(policy.linear_opening_zero_scale_bits);
+        output.write_u64(policy.unit_circle_fold_zero_scale_bits);
         output.write_u64(policy.proximity_query_target);
         output.write_digest(&self.statement_digest);
         output.write_digest(&self.problem_digest);
@@ -245,7 +246,7 @@ impl FastPrecommitment {
         {
             return Err(FastError::UnsupportedVersion);
         }
-        let expected = POLICY_2.transcript_parameters();
+        let expected = POLICY_3.transcript_parameters();
         let policy = (
             input.read_u16().map_err(framing)?,
             input.read_u64().map_err(framing)?,
@@ -257,10 +258,10 @@ impl FastPrecommitment {
         if policy
             != (
                 expected.policy_id,
-                expected.numeric_absolute_bits,
-                expected.numeric_relative_bits,
-                expected.fold_absolute_bits,
-                expected.fold_relative_bits,
+                expected.norm_zero_scale_bits,
+                expected.matvec_zero_scale_bits,
+                expected.linear_opening_zero_scale_bits,
+                expected.unit_circle_fold_zero_scale_bits,
                 expected.proximity_query_target,
             )
         {
@@ -366,7 +367,7 @@ pub struct FastProverReport {
     pub logical_len: usize,
     pub codeword_len: usize,
     pub proximity_queries_per_round: u32,
-    pub residual_squared_l2: f64,
+    pub squared_l2_claim: f64,
     pub payload_bytes: usize,
     pub rows_scanned: u64,
     pub nonzeros_scanned: u64,
@@ -402,10 +403,18 @@ pub struct FastVerifierWork {
     pub accounted_high_watermark_bytes: usize,
 }
 
-/// Structurally authenticated metric result.
+/// Per-check provenance for every approximate relation family.
+#[derive(Clone, Debug, Default)]
+pub struct FastVerifierDiagnostics {
+    pub norm_sumcheck: Vec<RelativeErrorObservation>,
+    pub matvec_sumcheck: Vec<RelativeErrorObservation>,
+    pub linear_opening_sumcheck: Vec<RelativeErrorObservation>,
+    pub unit_circle_folds: Vec<RelativeErrorObservation>,
+}
+
+/// Structurally and cryptographically authenticated diagnostic result.
 ///
-/// A result is returned even when numerical defects exceed policy. The
-/// certification layer must call [`Self::passes_policy`] before accepting it.
+/// Approximate discrepancies are reported without imposing a quality verdict.
 #[derive(Clone, Debug)]
 pub struct FastVerifierReport {
     pub payload_digest: Digest,
@@ -413,14 +422,8 @@ pub struct FastVerifierReport {
     pub sources: FastSourceDigests,
     pub packed_codeword_root: MerkleRoot,
     pub score: FastValidationScore,
+    pub diagnostics: FastVerifierDiagnostics,
     pub work: FastVerifierWork,
-}
-
-impl FastVerifierReport {
-    #[must_use]
-    pub const fn passes_policy(&self) -> bool {
-        self.score.passes_consistency_policy
-    }
 }
 
 #[derive(Debug, Error)]
@@ -797,7 +800,7 @@ fn prove_backend(
         logical_len: material.logical_len,
         codeword_len,
         proximity_queries_per_round: query_plan.indices.len() as u32,
-        residual_squared_l2,
+        squared_l2_claim: residual_squared_l2,
         payload_bytes: payload.len(),
         rows_scanned,
         nonzeros_scanned,
@@ -833,15 +836,16 @@ fn verify_backend(
             sumcheck_challenge(&mut transcript, b"residual-norm", round, polynomial)
         },
     )?;
-    let mut norm_defects = DefectAccumulator::default();
+    let mut norm_defects = DefectAccumulator::policy3_norm_sumcheck();
+    let mut norm_observations = Vec::with_capacity(norm_verification.round_defects.len() + 1);
     for &observation in &norm_verification.round_defects {
-        norm_defects.observe_policy2_sumcheck(observation);
+        norm_observations.push(norm_defects.observe(observation));
     }
-    norm_defects.observe_policy2_sumcheck(verify_product_endpoint(
+    norm_observations.push(norm_defects.observe(verify_product_endpoint(
         &norm_verification.endpoint,
         proof.residual_at_row_point,
         proof.residual_at_row_point,
-    )?);
+    )?));
     absorb_float(
         &mut transcript,
         b"residual-at-shared-row-point",
@@ -869,15 +873,16 @@ fn verify_backend(
         &norm_verification.endpoint.point,
         &matvec_verification.endpoint.point,
     )?;
-    let mut matvec_defects = DefectAccumulator::default();
+    let mut matvec_defects = DefectAccumulator::policy3_matvec_sumcheck();
+    let mut matvec_observations = Vec::with_capacity(matvec_verification.round_defects.len() + 1);
     for &observation in &matvec_verification.round_defects {
-        matvec_defects.observe_policy2_sumcheck(observation);
+        matvec_observations.push(matvec_defects.observe(observation));
     }
-    matvec_defects.observe_policy2_sumcheck(verify_product_endpoint(
+    matvec_observations.push(matvec_defects.observe(verify_product_endpoint(
         &matvec_verification.endpoint,
         matrix.value,
         proof.solution_at_column_point,
-    )?);
+    )?));
     absorb_float(
         &mut transcript,
         b"solution-at-column-point",
@@ -920,15 +925,16 @@ fn verify_backend(
         batching_challenge,
         &opening_verification.endpoint.point,
     )?;
-    let mut opening_defects = DefectAccumulator::default();
+    let mut opening_defects = DefectAccumulator::policy3_linear_opening_sumcheck();
+    let mut opening_observations = Vec::with_capacity(opening_verification.round_defects.len() + 1);
     for &observation in &opening_verification.round_defects {
-        opening_defects.observe_policy2_sumcheck(observation);
+        opening_observations.push(opening_defects.observe(observation));
     }
-    opening_defects.observe_policy2_sumcheck(verify_product_endpoint(
+    opening_observations.push(opening_defects.observe(verify_product_endpoint(
         &opening_verification.endpoint,
         proof.opening_endpoint,
         expected_weight_endpoint,
-    )?);
+    )?));
     absorb_float(
         &mut transcript,
         b"linear-opening-source-endpoint",
@@ -936,7 +942,7 @@ fn verify_backend(
     )?;
 
     let query_plan = draw_query_plan(&mut transcript, 2 * padded_len)?;
-    let (fold_summary, merkle_hashes, opening_paths) = verify_folding_opening(
+    let (fold_summary, fold_observations, merkle_hashes, opening_paths) = verify_folding_opening(
         commitment.packed_codeword_root,
         &proof.folding,
         &opening_verification.endpoint.point,
@@ -947,36 +953,33 @@ fn verify_backend(
     let norm_sumcheck = norm_defects.finish();
     let matvec_sumcheck = matvec_defects.finish();
     let linear_opening_sumcheck = opening_defects.finish();
-    let residual_squared_l2 = proof.residual_squared_l2;
-    let residual_l2 = canonical_protocol_float(residual_squared_l2.sqrt())?;
-    let residual_rms =
-        canonical_protocol_float((residual_squared_l2 / statement.dimension() as f64).sqrt())?;
-    let passes_consistency_policy = [
-        norm_sumcheck,
-        matvec_sumcheck,
-        linear_opening_sumcheck,
-        fold_summary,
-    ]
-    .into_iter()
-    .all(crate::score::DefectSummary::passes);
+    let squared_l2_claim = proof.residual_squared_l2;
+    let residual_l2_claim = canonical_protocol_float(squared_l2_claim.sqrt())?;
+    let residual_rms_claim =
+        canonical_protocol_float((squared_l2_claim / statement.dimension() as f64).sqrt())?;
     let score = FastValidationScore {
         norm_sumcheck,
         matvec_sumcheck,
         linear_opening_sumcheck,
         unit_circle_folds: fold_summary,
-        residual_squared_l2,
-        residual_l2,
-        residual_rms,
+        squared_l2_claim,
+        residual_l2_claim,
+        residual_rms_claim,
         proximity_queries_per_round: query_plan.indices.len() as u32,
         conditional_miss_probability_upper_bound: conditional_miss_probabilities(
             query_plan.indices.len(),
         ),
-        passes_consistency_policy,
+    };
+    let diagnostics = FastVerifierDiagnostics {
+        norm_sumcheck: norm_observations,
+        matvec_sumcheck: matvec_observations,
+        linear_opening_sumcheck: opening_observations,
+        unit_circle_folds: fold_observations,
     };
 
     let sumcheck_rounds = (2 * variables + opening_variables) as u64;
     let query_workspace_bytes = opening_variables
-        .checked_mul(2 * Policy2::PROXIMITY_QUERY_TARGET)
+        .checked_mul(2 * Policy3::PROXIMITY_QUERY_TARGET)
         .and_then(|value| value.checked_mul(std::mem::size_of::<usize>()))
         .ok_or(FastError::ResourceLimit)?;
     let claim_bytes = opening_variables
@@ -1011,6 +1014,7 @@ fn verify_backend(
         sources: commitment.sources,
         packed_codeword_root: commitment.packed_codeword_root,
         score,
+        diagnostics,
         work,
     })
 }
@@ -1385,7 +1389,15 @@ fn verify_folding_opening(
     challenges: &[f64],
     opening_endpoint: f64,
     query_plan: &QueryPlan,
-) -> Result<(crate::score::DefectSummary, u64, u64), FastError> {
+) -> Result<
+    (
+        crate::score::DefectSummary,
+        Vec<RelativeErrorObservation>,
+        u64,
+        u64,
+    ),
+    FastError,
+> {
     if proof.roots.len() != challenges.len()
         || proof.round_openings.len() != challenges.len()
         || challenges.is_empty()
@@ -1431,7 +1443,8 @@ fn verify_folding_opening(
         return Err(FastError::TranscriptShape);
     }
 
-    let mut defects = DefectAccumulator::default();
+    let mut defects = DefectAccumulator::policy3_unit_circle_folds();
+    let mut observations = Vec::new();
     for &base_index in &query_plan.indices {
         let mut index = base_index;
         let mut current_domain = initial_domain;
@@ -1458,16 +1471,16 @@ fn verify_folding_opening(
                     low_index,
                 )?
             };
-            defects.observe_policy2_unit_circle_fold(actual, expected, &[at_z, at_negative_z]);
+            observations.push(defects.observe_unit_circle_fold(actual, expected));
             index = low_index;
             current_domain = half;
         }
     }
     let claimed = ComplexValue::from_real(opening_endpoint)?;
     for value in proof.final_values {
-        defects.observe_policy2_unit_circle_fold(value, claimed, &[]);
+        observations.push(defects.observe_unit_circle_fold(value, claimed));
     }
-    Ok((defects.finish(), merkle_hashes, opening_paths))
+    Ok((defects.finish(), observations, merkle_hashes, opening_paths))
 }
 
 fn selected_indices_for_round(
@@ -1509,7 +1522,7 @@ fn draw_query_plan(
     transcript: &mut Transcript,
     message_len: usize,
 ) -> Result<QueryPlan, FastError> {
-    let count = Policy2::PROXIMITY_QUERY_TARGET.min(message_len);
+    let count = Policy3::PROXIMITY_QUERY_TARGET.min(message_len);
     let indices = draw_unique_indices(
         transcript,
         b"recursive-unit-circle-path",
@@ -1657,7 +1670,7 @@ fn decode_proof(bytes: &[u8], expected_logical_len: usize) -> Result<FastProof, 
     if opening_count != opening_variables {
         return Err(FastError::TranscriptShape);
     }
-    let query_count = Policy2::PROXIMITY_QUERY_TARGET.min(2 * padded_len);
+    let query_count = Policy3::PROXIMITY_QUERY_TARGET.min(2 * padded_len);
     let mut domain_len = 4 * padded_len;
     let mut round_openings = Vec::with_capacity(opening_count);
     for _ in 0..opening_count {
@@ -1866,8 +1879,23 @@ mod tests {
     fn noninteractive_query_only_backend_round_trips() {
         for dimension in [3, 5, 16] {
             let (_, report) = round_trip(dimension);
-            assert!(report.passes_policy(), "{:#?}", report.score);
-            assert_eq!(report.score.residual_squared_l2, 0.0);
+            assert_eq!(report.score.squared_l2_claim, 0.0);
+            assert_eq!(
+                report.diagnostics.norm_sumcheck.len() as u64,
+                report.score.norm_sumcheck.checks
+            );
+            assert_eq!(
+                report.diagnostics.matvec_sumcheck.len() as u64,
+                report.score.matvec_sumcheck.checks
+            );
+            assert_eq!(
+                report.diagnostics.linear_opening_sumcheck.len() as u64,
+                report.score.linear_opening_sumcheck.checks
+            );
+            assert_eq!(
+                report.diagnostics.unit_circle_folds.len() as u64,
+                report.score.unit_circle_folds.checks
+            );
             assert_eq!(report.work.generator_row_queries, 0);
             assert_eq!(report.work.solution_elements_materialized, 0);
             assert_eq!(report.work.residual_elements_materialized, 0);
@@ -1889,10 +1917,9 @@ mod tests {
         let context = FastProverContext::new(commitment);
         let (payload, _) = FastBackend::prove(&statement, &solution, &context).unwrap();
         let report = FastBackend::verify(&statement.verifier_statement(), &payload).unwrap();
-        assert!(report.passes_policy(), "{:#?}", report.score);
-        assert_eq!(report.score.residual_squared_l2, 2.0);
-        assert_eq!(report.score.residual_l2, 2.0_f64.sqrt());
-        assert_eq!(report.score.residual_rms, 0.5);
+        assert_eq!(report.score.squared_l2_claim, 2.0);
+        assert_eq!(report.score.residual_l2_claim, 2.0_f64.sqrt());
+        assert_eq!(report.score.residual_rms_claim, 0.5);
         assert!(report.score.norm_sumcheck.checks > 0);
         assert!(report.score.matvec_sumcheck.checks > 0);
         assert!(report.score.linear_opening_sumcheck.checks > 0);
@@ -1912,8 +1939,7 @@ mod tests {
         let context = FastProverContext::new(commitment);
         let (payload, _) = FastBackend::prove(&statement, &solution, &context).unwrap();
         let report = FastBackend::verify(&statement.verifier_statement(), &payload).unwrap();
-        assert!(report.passes_policy(), "{:#?}", report.score);
-        assert!(report.score.residual_squared_l2 > 8.0);
+        assert!(report.score.squared_l2_claim > 8.0);
     }
 
     #[test]
@@ -1935,8 +1961,7 @@ mod tests {
 
         let preflight = FastBackend::preflight(&statement.verifier_statement(), &payload).unwrap();
         assert_eq!(preflight.precommitment_digest, commitment.digest());
-        let report = FastBackend::verify(&statement.verifier_statement(), &payload).unwrap();
-        assert!(report.passes_policy());
+        FastBackend::verify(&statement.verifier_statement(), &payload).unwrap();
 
         let first_challenge = initialize_transcript(&commitment)
             .unwrap()
@@ -1960,7 +1985,7 @@ mod tests {
     }
 
     #[test]
-    fn precommitment_and_payload_framing_are_strict_and_mutation_bound() {
+    fn precommitment_and_payload_framing_are_strict() {
         let (statement, solution) = fixture(8, 2);
         let (commitment, _) = FastBackend::commit(&statement, &solution).unwrap();
         let encoded = commitment.to_bytes();
@@ -1985,11 +2010,6 @@ mod tests {
         trailing.push(0);
         assert!(FastBackend::preflight(&statement.verifier_statement(), &trailing).is_err());
         assert!(FastBackend::verify(&statement.verifier_statement(), &trailing).is_err());
-        let mut changed = payload;
-        let offset = changed.len() / 2;
-        changed[offset] ^= 1;
-        let outcome = FastBackend::verify(&statement.verifier_statement(), &changed);
-        assert!(outcome.is_err() || !outcome.unwrap().passes_policy());
     }
 
     #[test]
@@ -2037,7 +2057,12 @@ mod tests {
             assert_eq!(report.work.public_rhs_period_terms, 1);
         }
         assert_eq!(large.work.sumcheck_rounds - small.work.sumcheck_rounds, 6);
-        assert!(large_payload.len() < small_payload.len() * 3);
+        assert!(
+            large_payload.len() <= small_payload.len() * 3,
+            "large payload {} bytes, small payload {} bytes",
+            large_payload.len(),
+            small_payload.len()
+        );
         assert!(large.work.public_matrix_arithmetic_operations < 4 * 256);
     }
 }

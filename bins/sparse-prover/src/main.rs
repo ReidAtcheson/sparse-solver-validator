@@ -175,10 +175,7 @@ fn print_fast_prover_report(report: &FastProverReport) {
     println!("proof_kind=fast-binary64-unit-circle-v4");
     println!("challenge_mode=noninteractive-fiat-shamir");
     println!("precommitment_digest={}", report.precommitment_digest);
-    println!(
-        "residual_squared_l2_claim={:.17e}",
-        report.residual_squared_l2
-    );
+    println!("residual_squared_l2_claim={:.17e}", report.squared_l2_claim);
     println!(
         "recursive_query_trajectories={}",
         report.proximity_queries_per_round
