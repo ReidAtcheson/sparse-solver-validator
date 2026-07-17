@@ -429,6 +429,155 @@ samples, sampling with or without replacement, adaptive transcript messages,
 and deterministic errors in both public bilinear evaluation and authenticated
 linear openings. Merely citing the unbiased second moment is insufficient.
 
+#### 6.2.2 Homogeneous multilinear sampling on the complex unit torus
+
+A related candidate changes the geometry of the multilinear challenges
+themselves. Naively substituting complex unit-circle values into the current
+affine MLE is not the desired construction. For
+
+```text
+f_tilde(u) = sum_s f_s product_j (1 - u_j)^(1 - s_j) u_j^s_j,
+```
+
+setting `abs(u_j) = 1` leaves the one-coordinate weight vector
+`[1 - u_j, u_j]`, whose squared norm is
+
+```text
+abs(1 - u_j)^2 + abs(u_j)^2 = 3 - 2*cos(theta_j).
+```
+
+This ranges from `1` to `5`, so its tensor-product norm can vary
+exponentially with the number of variables. It also does not define an
+orthogonal random sketch family.
+
+The better object is the homogeneous multilinear extension
+
+```text
+F_f((alpha_1,beta_1),...,(alpha_m,beta_m))
+  = sum_s f_s
+      product_(j:s_j=0) alpha_j
+      product_(j:s_j=1) beta_j.
+```
+
+The ordinary MLE is the affine slice
+
+```text
+(alpha_j, beta_j) = (1 - u_j, u_j),
+```
+
+and the Boolean values remain the coordinate-axis points
+
+```text
+0 -> (1,0)
+1 -> (0,1).
+```
+
+Instead sample the balanced complex unit equator
+
+```text
+(alpha_j, beta_j) = (1, z_j) / sqrt(2),
+abs(z_j) = 1.
+```
+
+For `N = 2^m`, the resulting observation is
+
+```text
+F_f(z) = (1 / sqrt(N)) * sum_s f_s product_j z_j^s_j.
+```
+
+If the phases `z_j` are independent and uniform on the unit circle, their
+characters are orthogonal:
+
+```text
+E_z[(product_j z_j^s_j) * conjugate(product_j z_j^t_j)] = indicator(s = t),
+E_z[abs(F_f(z))^2] = norm(f)^2 / N.
+```
+
+The unnormalized version therefore has expected squared magnitude
+`norm(f)^2`. This is a continuous unit-modulus Kronecker sketch and a
+multivariate Fourier polynomial on the torus. The Hadamard sketch is its
+discrete `z_j in {-1,+1}` relative.
+
+For residual consistency, define the normalized phase vector
+
+```text
+q_z(s) = (1 / sqrt(N)) * product_j z_j^s_j.
+```
+
+One observation is
+
+```text
+q_z^* (A X - b - R).
+```
+
+A hybrid application sumcheck could retain the existing column MLE point `v`
+and terminate at the factors
+
+```text
+(q_z^* A w(v)) * (w(v)^T X).
+```
+
+The new generator-owned public operations would be `q_z^* b` and
+`q_z^* A w(v)`. Unlike an arbitrary Rademacher diagonal, `q_z` is separable over
+the index bits. The registered periodic tridiagonal generator may therefore
+admit a succinct contraction with the same neighboring-index carry machinery
+as its current MLE evaluator. This must be established by implementation and
+reference equivalence; separability alone is not a complexity proof.
+
+The same homogeneous geometry can be applied to each product-sumcheck round.
+For the current degree-two Bernstein message
+
+```text
+g(t) = b_0*(1 - t)^2 + 2*b_1*t*(1 - t) + b_2*t^2,
+```
+
+define
+
+```text
+G(alpha,beta) = b_0*alpha^2 + 2*b_1*alpha*beta + b_2*beta^2.
+```
+
+The current challenge evaluates `G(1 - r,r)`. A unit-equator challenge would
+evaluate `G(1,z)/2`, while each source-table pair folds by the normalized
+complex butterfly
+
+```text
+(f_0 + z*f_1) / sqrt(2).
+```
+
+For a uniform phase,
+
+```text
+E_z[abs(G(1,z))^2]
+  = abs(b_0)^2 + 4*abs(b_1)^2 + abs(b_2)^2.
+```
+
+Because `abs(b_0 + b_2)^2` is at most
+`2*(abs(b_0)^2 + abs(b_2)^2)`, a false Boolean endpoint-sum relation creates
+energy on the sampled circle. This suggests a degree-two complex
+anti-concentration argument that avoids extrapolating from `[1/4,3/4)` to the
+Boolean endpoints. A complete proof still needs a lower-tail bound for the
+exact discrete phase grid and must propagate complex binary64 intervals.
+
+This direction is adjacent to, but distinct from, the current unit-circle
+commitment code. The current code treats the bit-reversed Boolean table as
+univariate monomial coefficients, evaluates at roots of unity, and then folds
+source coefficients using the real affine weights `[1 - r,r]`. A successor
+could instead use complex homogeneous challenges for the application
+sumchecks and recursive folds as well. That would place residual sketches,
+sumcheck reduction, and commitment proximity in one unitary geometry, but it
+is a protocol redesign rather than a local challenge-distribution change.
+
+Parseval is not by itself a finite-sample residual theorem. A degree-`m`
+multilinear Fourier polynomial can concentrate much of its energy on a small
+region of the torus; products such as `product_j (1 - z_j)` illustrate the
+potentially heavy lower tail. The research questions are therefore the
+small-ball behavior of individual-degree-one Steinhaus polynomials, required
+oversampling, continuous phases versus a canonical finite root grid, and
+whether extra challenge-derived randomization is necessary. As with the
+Hadamard candidate, every stopping rule and confidence allocation must be
+prespecified or anytime-valid.
+
 ### 6.3 Robust numerical unit-circle proximity
 
 The existing `q` unique initial fold trajectories are sampled without
@@ -546,8 +695,9 @@ The following are research candidates, not changes to policy 3:
    signing a theorem-specific per-round accumulator.
 2. Report deterministic roundoff envelopes for every verifier operation used
    by the theorem.
-3. Add sequential, independently challenged randomized-Hadamard
-   residual-consistency sketches, retaining each interval-valued observation.
+3. Add sequential, independently challenged randomized-Hadamard or complex
+   unit-torus residual-consistency sketches, retaining each interval-valued
+   observation.
 4. Split fold summaries by round and bind a useful oracle magnitude or energy
    cap.
 5. Make the randomness/attempt model machine-readable.
@@ -600,6 +750,12 @@ generic `passes=true` field.
   a few Hadamard modes.
 - Prototype challenge-derived randomized-Hadamard sign families that offer
   both a small-ball theorem and a succinct generator-owned public contraction.
+- Prototype homogeneous unit-torus challenges with the hybrid public endpoint
+  `q_z^* A w(v)`, and verify Parseval identities against exhaustive small
+  instances.
+- Compare real affine and normalized complex-butterfly sumcheck folds,
+  including operator norms, roundoff envelopes, and degree-two small-ball
+  constants on candidate finite phase grids.
 - Compare predetermined sequential sample counts and anytime-valid stopping
   rules, retaining deterministic binary64 intervals for every observation.
 - Retain complex-unit-circle and direct-row sketches as comparative designs.
@@ -712,12 +868,18 @@ This proposal does not attempt to:
 6. Which randomized-Hadamard sign family simultaneously gives useful
    distribution-free small-ball bounds and succinct public evaluation for the
    registered matrix generators?
-7. Should services provide post-precommitment randomness, or is an explicit
+7. Do homogeneous unit-torus challenges give useful dimension-dependent
+   small-ball constants after practical oversampling, and which canonical
+   finite phase grid preserves the required orthogonality?
+8. Can application sumchecks and recursive commitment folds share the same
+   normalized complex-butterfly challenge geometry without unacceptable proof
+   size or binary64 error growth?
+9. Should services provide post-precommitment randomness, or is an explicit
    attempt budget sufficient for the intended deployment?
-8. Should certificates carry per-round bound inputs, or rely on availability of
-   the certificate-bound proof digest and deterministic replay?
-9. Which confidence levels should be standardized for presentation without
-   implying an application policy?
+10. Should certificates carry per-round bound inputs, or rely on availability
+    of the certificate-bound proof digest and deterministic replay?
+11. Which confidence levels should be standardized for presentation without
+    implying an application policy?
 
 ## 13. Suggested research narrative
 
@@ -728,8 +890,9 @@ A concise paper or blog-post progression is:
 3. A deterministic decomposition converts committed-residual bounds into a
    final residual interval.
 4. The current central MLE challenge exposes a concrete conditioning barrier.
-5. Sequential randomized-Hadamard sketches separate statistically meaningful
-   residual sampling from the MLE machinery used for succinct openings.
+5. Sequential randomized-Hadamard or homogeneous unit-torus sketches separate
+   statistically meaningful residual sampling from the MLE machinery used for
+   succinct openings.
 6. Sampled fold checks need magnitude control in addition to bad-fraction
    estimates.
 7. Better sketches, deterministic roundoff envelopes, and a fixed randomness
