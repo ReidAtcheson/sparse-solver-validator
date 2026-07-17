@@ -1531,6 +1531,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "serde",
+ "serde_json",
  "ssv-canonical",
  "thiserror",
 ]

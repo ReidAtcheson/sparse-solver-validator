@@ -943,6 +943,58 @@ mod tests {
     }
 
     #[test]
+    fn signed_fast_certificate_survives_json_round_trip() {
+        let key = signing_key();
+        let zero = DefectMetrics {
+            maximum_absolute_defect: 0.0,
+            maximum_normalized_defect: 0.0,
+            rms_normalized_defect: 0.0,
+            threshold_exceedances: 0,
+        };
+        let certificate = SignedCertificate::sign(
+            CertificatePayload {
+                schema: CertificateSchema::V3,
+                issuer: "test-issuer".to_owned(),
+                key_id: "test-key".to_owned(),
+                issued_at_unix_seconds: 1_500,
+                challenge_digest: Digest::from_bytes([1; 32]),
+                problem_digest: Digest::from_bytes([2; 32]),
+                validation_manifest_digest: Digest::from_bytes([3; 32]),
+                proof_digest: Digest::from_bytes([4; 32]),
+                protocol: ProofProtocol::FastBinary64UnitCircleV3,
+                score: CertifiedScore::FastBinary64SquaredL2V1 {
+                    squared_l2: 0.0,
+                    consistency: FastConsistencyMetrics {
+                        norm_sumcheck: zero,
+                        matvec_sumcheck: DefectMetrics {
+                            maximum_absolute_defect: 6.938_893_903_907_228e-18,
+                            maximum_normalized_defect: 2.104_791_105_834_217_8e-5,
+                            rms_normalized_defect: 9.914_397_065_476_954e-6,
+                            threshold_exceedances: 0,
+                        },
+                        linear_opening: zero,
+                        unit_circle_folds: zero,
+                        recursive_query_trajectories: 32,
+                    },
+                },
+                validator_build: "test-build".to_owned(),
+            },
+            &key,
+        )
+        .unwrap();
+
+        let encoded = serde_json::to_vec(&certificate).unwrap();
+        let decoded: SignedCertificate = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            encode_to_vec(&decoded.payload),
+            encode_to_vec(&certificate.payload)
+        );
+        decoded
+            .verify(&key.verifying_key(), "test-issuer", "test-key")
+            .unwrap();
+    }
+
+    #[test]
     fn fast_certificate_accepts_up_to_64_distinct_small_domain_queries() {
         let zero = DefectMetrics {
             maximum_absolute_defect: 0.0,

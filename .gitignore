@@ -25,3 +25,4 @@ target/
 *.challenge.json
 *.key
 .env
+/deploy/*.env

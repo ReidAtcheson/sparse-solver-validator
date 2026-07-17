@@ -535,7 +535,7 @@ one-shot challenge.
 The HTTP adapter exposes:
 
 ```text
-GET  /healthz
+GET  /health
 POST /v1/challenges
 POST /v1/validate
 ```

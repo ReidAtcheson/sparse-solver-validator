@@ -1,0 +1,40 @@
+# Version-control and local agent state.
+.git/
+.agents/
+.codex/
+
+# Local build outputs and editor artifacts.
+target/
+debug/
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
+
+# Local secrets and credentials must never enter the build context.
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+*.secret
+credentials*.json
+service-account*.json
+application_default_credentials.json
+secrets/
+**/secrets/
+
+# Generated protocol artifacts are not image inputs.
+*.proof
+*.certificate.json
+*.challenge.json
+
+# Documentation and local examples are not needed to build the server.
+docs/
+deploy/
+examples/
+README.md
+AGENTS.md
+
+# The locked dependency graph is required for the reproducible build.
+!Cargo.lock

@@ -40,7 +40,7 @@ num-traits = "0.2.19"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 rayon = "1.11"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 thiserror = "2.0.18"
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 tower = { version = "0.5.3", features = ["limit"] }

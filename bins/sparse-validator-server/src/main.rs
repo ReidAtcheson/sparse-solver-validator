@@ -27,6 +27,8 @@ use tower::limit::ConcurrencyLimitLayer;
 use zeroize::Zeroizing;
 
 const MAX_TEMPLATE_JSON_BYTES: usize = 1024 * 1024;
+const PACKAGE_VALIDATOR_BUILD: &str =
+    concat!("sparse-validator-server/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Parser)]
 #[command(
@@ -59,6 +61,8 @@ enum Command {
         issuer: String,
         #[arg(long, env = "SSV_KEY_ID", default_value = "local-development-v1")]
         key_id: String,
+        #[arg(long, env = "SSV_VALIDATOR_BUILD")]
+        validator_build: Option<String>,
         #[arg(long, default_value_t = 900)]
         challenge_lifetime_seconds: i64,
         #[arg(long, default_value_t = 30)]
@@ -139,6 +143,7 @@ async fn main() -> Result<()> {
             signing_key,
             issuer,
             key_id,
+            validator_build,
             challenge_lifetime_seconds,
             maximum_future_skew_seconds,
             maximum_solution_elements,
@@ -155,6 +160,9 @@ async fn main() -> Result<()> {
                 .context("maximum-solution-elements exceeds registered backend limits")?;
             let max_proof_bytes = structural_proof_limit;
             let signing_key = load_signing_key(&signing_key)?;
+            let cloud_run_revision = std::env::var("K_REVISION").ok();
+            let validator_build =
+                select_validator_build(validator_build.as_deref(), cloud_run_revision.as_deref());
             let service = StatelessValidatorService::new(
                 ServiceConfig {
                     issuer,
@@ -162,10 +170,7 @@ async fn main() -> Result<()> {
                     challenge_lifetime_seconds,
                     maximum_future_skew_seconds,
                     maximum_solution_elements,
-                    validator_build: format!(
-                        "sparse-validator-server/{}",
-                        env!("CARGO_PKG_VERSION")
-                    ),
+                    validator_build,
                 },
                 signing_key,
             )?;
@@ -207,7 +212,9 @@ async fn serve(
         }
     });
     let app = Router::new()
-        .route("/healthz", get(health))
+        // Cloud Run reserves some paths ending in `z`; keep this endpoint on
+        // an ordinary application path so requests reach the container.
+        .route("/health", get(health))
         .route(
             "/v1/challenges",
             post(issue_challenge).layer(DefaultBodyLimit::max(MAX_TEMPLATE_JSON_BYTES)),
@@ -226,7 +233,7 @@ async fn serve(
         .await
         .with_context(|| format!("could not bind HTTP listener to {address}"))?;
     println!("listening=http://{address}");
-    println!("health_path=/healthz");
+    println!("health_path=/health");
     println!("challenge_path=/v1/challenges");
     println!("validation_path=/v1/validate");
     println!("max_proof_bytes={max_proof_bytes}");
@@ -285,7 +292,38 @@ async fn validate(
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(terminate) => terminate,
+            Err(error) => {
+                eprintln!("could not install SIGTERM handler: {error}");
+                return;
+            }
+        };
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(error) = result {
+                    eprintln!("could not listen for Ctrl-C: {error}");
+                }
+            }
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        eprintln!("could not listen for Ctrl-C: {error}");
+    }
+}
+
+fn select_validator_build(configured: Option<&str>, cloud_run_revision: Option<&str>) -> String {
+    configured
+        .or(cloud_run_revision)
+        .unwrap_or(PACKAGE_VALIDATOR_BUILD)
+        .to_owned()
 }
 
 fn keygen(signing_key_path: &Path, public_key_path: &Path) -> Result<()> {
@@ -365,4 +403,35 @@ fn now_unix_seconds() -> Result<i64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the Unix epoch")?;
     i64::try_from(duration.as_secs()).context("Unix timestamp does not fit i64")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PACKAGE_VALIDATOR_BUILD, select_validator_build};
+
+    #[test]
+    fn validator_build_prefers_explicit_configuration() {
+        assert_eq!(
+            select_validator_build(Some("configured-build"), Some("cloud-run-revision")),
+            "configured-build"
+        );
+    }
+
+    #[test]
+    fn validator_build_uses_cloud_run_revision_when_not_configured() {
+        assert_eq!(
+            select_validator_build(None, Some("cloud-run-revision")),
+            "cloud-run-revision"
+        );
+    }
+
+    #[test]
+    fn validator_build_falls_back_to_package_version() {
+        assert_eq!(select_validator_build(None, None), PACKAGE_VALIDATOR_BUILD);
+    }
+
+    #[test]
+    fn empty_explicit_validator_build_is_not_silently_replaced() {
+        assert_eq!(select_validator_build(Some(""), Some("revision")), "");
+    }
 }

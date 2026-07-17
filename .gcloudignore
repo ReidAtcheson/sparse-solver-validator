@@ -1,0 +1,37 @@
+# Keep Cloud Build uploads aligned with the Docker build context.
+.git/
+.agents/
+.codex/
+
+target/
+debug/
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
+
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+*.secret
+credentials*.json
+service-account*.json
+application_default_credentials.json
+secrets/
+**/secrets/
+
+*.proof
+*.certificate.json
+*.challenge.json
+
+docs/
+deploy/
+examples/
+README.md
+AGENTS.md
+
+# Upload the container recipe and immutable Rust dependency graph.
+!Dockerfile
+!Cargo.lock

@@ -48,7 +48,8 @@ numerical audit.
 See [architecture.md](docs/architecture.md), [protocol.md](docs/protocol.md), and
 [benchmarking.md](docs/benchmarking.md) for component boundaries, exact/fast
 semantics, security limits, and the measurement method required before making
-performance claims about this rewrite.
+performance claims about this rewrite. The private-by-default deployment
+runbook is [gcp-cloud-run.md](docs/gcp-cloud-run.md).
 
 ## Local direct workflow
 
