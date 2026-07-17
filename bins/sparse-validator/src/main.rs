@@ -278,7 +278,7 @@ fn print_backend_report(report: &BackendVerifierReport) {
         }
         BackendVerifierReport::Fast(report) => {
             println!("proof_kind=fast-binary64-unit-circle-v4");
-            println!("warning=provisional_metric_diagnostics_without_global_soundness_bound");
+            print_live_fast_validation_semantics();
             println!(
                 "residual_squared_l2_claim={:.17e}",
                 report.score.squared_l2_claim
@@ -292,13 +292,30 @@ fn print_backend_report(report: &BackendVerifierReport) {
             print_defects("matvec_sumcheck", report.score.matvec_sumcheck);
             print_defects("linear_opening", report.score.linear_opening_sumcheck);
             print_defects("unit_circle_folds", report.score.unit_circle_folds);
+            print_public_evaluator_roundoff(
+                "public_rhs",
+                report.public_evaluations.rhs.forward_absolute_error_bound,
+                report.public_evaluations.rhs.maximum_absolute_source,
+                report.public_evaluations.rhs.maximum_absolute_intermediate,
+            );
+            print_public_evaluator_roundoff(
+                "public_matrix",
+                report
+                    .public_evaluations
+                    .matrix
+                    .forward_absolute_error_bound,
+                report.public_evaluations.matrix.maximum_absolute_source,
+                report
+                    .public_evaluations
+                    .matrix
+                    .maximum_absolute_intermediate,
+            );
             println!(
                 "recursive_query_trajectories={}",
                 report.score.proximity_queries_per_round
             );
-            println!(
-                "conditional_miss_probability_bad_fraction_1_percent={:.17e}",
-                report.score.conditional_miss_probability_upper_bound[0]
+            print_conditional_miss_probabilities(
+                report.score.conditional_miss_probability_upper_bound,
             );
             println!("sumcheck_rounds={}", report.work.sumcheck_rounds);
             println!("merkle_hashes={}", report.work.merkle_hashes);
@@ -319,6 +336,38 @@ fn print_backend_report(report: &BackendVerifierReport) {
             );
         }
     }
+}
+
+fn print_live_fast_validation_semantics() {
+    println!("structural_verification=true");
+    print_fast_quality_semantics();
+}
+
+fn print_certified_fast_validation_semantics() {
+    println!("structural_verification_attested=true");
+    println!("structural_verification_source=signed_certificate");
+    print_fast_quality_semantics();
+}
+
+fn print_fast_quality_semantics() {
+    println!("residual_quality_verdict=none");
+    println!("global_residual_a_posteriori_error_bound_available=false");
+    println!("warning=provisional_metric_diagnostics_without_global_soundness_bound");
+}
+
+fn print_conditional_miss_probabilities(probabilities: [f64; 3]) {
+    println!(
+        "conditional_miss_probability_bad_fraction_1_percent={:.17e}",
+        probabilities[0]
+    );
+    println!(
+        "conditional_miss_probability_bad_fraction_5_percent={:.17e}",
+        probabilities[1]
+    );
+    println!(
+        "conditional_miss_probability_bad_fraction_10_percent={:.17e}",
+        probabilities[2]
+    );
 }
 
 fn print_defects(prefix: &str, summary: ssv_fast::DefectSummary) {
@@ -366,6 +415,17 @@ fn print_certified_defects(prefix: &str, metrics: ssv_service_protocol::DefectMe
         "{prefix}_maximum_normalization_scale={:.17e}",
         metrics.maximum_normalization_scale
     );
+}
+
+fn print_public_evaluator_roundoff(
+    prefix: &str,
+    forward_absolute_error_bound: f64,
+    maximum_absolute_source: f64,
+    maximum_absolute_intermediate: f64,
+) {
+    println!("{prefix}_forward_absolute_error_bound={forward_absolute_error_bound:.17e}");
+    println!("{prefix}_maximum_absolute_source={maximum_absolute_source:.17e}");
+    println!("{prefix}_maximum_absolute_intermediate={maximum_absolute_intermediate:.17e}");
 }
 
 fn print_succinct_materialization(
@@ -555,15 +615,39 @@ fn verify_certificate(
             consistency,
         } => {
             println!("score_kind=fast-binary64-diagnostics-v1");
+            print_certified_fast_validation_semantics();
             println!("residual_squared_l2_claim={squared_l2_claim:.17e}");
             print_certified_defects("norm_sumcheck", consistency.norm_sumcheck);
             print_certified_defects("matvec_sumcheck", consistency.matvec_sumcheck);
             print_certified_defects("linear_opening", consistency.linear_opening);
             print_certified_defects("unit_circle_folds", consistency.unit_circle_folds);
+            print_public_evaluator_roundoff(
+                "public_rhs",
+                consistency.public_rhs_roundoff.forward_absolute_error_bound,
+                consistency.public_rhs_roundoff.maximum_absolute_source,
+                consistency
+                    .public_rhs_roundoff
+                    .maximum_absolute_intermediate,
+            );
+            print_public_evaluator_roundoff(
+                "public_matrix",
+                consistency
+                    .public_matrix_roundoff
+                    .forward_absolute_error_bound,
+                consistency.public_matrix_roundoff.maximum_absolute_source,
+                consistency
+                    .public_matrix_roundoff
+                    .maximum_absolute_intermediate,
+            );
             println!(
                 "recursive_query_trajectories={}",
                 consistency.recursive_query_trajectories
             );
+            let query_count =
+                usize::try_from(consistency.recursive_query_trajectories).unwrap_or(usize::MAX);
+            print_conditional_miss_probabilities(ssv_fast::conditional_miss_probabilities(
+                query_count,
+            ));
         }
     }
     println!("quality_threshold_applied=false");

@@ -69,16 +69,16 @@ pub struct ProductSumcheckProof {
 
 /// Raw provenance for one approximate relation.
 ///
-/// `normalization_scale` is `min(abs(actual), abs(expected))`. A protocol
-/// policy combines it with its relation-specific zero scale before computing
-/// a floor-relative error. Keeping policy out of this primitive preserves the
-/// raw inputs needed by later diagnostic and soundness analyses.
+/// A protocol policy derives `min(actual_magnitude, expected_magnitude)` and
+/// combines it with its relation-specific zero scale before computing a
+/// floor-relative error. Keeping policy out of this primitive preserves the
+/// raw inputs needed by later diagnostic and soundness analyses without
+/// storing a redundant derived value.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DefectObservation {
     pub actual_magnitude: f64,
     pub expected_magnitude: f64,
     pub absolute_defect: f64,
-    pub normalization_scale: f64,
 }
 
 /// Prover-side endpoint values.
@@ -188,7 +188,7 @@ where
     let left_evaluation = canonicalize_zero(left[0]);
     let right_evaluation = canonicalize_zero(right[0]);
     let actual = checked_product(left_evaluation, right_evaluation, "endpoint product")?;
-    let defect = observe_relation(actual, claim)?;
+    let defect = observe_relation(actual, claim);
 
     Ok((
         ProductSumcheckProof { rounds },
@@ -230,7 +230,7 @@ where
     for (round_index, &round) in proof.rounds.iter().enumerate() {
         round.validate(Some(round_index))?;
         let endpoints_sum = checked_sum(round.b0(), round.b2(), "round endpoint sum")?;
-        round_defects.push(observe_relation(endpoints_sum, claim)?);
+        round_defects.push(observe_relation(endpoints_sum, claim));
 
         let round_challenge = challenge(round_index, &round);
         validate_challenge(round_challenge)?;
@@ -257,7 +257,7 @@ pub fn verify_product_endpoint(
     validate_canonical(right_evaluation)
         .map_err(|_| SumcheckError::NonCanonicalEndpoint { factor: "right" })?;
     let product = checked_product(left_evaluation, right_evaluation, "endpoint product")?;
-    observe_relation(product, endpoint.claim)
+    Ok(observe_relation(product, endpoint.claim))
 }
 
 /// Evaluates an MLE using the fast path's MSB-coordinate-first convention.
@@ -341,23 +341,26 @@ fn interpolate(low: f64, high: f64, challenge: f64) -> Result<f64, SumcheckError
     canonicalize_computation(value, "multilinear interpolation")
 }
 
-fn observe_relation(actual: f64, expected: f64) -> Result<DefectObservation, SumcheckError> {
+fn observe_relation(actual: f64, expected: f64) -> DefectObservation {
     let difference = actual - expected;
-    if !difference.is_finite() {
-        return Err(SumcheckError::NonFiniteComputation {
-            phase: "defect evaluation",
-        });
-    }
-    let absolute_defect = canonicalize_zero(difference.abs());
+    let absolute_defect = if difference.is_finite() {
+        // Defects are diagnostics rather than transcript values. Preserve a
+        // finite subnormal difference instead of applying the protocol's
+        // flush-to-zero rule for arithmetic that feeds later challenges.
+        difference.abs()
+    } else {
+        // Both operands have already passed a canonical finite boundary.
+        // Their discrepancy is diagnostic-only, so an unrepresentable
+        // magnitude saturates rather than changing structural verification.
+        f64::MAX
+    };
     let actual_magnitude = canonicalize_zero(actual.abs());
     let expected_magnitude = canonicalize_zero(expected.abs());
-    let normalization_scale = canonicalize_zero(actual_magnitude.min(expected_magnitude));
-    Ok(DefectObservation {
+    DefectObservation {
         actual_magnitude,
         expected_magnitude,
         absolute_defect,
-        normalization_scale,
-    })
+    }
 }
 
 fn checked_product(left: f64, right: f64, phase: &'static str) -> Result<f64, SumcheckError> {
@@ -505,7 +508,12 @@ mod tests {
         let verification =
             verify_product(left.len(), initial_claim, &proof, scripted_challenge).unwrap();
         assert!(verification.round_defects[0].absolute_defect > 0.0);
-        assert_eq!(verification.round_defects[0].normalization_scale, 11.0);
+        assert_eq!(
+            verification.round_defects[0]
+                .actual_magnitude
+                .min(verification.round_defects[0].expected_magnitude),
+            11.0
+        );
     }
 
     #[test]
@@ -541,11 +549,31 @@ mod tests {
         assert!(honest.absolute_defect <= 4.0 * f64::EPSILON);
         assert!(changed.absolute_defect > honest.absolute_defect);
         assert_eq!(
-            changed.normalization_scale,
-            ((left_at_point + 0.25) * right_at_point)
-                .abs()
-                .min(verification.endpoint.claim.abs())
+            changed.actual_magnitude,
+            ((left_at_point + 0.25) * right_at_point).abs()
         );
+        assert_eq!(
+            changed.expected_magnitude,
+            verification.endpoint.claim.abs()
+        );
+    }
+
+    #[test]
+    fn diagnostic_difference_overflow_saturates_without_an_error() {
+        let observation = observe_relation(f64::MAX, -f64::MAX);
+
+        assert_eq!(observation.actual_magnitude, f64::MAX);
+        assert_eq!(observation.expected_magnitude, f64::MAX);
+        assert_eq!(observation.absolute_defect, f64::MAX);
+    }
+
+    #[test]
+    fn diagnostic_preserves_a_finite_subnormal_difference() {
+        let expected = f64::MIN_POSITIVE;
+        let actual = f64::from_bits(expected.to_bits() + 1);
+        let observation = observe_relation(actual, expected);
+
+        assert_eq!(observation.absolute_defect.to_bits(), 1);
     }
 
     #[test]

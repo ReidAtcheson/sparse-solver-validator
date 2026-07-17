@@ -303,7 +303,8 @@ relations such as framing, transcript replay, and Merkle authentication remain
 hard verification conditions. Approximate algebraic relations do not produce a
 protocol-level quality verdict: the verifier reports absolute defects and
 floor-relative errors under relation-specific, transcript-bound zero scales,
-along with a conditional sampling curve.
+along with public-evaluator roundoff provenance and a conditional sampling
+curve.
 
 This is a **provisional metric certificate**, not the exact profile with faster
 arithmetic. Structural framing, signatures, transcript binding, Merkle

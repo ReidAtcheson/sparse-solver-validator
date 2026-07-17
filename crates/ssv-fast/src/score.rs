@@ -130,7 +130,8 @@ pub struct DefectAccumulator {
     checks: u64,
     max_absolute: f64,
     max_relative: f64,
-    relative_square_sum: f64,
+    relative_rms_scale: f64,
+    relative_scaled_square_sum: f64,
     min_normalization_scale: f64,
     max_normalization_scale: f64,
 }
@@ -166,7 +167,8 @@ impl DefectAccumulator {
             checks: 0,
             max_absolute: 0.0,
             max_relative: 0.0,
-            relative_square_sum: 0.0,
+            relative_rms_scale: 0.0,
+            relative_scaled_square_sum: 0.0,
             min_normalization_scale: f64::INFINITY,
             max_normalization_scale: 0.0,
         }
@@ -204,7 +206,6 @@ impl DefectAccumulator {
             actual_magnitude: actual.magnitude(),
             expected_magnitude: expected.magnitude(),
             absolute_defect: defect,
-            normalization_scale: actual.magnitude().min(expected.magnitude()),
         })
     }
 
@@ -212,10 +213,29 @@ impl DefectAccumulator {
         self.checks = self.checks.saturating_add(1);
         self.max_absolute = self.max_absolute.max(absolute);
         self.max_relative = self.max_relative.max(relative);
-        self.relative_square_sum =
-            saturating_float_add(self.relative_square_sum, relative * relative);
+        self.record_relative_square(relative);
         self.min_normalization_scale = self.min_normalization_scale.min(normalization_scale);
         self.max_normalization_scale = self.max_normalization_scale.max(normalization_scale);
+    }
+
+    /// Updates a scaled sum of squares without directly squaring `relative`.
+    ///
+    /// This is the same scaling strategy used by BLAS `LASSQ`: the largest
+    /// magnitude is kept separately and every accumulated square is at most
+    /// one. It therefore preserves finite RMS values when a direct square
+    /// would overflow or underflow.
+    fn record_relative_square(&mut self, relative: f64) {
+        if relative == 0.0 {
+            return;
+        }
+        if relative > self.relative_rms_scale {
+            let ratio = self.relative_rms_scale / relative;
+            self.relative_scaled_square_sum = 1.0 + self.relative_scaled_square_sum * ratio * ratio;
+            self.relative_rms_scale = relative;
+        } else {
+            let ratio = relative / self.relative_rms_scale;
+            self.relative_scaled_square_sum += ratio * ratio;
+        }
     }
 
     /// Finalizes neutral maximum and RMS statistics.
@@ -224,9 +244,10 @@ impl DefectAccumulator {
         let rms_relative = if self.checks == 0 {
             0.0
         } else {
-            (self.relative_square_sum / self.checks as f64)
+            let normalized_rms = (self.relative_scaled_square_sum / self.checks as f64)
                 .sqrt()
-                .min(self.max_relative)
+                .min(1.0);
+            (self.relative_rms_scale * normalized_rms).min(self.max_relative)
         };
         DefectSummary {
             checks: self.checks,
@@ -262,11 +283,6 @@ fn finite_quotient(numerator: f64, denominator: f64) -> f64 {
     }
 }
 
-fn saturating_float_add(left: f64, right: f64) -> f64 {
-    let result = left + right;
-    if result.is_finite() { result } else { f64::MAX }
-}
-
 /// Conditional per-round miss curves for hypothetical bad fractions.
 ///
 /// These values must not be multiplied across rounds without an additional
@@ -286,7 +302,6 @@ mod tests {
             actual_magnitude: actual.abs(),
             expected_magnitude: expected.abs(),
             absolute_defect: (actual - expected).abs(),
-            normalization_scale: actual.abs().min(expected.abs()),
         }
     }
 
@@ -368,15 +383,32 @@ mod tests {
             actual_magnitude: f64::INFINITY,
             expected_magnitude: 1.0,
             absolute_defect: f64::NAN,
-            normalization_scale: 1.0,
         });
         let summary = accumulator.finish();
         assert_eq!(observation.absolute_defect, f64::MAX);
         assert_eq!(observation.relative_error, f64::MAX);
         assert_eq!(summary.max_absolute, f64::MAX);
         assert_eq!(summary.max_relative, f64::MAX);
-        assert!(summary.rms_relative.is_finite());
-        assert!(summary.rms_relative <= summary.max_relative);
+        assert_eq!(summary.rms_relative, f64::MAX);
+    }
+
+    #[test]
+    fn scaled_rms_preserves_values_whose_squares_overflow_or_underflow() {
+        let mut large = DefectAccumulator::policy3_matvec_sumcheck();
+        let _ = large.observe(DefectObservation {
+            actual_magnitude: 1.0,
+            expected_magnitude: 1.0,
+            absolute_defect: 1.0e200,
+        });
+        assert_eq!(large.finish().rms_relative, 1.0e200);
+
+        let mut small = DefectAccumulator::policy3_matvec_sumcheck();
+        let _ = small.observe(DefectObservation {
+            actual_magnitude: 1.0,
+            expected_magnitude: 1.0,
+            absolute_defect: 1.0e-200,
+        });
+        assert_eq!(small.finish().rms_relative, 1.0e-200);
     }
 
     #[test]

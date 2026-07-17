@@ -13,7 +13,8 @@ use ssv_direct::{DirectBackend, DirectError, DirectProverReport, DirectVerifierR
 use ssv_exact::{ExactBackend, ExactError, ExactProverReport, ExactVerifierReport};
 use ssv_fast::{FastBackend, FastError, FastProverContext, FastProverReport, FastVerifierReport};
 use ssv_service_protocol::{
-    CertifiedScore, DefectMetrics, FastConsistencyMetrics, ProofProtocol, Unsigned192,
+    CertifiedScore, DefectMetrics, FastConsistencyMetrics, ProofProtocol,
+    PublicEvaluatorRoundoffMetrics, Unsigned192,
 };
 use ssv_solution::Solution;
 use ssv_validation::{
@@ -140,6 +141,8 @@ impl BackendVerifierReport {
                         matvec_sumcheck: defect_metrics(score.matvec_sumcheck),
                         linear_opening: defect_metrics(score.linear_opening_sumcheck),
                         unit_circle_folds: defect_metrics(score.unit_circle_folds),
+                        public_rhs_roundoff: roundoff_metrics(report.public_evaluations.rhs),
+                        public_matrix_roundoff: roundoff_metrics(report.public_evaluations.matrix),
                         recursive_query_trajectories: score.proximity_queries_per_round,
                     }),
                 })
@@ -157,5 +160,15 @@ fn defect_metrics(summary: ssv_fast::DefectSummary) -> DefectMetrics {
         rms_relative_error: summary.rms_relative,
         minimum_normalization_scale: summary.min_normalization_scale,
         maximum_normalization_scale: summary.max_normalization_scale,
+    }
+}
+
+fn roundoff_metrics(
+    diagnostics: ssv_fast::F64RoundoffDiagnostics,
+) -> PublicEvaluatorRoundoffMetrics {
+    PublicEvaluatorRoundoffMetrics {
+        forward_absolute_error_bound: diagnostics.forward_absolute_error_bound,
+        maximum_absolute_source: diagnostics.maximum_absolute_source,
+        maximum_absolute_intermediate: diagnostics.maximum_absolute_intermediate,
     }
 }

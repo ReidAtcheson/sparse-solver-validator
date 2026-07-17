@@ -284,6 +284,32 @@ fn hosted_fast_and_exact_followup_share_the_signed_problem_header() {
         assert!(metrics.maximum_relative_error.is_finite());
         assert!(metrics.rms_relative_error.is_finite());
     }
+    let BackendVerifierReport::Fast(fast_report) = fast_certificate.output.backend_report() else {
+        panic!("expected fast verifier report");
+    };
+    for (certified, verified) in [
+        (
+            consistency.public_rhs_roundoff,
+            fast_report.public_evaluations.rhs,
+        ),
+        (
+            consistency.public_matrix_roundoff,
+            fast_report.public_evaluations.matrix,
+        ),
+    ] {
+        assert_eq!(
+            certified.forward_absolute_error_bound,
+            verified.forward_absolute_error_bound
+        );
+        assert_eq!(
+            certified.maximum_absolute_source,
+            verified.maximum_absolute_source
+        );
+        assert_eq!(
+            certified.maximum_absolute_intermediate,
+            verified.maximum_absolute_intermediate
+        );
+    }
     let certificate_json = serde_json::to_value(&fast_certificate.certificate).unwrap();
     let certificate_payload = certificate_json.get("payload").unwrap();
     assert_eq!(

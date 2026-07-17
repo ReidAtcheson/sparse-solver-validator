@@ -462,6 +462,13 @@ normalization_scale = min(abs(actual), abs(expected))
 relative_error      = absolute_defect / max(normalization_scale, zero_scale)
 ```
 
+If the mathematical absolute defect is larger than finite binary64 can
+represent, the diagnostic magnitude saturates to `f64::MAX`. This preserves a
+traceable large discrepancy without turning diagnostic-only arithmetic into a
+verification failure. Conversely, finite subnormal defects are retained rather
+than applying the flush-to-zero rule used by arithmetic that feeds subsequent
+transcript challenges.
+
 Each relation family has a separately transcript-bound zero scale with the
 appropriate units:
 
@@ -480,7 +487,9 @@ proven residual interval without an additional theorem.
 
 The score records check count, zero scale, maximum absolute defect, maximum and
 RMS relative error, and the minimum and maximum observed normalization scale
-for:
+for the four relation families below. RMS is accumulated with a scaled
+sum-of-squares algorithm so very large and very small finite errors are not
+lost to intermediate overflow or underflow.
 
 - residual-norm sumcheck;
 - sparse matvec sumcheck;
@@ -489,8 +498,11 @@ for:
 
 The in-process fast verifier additionally retains every observation with its
 relation location: sumcheck round or endpoint, and unit-circle query trajectory
-and fold round (plus each final-value check). Signed certificates carry the
-corresponding family summaries after validating their policy-3 zero scales.
+and fold round (plus each final-value check). It also retains the public RHS and
+matrix evaluator's forward-error bound, maximum source magnitude, and maximum
+intermediate magnitude. Signed certificates carry the corresponding family
+summaries and public-evaluator roundoff provenance after validating their
+policy-3 zero scales and finite nonnegative encoding.
 
 No approximate diagnostic causes protocol verification to accept or reject.
 The binary64 squared-L2 value is explicitly a claim, and residual-quality policy
@@ -545,8 +557,9 @@ The score variants are deliberately different:
 
 - direct: binary64 squared L2, L2, RMS, and maximum absolute residual;
 - exact: unsigned residual numerator plus dyadic denominator power; and
-- fast: a binary64 squared-L2 claim plus four diagnostic summaries and the distinct
-  recursive-query-trajectory count.
+- fast: a binary64 squared-L2 claim, four diagnostic summaries, public RHS and
+  matrix evaluator roundoff provenance, and the distinct recursive-query-
+  trajectory count.
 
 A v4 certificate always carries the signed problem-challenge digest. Fast needs
 no additional signed challenge field. A score/protocol mismatch is invalid. A

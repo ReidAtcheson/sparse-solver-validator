@@ -201,6 +201,7 @@ no issuer interaction. Report:
 - sumcheck rounds and scalar values;
 - opening paths and Merkle hashes;
 - four floor-relative diagnostic summaries;
+- public RHS and matrix evaluator roundoff diagnostics;
 - residual squared-L2 claim; and
 - commit, prove, and verify time/RSS.
 

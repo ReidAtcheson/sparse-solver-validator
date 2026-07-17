@@ -18,8 +18,8 @@ use std::collections::BTreeSet;
 
 use ssv_canonical::{DecodeLimits, Digest, Encoder, Reader, domain_separated_digest};
 use ssv_problem::{
-    BooleanCoordinateOrder, GeneratedProblem, MleEvaluationError, PublicEvaluationMetadata,
-    SuccinctPublicEvaluator,
+    BooleanCoordinateOrder, F64RoundoffDiagnostics, GeneratedProblem, MleEvaluationError,
+    PublicEvaluationMetadata, SuccinctPublicEvaluator,
 };
 use ssv_relation::{FixedWitness, RelationError};
 use ssv_service_protocol::ProofProtocol;
@@ -432,6 +432,19 @@ pub struct FastVerifierDiagnostics {
     pub unit_circle_folds: Vec<FastDiagnosticObservation>,
 }
 
+/// Public-MLE roundoff provenance computed while verifying the transcript.
+///
+/// These diagnostics retain the verifier's actual RHS and matrix evaluation
+/// bounds and operand scales. They are inputs to a future a-posteriori error
+/// theorem, not acceptance thresholds for the present approximate protocol.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FastPublicEvaluationDiagnostics {
+    /// Diagnostics for the public RHS MLE at the shared row challenge.
+    pub rhs: F64RoundoffDiagnostics,
+    /// Diagnostics for the public matrix MLE at the row and column challenges.
+    pub matrix: F64RoundoffDiagnostics,
+}
+
 /// Structurally and cryptographically authenticated diagnostic result.
 ///
 /// Approximate discrepancies are reported without imposing a quality verdict.
@@ -443,6 +456,7 @@ pub struct FastVerifierReport {
     pub packed_codeword_root: MerkleRoot,
     pub score: FastValidationScore,
     pub diagnostics: FastVerifierDiagnostics,
+    pub public_evaluations: FastPublicEvaluationDiagnostics,
     pub work: FastVerifierWork,
 }
 
@@ -1020,6 +1034,10 @@ fn verify_backend(
         linear_opening_sumcheck: opening_observations,
         unit_circle_folds: fold_observations,
     };
+    let public_evaluations = FastPublicEvaluationDiagnostics {
+        rhs: rhs.roundoff,
+        matrix: matrix.roundoff,
+    };
 
     let sumcheck_rounds = (2 * variables + opening_variables) as u64;
     let query_workspace_bytes = opening_variables
@@ -1030,11 +1048,22 @@ fn verify_backend(
         .checked_mul(std::mem::size_of::<f64>())
         .and_then(|value| value.checked_add(4 * std::mem::size_of::<f64>()))
         .ok_or(FastError::ResourceLimit)?;
+    let diagnostic_observation_capacity = diagnostics
+        .norm_sumcheck
+        .capacity()
+        .checked_add(diagnostics.matvec_sumcheck.capacity())
+        .and_then(|value| value.checked_add(diagnostics.linear_opening_sumcheck.capacity()))
+        .and_then(|value| value.checked_add(diagnostics.unit_circle_folds.capacity()))
+        .ok_or(FastError::ResourceLimit)?;
+    let diagnostic_bytes = diagnostic_observation_capacity
+        .checked_mul(std::mem::size_of::<FastDiagnosticObservation>())
+        .ok_or(FastError::ResourceLimit)?;
     let accounted_high_watermark_bytes = payload_bytes
         .len()
         .checked_mul(2)
         .and_then(|value| value.checked_add(query_workspace_bytes))
         .and_then(|value| value.checked_add(claim_bytes))
+        .and_then(|value| value.checked_add(diagnostic_bytes))
         .ok_or(FastError::ResourceLimit)?;
     let work = FastVerifierWork {
         sumcheck_rounds,
@@ -1059,6 +1088,7 @@ fn verify_backend(
         packed_codeword_root: commitment.packed_codeword_root,
         score,
         diagnostics,
+        public_evaluations,
         work,
     })
 }
@@ -1488,7 +1518,16 @@ fn verify_folding_opening(
     }
 
     let mut defects = DefectAccumulator::policy3_unit_circle_folds();
+    let observation_count = query_plan
+        .indices
+        .len()
+        .checked_mul(challenges.len())
+        .and_then(|value| value.checked_add(proof.final_values.len()))
+        .ok_or(FastError::ResourceLimit)?;
     let mut observations = Vec::new();
+    observations
+        .try_reserve_exact(observation_count)
+        .map_err(|_| FastError::ResourceLimit)?;
     for &base_index in &query_plan.indices {
         let query_index = u64::try_from(base_index).map_err(|_| FastError::ResourceLimit)?;
         let mut index = base_index;
@@ -1536,6 +1575,7 @@ fn verify_folding_opening(
             observation: defects.observe_unit_circle_fold(value, claimed),
         });
     }
+    debug_assert_eq!(observations.len(), observation_count);
     Ok((defects.finish(), observations, merkle_hashes, opening_paths))
 }
 
@@ -1978,7 +2018,7 @@ mod tests {
     #[test]
     fn noninteractive_query_only_backend_round_trips() {
         for dimension in [3, 5, 16] {
-            let (_, report) = round_trip(dimension);
+            let (payload, report) = round_trip(dimension);
             assert_eq!(report.score.squared_l2_claim, 0.0);
             assert_eq!(
                 report.diagnostics.norm_sumcheck.len() as u64,
@@ -2048,11 +2088,27 @@ mod tests {
             assert_eq!(report.work.solution_elements_materialized, 0);
             assert_eq!(report.work.residual_elements_materialized, 0);
             assert_eq!(report.work.codeword_elements_materialized, 0);
-            let variables = dimension.next_power_of_two().ilog2() as u64;
-            assert_eq!(report.work.sumcheck_rounds, 3 * variables + 1);
+            let variables = dimension.next_power_of_two().ilog2() as usize;
+            assert_eq!(report.work.sumcheck_rounds, (3 * variables + 1) as u64);
             assert_eq!(
                 report.score.proximity_queries_per_round,
                 (2 * dimension.next_power_of_two()).min(64) as u32
+            );
+
+            let opening_variables = variables + 1;
+            let diagnostic_capacity = report.diagnostics.norm_sumcheck.capacity()
+                + report.diagnostics.matvec_sumcheck.capacity()
+                + report.diagnostics.linear_opening_sumcheck.capacity()
+                + report.diagnostics.unit_circle_folds.capacity();
+            let expected_accounted_bytes = 2 * payload.len()
+                + opening_variables
+                    * (2 * Policy3::PROXIMITY_QUERY_TARGET)
+                    * std::mem::size_of::<usize>()
+                + (opening_variables + 4) * std::mem::size_of::<f64>()
+                + diagnostic_capacity * std::mem::size_of::<FastDiagnosticObservation>();
+            assert_eq!(
+                report.work.accounted_high_watermark_bytes,
+                expected_accounted_bytes
             );
         }
     }
@@ -2123,9 +2179,20 @@ mod tests {
         assert_eq!(rhs.value, 2.0_f64.powi(-42));
         absorb_float(&mut transcript, b"matvec-initial-claim", rhs.value).unwrap();
         let matvec_sumcheck = zero_sumcheck(variables);
+        let mut matvec_point = Vec::with_capacity(variables);
         for (round, polynomial) in matvec_sumcheck.rounds.iter().enumerate() {
-            sumcheck_challenge(&mut transcript, b"matvec-product", round, polynomial);
+            matvec_point.push(sumcheck_challenge(
+                &mut transcript,
+                b"matvec-product",
+                round,
+                polynomial,
+            ));
         }
+        let matrix = statement
+            .generated()
+            .public_evaluation_plan()
+            .evaluate_matrix_mle_f64(&norm_point, &matvec_point)
+            .unwrap();
         absorb_float(&mut transcript, b"solution-at-column-point", 0.0).unwrap();
 
         transcript
@@ -2177,6 +2244,19 @@ mod tests {
         let payload = encode_backend_payload(&commitment, &proof_bytes).unwrap();
         let report = FastBackend::verify(&statement.verifier_statement(), &payload).unwrap();
 
+        assert_eq!(report.public_evaluations.rhs, rhs.roundoff);
+        assert_eq!(report.public_evaluations.matrix, matrix.roundoff);
+        for roundoff in [
+            report.public_evaluations.rhs,
+            report.public_evaluations.matrix,
+        ] {
+            assert!(roundoff.forward_absolute_error_bound.is_finite());
+            assert!(roundoff.forward_absolute_error_bound >= 0.0);
+            assert!(roundoff.maximum_absolute_source.is_finite());
+            assert!(roundoff.maximum_absolute_source >= 0.0);
+            assert!(roundoff.maximum_absolute_intermediate.is_finite());
+            assert!(roundoff.maximum_absolute_intermediate >= roundoff.maximum_absolute_source);
+        }
         assert_eq!(report.score.squared_l2_claim, 0.0);
         assert_eq!(report.score.matvec_sumcheck.max_relative, 1.0);
         assert_eq!(

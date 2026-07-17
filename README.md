@@ -140,6 +140,8 @@ invalid Merkle openings, and other exact relations. Approximate binary64
 relations instead produce protocol-normalized error diagnostics; neither the
 protocol nor the validator applies a numerical-quality threshold. Its reported
 residual is a provisional binary64 claim, not the exact profile's dyadic result.
+Machine-readable output distinguishes structural verification from residual
+quality and retains public-evaluator roundoff provenance for later analysis.
 
 ## Local signed service workflow
 

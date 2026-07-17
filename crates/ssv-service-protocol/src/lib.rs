@@ -292,6 +292,21 @@ pub struct DefectMetrics {
     pub maximum_normalization_scale: f64,
 }
 
+/// Deterministic binary64 roundoff provenance for one public MLE evaluation.
+///
+/// These values describe the reviewed public-evaluator operation sequence.
+/// They are inputs to possible future error analysis, not acceptance bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicEvaluatorRoundoffMetrics {
+    /// Conservative forward absolute-error bound for the returned MLE value.
+    pub forward_absolute_error_bound: f64,
+    /// Largest absolute source operand encountered by the evaluator.
+    pub maximum_absolute_source: f64,
+    /// Largest absolute tracked intermediate encountered by the evaluator.
+    pub maximum_absolute_intermediate: f64,
+}
+
 /// Auditable diagnostic summary of the provisional fast validator's four
 /// approximate relation families.
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
@@ -301,6 +316,8 @@ pub struct FastConsistencyMetrics {
     pub matvec_sumcheck: DefectMetrics,
     pub linear_opening: DefectMetrics,
     pub unit_circle_folds: DefectMetrics,
+    pub public_rhs_roundoff: PublicEvaluatorRoundoffMetrics,
+    pub public_matrix_roundoff: PublicEvaluatorRoundoffMetrics,
     pub recursive_query_trajectories: u32,
 }
 
@@ -657,12 +674,40 @@ impl CanonicalEncode for DefectMetrics {
     }
 }
 
+impl PublicEvaluatorRoundoffMetrics {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        let values = [
+            self.forward_absolute_error_bound,
+            self.maximum_absolute_source,
+            self.maximum_absolute_intermediate,
+        ];
+        if values
+            .iter()
+            .any(|value| !value.is_finite() || value.is_sign_negative())
+            || self.maximum_absolute_intermediate < self.maximum_absolute_source
+        {
+            return Err(ProtocolError::InvalidFastConsistency);
+        }
+        Ok(())
+    }
+}
+
+impl CanonicalEncode for PublicEvaluatorRoundoffMetrics {
+    fn encode(&self, output: &mut Encoder) {
+        output.write_u64(self.forward_absolute_error_bound.to_bits());
+        output.write_u64(self.maximum_absolute_source.to_bits());
+        output.write_u64(self.maximum_absolute_intermediate.to_bits());
+    }
+}
+
 impl FastConsistencyMetrics {
     fn validate(&self) -> Result<(), ProtocolError> {
         self.norm_sumcheck.validate()?;
         self.matvec_sumcheck.validate()?;
         self.linear_opening.validate()?;
         self.unit_circle_folds.validate()?;
+        self.public_rhs_roundoff.validate()?;
+        self.public_matrix_roundoff.validate()?;
         if self.norm_sumcheck.zero_scale.to_bits() != FAST_POLICY_3_NORM_ZERO_SCALE.to_bits()
             || self.matvec_sumcheck.zero_scale.to_bits()
                 != FAST_POLICY_3_MATVEC_ZERO_SCALE.to_bits()
@@ -690,6 +735,8 @@ impl CanonicalEncode for FastConsistencyMetrics {
         self.matvec_sumcheck.encode(output);
         self.linear_opening.encode(output);
         self.unit_circle_folds.encode(output);
+        self.public_rhs_roundoff.encode(output);
+        self.public_matrix_roundoff.encode(output);
         output.write_u32(self.recursive_query_trajectories);
     }
 }
@@ -864,6 +911,14 @@ mod tests {
         }
     }
 
+    fn zero_roundoff() -> PublicEvaluatorRoundoffMetrics {
+        PublicEvaluatorRoundoffMetrics {
+            forward_absolute_error_bound: 0.0,
+            maximum_absolute_source: 0.0,
+            maximum_absolute_intermediate: 0.0,
+        }
+    }
+
     fn payload() -> ChallengePayload {
         ChallengePayload {
             schema: ChallengeSchema::V1,
@@ -1031,6 +1086,16 @@ mod tests {
                         },
                         linear_opening: linear_zero,
                         unit_circle_folds: fold_zero,
+                        public_rhs_roundoff: PublicEvaluatorRoundoffMetrics {
+                            forward_absolute_error_bound: 1.0e-15,
+                            maximum_absolute_source: 1.0,
+                            maximum_absolute_intermediate: 2.0,
+                        },
+                        public_matrix_roundoff: PublicEvaluatorRoundoffMetrics {
+                            forward_absolute_error_bound: 2.0e-15,
+                            maximum_absolute_source: 2.0,
+                            maximum_absolute_intermediate: 4.0,
+                        },
                         recursive_query_trajectories: 32,
                     }),
                 },
@@ -1050,6 +1115,10 @@ mod tests {
             "fast-binary64-diagnostics-v1"
         );
         assert_eq!(value["payload"]["score"]["squared_l2_claim"], 0.0);
+        assert_eq!(
+            value["payload"]["score"]["consistency"]["public_rhs_roundoff"]["forward_absolute_error_bound"],
+            1.0e-15
+        );
         assert!(value["payload"]["score"].get("squared_l2").is_none());
 
         let encoded = serde_json::to_vec(&value).unwrap();
@@ -1061,6 +1130,19 @@ mod tests {
         decoded
             .verify(&key.verifying_key(), "test-issuer", "test-key")
             .unwrap();
+
+        let mut changed_roundoff = certificate;
+        let CertifiedScore::FastBinary64DiagnosticsV1 { consistency, .. } =
+            &mut changed_roundoff.payload.score
+        else {
+            panic!("expected fast diagnostic score");
+        };
+        consistency.public_rhs_roundoff.forward_absolute_error_bound *= 2.0;
+        assert!(
+            changed_roundoff
+                .verify(&key.verifying_key(), "test-issuer", "test-key")
+                .is_err()
+        );
     }
 
     #[test]
@@ -1070,6 +1152,8 @@ mod tests {
             matvec_sumcheck: zero_metrics(FAST_POLICY_3_MATVEC_ZERO_SCALE),
             linear_opening: zero_metrics(FAST_POLICY_3_LINEAR_OPENING_ZERO_SCALE),
             unit_circle_folds: zero_metrics(FAST_POLICY_3_UNIT_CIRCLE_FOLD_ZERO_SCALE),
+            public_rhs_roundoff: zero_roundoff(),
+            public_matrix_roundoff: zero_roundoff(),
             recursive_query_trajectories: 1,
         };
         assert!(consistency.validate().is_ok());
@@ -1108,12 +1192,41 @@ mod tests {
     }
 
     #[test]
+    fn fast_certificate_requires_finite_nonnegative_roundoff_provenance() {
+        let mut roundoff = zero_roundoff();
+        assert!(roundoff.validate().is_ok());
+
+        roundoff.forward_absolute_error_bound = f64::INFINITY;
+        assert!(matches!(
+            roundoff.validate(),
+            Err(ProtocolError::InvalidFastConsistency)
+        ));
+
+        roundoff = zero_roundoff();
+        roundoff.maximum_absolute_intermediate = -0.0;
+        assert!(matches!(
+            roundoff.validate(),
+            Err(ProtocolError::InvalidFastConsistency)
+        ));
+
+        roundoff = zero_roundoff();
+        roundoff.maximum_absolute_source = 2.0;
+        roundoff.maximum_absolute_intermediate = 1.0;
+        assert!(matches!(
+            roundoff.validate(),
+            Err(ProtocolError::InvalidFastConsistency)
+        ));
+    }
+
+    #[test]
     fn fast_certificate_requires_policy_three_zero_scales() {
         let mut consistency = FastConsistencyMetrics {
             norm_sumcheck: zero_metrics(FAST_POLICY_3_NORM_ZERO_SCALE),
             matvec_sumcheck: zero_metrics(FAST_POLICY_3_MATVEC_ZERO_SCALE),
             linear_opening: zero_metrics(FAST_POLICY_3_LINEAR_OPENING_ZERO_SCALE),
             unit_circle_folds: zero_metrics(FAST_POLICY_3_UNIT_CIRCLE_FOLD_ZERO_SCALE),
+            public_rhs_roundoff: zero_roundoff(),
+            public_matrix_roundoff: zero_roundoff(),
             recursive_query_trajectories: 1,
         };
         assert!(consistency.validate().is_ok());

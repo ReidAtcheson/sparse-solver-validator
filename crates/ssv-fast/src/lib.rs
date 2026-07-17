@@ -30,8 +30,10 @@ pub mod unit_circle;
 pub use backend::{
     FastBackend, FastCommitmentReport, FastDiagnosticLocation, FastDiagnosticObservation,
     FastError, FastPrecommitment, FastPreflight, FastProverContext, FastProverReport,
-    FastSourceDigests, FastVerifierDiagnostics, FastVerifierReport, FastVerifierWork,
+    FastPublicEvaluationDiagnostics, FastSourceDigests, FastVerifierDiagnostics,
+    FastVerifierReport, FastVerifierWork,
 };
+pub use ssv_problem::F64RoundoffDiagnostics;
 
 pub use float_contract::{
     FloatContractError, canonical_bits, canonicalize_source, decode_canonical_bits,
