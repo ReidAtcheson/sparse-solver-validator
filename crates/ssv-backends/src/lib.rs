@@ -13,7 +13,8 @@ use ssv_direct::{DirectBackend, DirectError, DirectProverReport, DirectVerifierR
 use ssv_exact::{ExactBackend, ExactError, ExactProverReport, ExactVerifierReport};
 use ssv_fast::{FastBackend, FastError, FastProverContext, FastProverReport, FastVerifierReport};
 use ssv_service_protocol::{
-    CertifiedScore, DefectMetrics, FastConsistencyMetrics, ProofProtocol, Unsigned192,
+    CertifiedScore, DefectMetrics, FastConsistencyMetrics, ProofProtocol,
+    PublicEvaluatorRoundoffMetrics, Unsigned192,
 };
 use ssv_solution::Solution;
 use ssv_validation::{
@@ -28,17 +29,18 @@ pub enum BackendProverReport {
     Fast(FastProverReport),
 }
 
+/// Report produced only after a backend's structural and cryptographic
+/// relations verify successfully.
+///
+/// The fast backend additionally records approximate algebraic discrepancies.
+/// Those values are diagnostics and do not turn this type into a residual-
+/// quality verdict.
 #[derive(Clone, Debug)]
 pub enum BackendVerifierReport {
     Direct(DirectVerifierReport),
     Exact(ExactVerifierReport),
     Fast(Box<FastVerifierReport>),
 }
-
-/// A structurally verified report that also passed its backend's fixed
-/// consistency policy. Residual quality remains an application decision.
-#[derive(Clone, Debug)]
-pub struct AcceptedBackendReport(BackendVerifierReport);
 
 #[derive(Debug, Error)]
 pub enum BackendError {
@@ -48,8 +50,6 @@ pub enum BackendError {
     Exact(#[from] ExactError),
     #[error("fast backend failed: {0}")]
     Fast(#[from] FastError),
-    #[error("fast proof exceeds frozen policy-2 consistency tolerances")]
-    FastConsistencyPolicy,
     #[error("exact residual numerator does not fit the certificate's unsigned-192 field")]
     ExactScoreOverflow,
 }
@@ -74,7 +74,7 @@ pub fn prove_single_stage(
                 <ExactBackend as ValidationBackend>::prove(statement, solution, &())?;
             Ok((payload, BackendProverReport::Exact(report)))
         }
-        ProofProtocol::FastBinary64UnitCircleV3 => {
+        ProofProtocol::FastBinary64UnitCircleV4 => {
             let (commitment, _) = FastBackend::commit(statement, solution)?;
             let context = FastProverContext::new(commitment);
             let (payload, report) =
@@ -93,7 +93,7 @@ pub fn verify(prelude: &ArtifactPrelude<'_>) -> Result<BackendVerifierReport, Ba
         ProofProtocol::WhirField192L2V4 => Ok(BackendVerifierReport::Exact(
             prelude.verify_with::<ExactBackend>()?,
         )),
-        ProofProtocol::FastBinary64UnitCircleV3 => Ok(BackendVerifierReport::Fast(Box::new(
+        ProofProtocol::FastBinary64UnitCircleV4 => Ok(BackendVerifierReport::Fast(Box::new(
             prelude.verify_with::<FastBackend>()?,
         ))),
     }
@@ -105,33 +105,18 @@ impl BackendVerifierReport {
         match self {
             Self::Direct(_) => ProofProtocol::DirectReferenceV1,
             Self::Exact(_) => ProofProtocol::WhirField192L2V4,
-            Self::Fast(_) => ProofProtocol::FastBinary64UnitCircleV3,
+            Self::Fast(_) => ProofProtocol::FastBinary64UnitCircleV4,
         }
     }
 
-    /// Applies protocol-fixed algebraic/metric consistency policy. This does
-    /// not compare the residual with a caller-selected quality threshold.
-    pub fn accept(self) -> Result<AcceptedBackendReport, BackendError> {
-        if matches!(&self, Self::Fast(report) if !report.passes_policy()) {
-            return Err(BackendError::FastConsistencyPolicy);
-        }
-        Ok(AcceptedBackendReport(self))
-    }
-}
-
-impl AcceptedBackendReport {
-    #[must_use]
-    pub const fn report(&self) -> &BackendVerifierReport {
-        &self.0
-    }
-
-    #[must_use]
-    pub const fn protocol(&self) -> ProofProtocol {
-        self.0.protocol()
-    }
-
+    /// Converts a verified backend report into its protocol-specific signed
+    /// certificate semantics.
+    ///
+    /// Fast binary64 relation errors are diagnostic provenance, not an
+    /// additional acceptance gate. Structural and cryptographic failures have
+    /// already returned an error from [`verify`].
     pub fn certified_score(&self) -> Result<CertifiedScore, BackendError> {
-        match &self.0 {
+        match self {
             BackendVerifierReport::Direct(report) => Ok(CertifiedScore::DirectBinary64ResidualV1 {
                 residual: report.residual,
             }),
@@ -148,17 +133,18 @@ impl AcceptedBackendReport {
                 })
             }
             BackendVerifierReport::Fast(report) => {
-                debug_assert!(report.passes_policy());
                 let score = &report.score;
-                Ok(CertifiedScore::FastBinary64SquaredL2V1 {
-                    squared_l2: score.residual_squared_l2,
-                    consistency: FastConsistencyMetrics {
+                Ok(CertifiedScore::FastBinary64DiagnosticsV1 {
+                    squared_l2_claim: score.squared_l2_claim,
+                    consistency: Box::new(FastConsistencyMetrics {
                         norm_sumcheck: defect_metrics(score.norm_sumcheck),
                         matvec_sumcheck: defect_metrics(score.matvec_sumcheck),
                         linear_opening: defect_metrics(score.linear_opening_sumcheck),
                         unit_circle_folds: defect_metrics(score.unit_circle_folds),
+                        public_rhs_roundoff: roundoff_metrics(report.public_evaluations.rhs),
+                        public_matrix_roundoff: roundoff_metrics(report.public_evaluations.matrix),
                         recursive_query_trajectories: score.proximity_queries_per_round,
-                    },
+                    }),
                 })
             }
         }
@@ -167,9 +153,22 @@ impl AcceptedBackendReport {
 
 fn defect_metrics(summary: ssv_fast::DefectSummary) -> DefectMetrics {
     DefectMetrics {
+        checks: summary.checks,
+        zero_scale: summary.zero_scale,
         maximum_absolute_defect: summary.max_absolute,
-        maximum_normalized_defect: summary.max_normalized,
-        rms_normalized_defect: summary.rms_normalized,
-        threshold_exceedances: summary.threshold_exceedances,
+        maximum_relative_error: summary.max_relative,
+        rms_relative_error: summary.rms_relative,
+        minimum_normalization_scale: summary.min_normalization_scale,
+        maximum_normalization_scale: summary.max_normalization_scale,
+    }
+}
+
+fn roundoff_metrics(
+    diagnostics: ssv_fast::F64RoundoffDiagnostics,
+) -> PublicEvaluatorRoundoffMetrics {
+    PublicEvaluatorRoundoffMetrics {
+        forward_absolute_error_bound: diagnostics.forward_absolute_error_bound,
+        maximum_absolute_source: diagnostics.maximum_absolute_source,
+        maximum_absolute_intermediate: diagnostics.maximum_absolute_intermediate,
     }
 }

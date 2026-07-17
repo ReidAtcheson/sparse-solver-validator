@@ -29,7 +29,7 @@ Three proof kinds are registered:
 | --- | --- | ---: | ---: |
 | `direct-reference-v1` | Independent binary64 relation computation | yes | yes |
 | `whir-field192-l2-v4` | Exact integer statement for Q63.64 `x` | no | no |
-| `fast-binary64-unit-circle-v3` | Provisional sampled metric consistency | no | no |
+| `fast-binary64-unit-circle-v4` | Provisional sampled metric diagnostics | no | no |
 
 The direct profile is not succinct. The exact and fast profiles receive a
 restricted verifier statement with the registered public-MLE evaluator but no
@@ -374,7 +374,7 @@ queries and materializes zero solution or residual elements.
 
 ### 9.1 Semantics and floating contract
 
-`fast-binary64-unit-circle-v3` is a provisional metric certificate. It applies
+`fast-binary64-unit-circle-v4` is a provisional metric certificate. It applies
 the exact path's one-time Q63.64 witness conversion, converts that witness back
 to binary64 deterministically, and computes `R = Ax-b` under a frozen binary64
 policy. Solver input rejects negative zero; internal source normalization maps
@@ -446,37 +446,74 @@ After precommitment binding, the transcript is fixed as follows:
 The third sumcheck is required. A Merkle root and sampled code proximity do not
 by themselves authenticate an arbitrary MLE endpoint supplied by the prover.
 
-### 9.5 Tolerance and score semantics
+### 9.5 Zero scales and diagnostic semantics
 
-Fast policy 2 freezes ordinary sumcheck and endpoint tolerance at:
+Fast policy 3 classifies every verifier relation as exact or approximate. Exact
+relations hard-fail verification. They include canonical framing and binary64
+encoding, statement and transcript binding, message schedules and shapes,
+Merkle authentication, and every other discrete structural condition.
+
+For an approximate scalar relation comparing `actual` with `expected`, the
+validator records:
 
 ```text
-absolute = 2^-42
-relative = 4096 * epsilon_binary64
+absolute_defect     = abs(actual - expected)
+normalization_scale = min(abs(actual), abs(expected))
+relative_error      = absolute_defect / max(normalization_scale, zero_scale)
 ```
 
-and unit-circle fold tolerance at:
+If the mathematical absolute defect is larger than finite binary64 can
+represent, the diagnostic magnitude saturates to `f64::MAX`. This preserves a
+traceable large discrepancy without turning diagnostic-only arithmetic into a
+verification failure. Conversely, finite subnormal defects are retained rather
+than applying the flush-to-zero rule used by arithmetic that feeds subsequent
+transcript challenges.
 
-```text
-absolute = 2^-38
-relative = 131072 * epsilon_binary64.
-```
+Each relation family has a separately transcript-bound zero scale with the
+appropriate units:
 
-It derives between 1 and 64 distinct recursive query trajectories. Each check
-reports a defect normalized by a validator-computed
-absolute-plus-scale-relative allowance.
-The scale includes operation inputs, not only a possibly tiny post-cancellation
-result. The score records count, threshold exceedances, maximum absolute defect,
-maximum normalized defect, and RMS normalized defect for:
+| Relation family | Zero scale |
+| --- | ---: |
+| residual-norm sumcheck | `2^-84` |
+| sparse matvec sumcheck | `2^-42` |
+| linear-opening sumcheck | `2^-42` |
+| unit-circle folds | `2^-38` |
+
+These are normalization floors, not acceptance tolerances and not claimed
+roundoff or soundness bounds. In particular, an approximate relation with
+relative error greater than one remains a structurally verified observation;
+applications may interpret the diagnostics but cannot convert them into a
+proven residual interval without an additional theorem.
+
+The score records check count, zero scale, maximum absolute defect, maximum and
+RMS relative error, and the minimum and maximum observed normalization scale
+for the four relation families below. RMS is accumulated with a scaled
+sum-of-squares algorithm so very large and very small finite errors are not
+lost to intermediate overflow or underflow.
 
 - residual-norm sumcheck;
 - sparse matvec sumcheck;
 - linear-opening sumcheck; and
 - unit-circle folds.
 
-Consistency passes only when every category has no exceedance and maximum
-normalized defect at most one. The residual magnitude remains separate caller
-policy.
+The in-process fast verifier additionally retains every observation with its
+relation location: sumcheck round or endpoint, and unit-circle query trajectory
+and fold round (plus each final-value check). It also retains the public RHS and
+matrix evaluator's forward-error bound, maximum source magnitude, and maximum
+intermediate magnitude. Signed certificates carry the corresponding family
+summaries and public-evaluator roundoff provenance after validating their
+policy-3 zero scales and finite nonnegative encoding.
+
+No approximate diagnostic causes protocol verification to accept or reject.
+The binary64 squared-L2 value is explicitly a claim, and residual-quality policy
+remains an application concern.
+
+As a calibration vector, consider a valid system whose RHS entries are
+`2^-42`, together with an all-zero committed solution and residual transcript.
+The first sparse-matvec relation compares zero with `2^-42`; it therefore has
+absolute defect `2^-42`, normalization scale zero, and relative error one. This
+is expected diagnostic output, not by itself a mandatory rejection. Invalid
+Merkle openings or transcript messages in the same artifact still hard-fail.
 
 For `q` distinct trajectories, the reported per-round conditional miss curve
 for a fixed bad fraction `phi` is `(1-phi)^q`. The implementation reports
@@ -486,13 +523,16 @@ no theorem justifying such multiplication.
 
 The fast verifier authenticates framing, commitments, openings, sampled folds,
 and public endpoints and returns zero row queries and zero materialized solution,
-residual, or codeword elements. Its unresolved global metric soundness statement
-is why this profile remains provisional and should be followed by the exact
-profile when exact assurance is required.
+residual, or codeword elements. A future a posteriori theorem could derive a
+bound `B(observations, public_bounds)` and failure probability `delta` relating
+the claimed metric to the committed oracle's true residual. Quantifying or
+claiming that theorem is explicitly out of scope for policy 3. This unresolved
+global statement is why the profile remains provisional and should be followed
+by the exact profile when exact assurance is required.
 
 ## 10. Signed certificate
 
-Certificate schema `sparse-solve/validation-certificate/v3` binds:
+Certificate schema `sparse-solve/validation-certificate/v4` binds:
 
 ```text
 issuer and key ID
@@ -509,7 +549,7 @@ validator-build identifier
 The Ed25519 signature message is:
 
 ```text
-bytes("sparse-solve/certificate-signature/ed25519/v3")
+bytes("sparse-solve/certificate-signature/ed25519/v4")
 || bytes(canonical_certificate_payload)
 ```
 
@@ -517,10 +557,11 @@ The score variants are deliberately different:
 
 - direct: binary64 squared L2, L2, RMS, and maximum absolute residual;
 - exact: unsigned residual numerator plus dyadic denominator power; and
-- fast: binary64 squared L2 plus four consistency summaries and the distinct
-  recursive-query-trajectory count.
+- fast: a binary64 squared-L2 claim, four diagnostic summaries, public RHS and
+  matrix evaluator roundoff provenance, and the distinct recursive-query-
+  trajectory count.
 
-A v3 certificate always carries the signed problem-challenge digest. Fast needs
+A v4 certificate always carries the signed problem-challenge digest. Fast needs
 no additional signed challenge field. A score/protocol mismatch is invalid. A
 relying party verifies the signature with an external trust anchor and pins
 whatever problem, manifest, proof, challenge, time, and quality policy its

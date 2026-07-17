@@ -1,5 +1,5 @@
 use ed25519_dalek::SigningKey;
-use ssv_backends::{BackendVerifierReport, prove_single_stage};
+use ssv_backends::{BackendProverReport, BackendVerifierReport, prove_single_stage};
 use ssv_canonical::Digest;
 use ssv_problem::ProblemTemplate;
 use ssv_service::{ServiceConfig, ServiceError, StatelessValidatorService};
@@ -239,7 +239,7 @@ fn hosted_fast_and_exact_followup_share_the_signed_problem_header() {
         .finalize_with_challenge_context(&problem_challenge.payload_canonical_bytes())
         .unwrap();
     let fast_manifest = ValidationManifest {
-        protocol: ProofProtocol::FastBinary64UnitCircleV3,
+        protocol: ProofProtocol::FastBinary64UnitCircleV4,
         max_solution_elements: 1_024,
         ..ValidationManifest::default()
     };
@@ -249,7 +249,12 @@ fn hosted_fast_and_exact_followup_share_the_signed_problem_header() {
         Some(problem_challenge.clone()),
     );
     let solution = Solution::new(vec![1.0; 16], 16).unwrap();
-    let fast_proof = single_stage_proof(&fast_statement, &solution);
+    let (fast_payload, fast_prover_report) =
+        prove_single_stage(&fast_statement, &solution).unwrap();
+    let BackendProverReport::Fast(fast_prover_report) = fast_prover_report else {
+        panic!("expected fast prover report");
+    };
+    let fast_proof = encode_artifact(&fast_statement, &fast_payload).unwrap();
     let fast_certificate = service
         .validate_and_certify(&fast_proof, 1_001, 1_002)
         .unwrap();
@@ -257,16 +262,68 @@ fn hosted_fast_and_exact_followup_share_the_signed_problem_header() {
         fast_certificate.certificate.payload.challenge_digest,
         expected_challenge_digest
     );
-    assert!(matches!(
-        fast_certificate.certificate.payload.score,
-        CertifiedScore::FastBinary64SquaredL2V1 { .. }
-    ));
+    let CertifiedScore::FastBinary64DiagnosticsV1 {
+        squared_l2_claim,
+        consistency,
+    } = &fast_certificate.certificate.payload.score
+    else {
+        panic!("expected fast diagnostic score");
+    };
+    assert_eq!(*squared_l2_claim, 0.0);
+    assert_eq!(consistency.norm_sumcheck.zero_scale, 2.0_f64.powi(-84));
+    assert_eq!(consistency.matvec_sumcheck.zero_scale, 2.0_f64.powi(-42));
+    assert_eq!(consistency.linear_opening.zero_scale, 2.0_f64.powi(-42));
+    assert_eq!(consistency.unit_circle_folds.zero_scale, 2.0_f64.powi(-38));
+    for metrics in [
+        consistency.norm_sumcheck,
+        consistency.matvec_sumcheck,
+        consistency.linear_opening,
+        consistency.unit_circle_folds,
+    ] {
+        assert!(metrics.checks > 0);
+        assert!(metrics.maximum_relative_error.is_finite());
+        assert!(metrics.rms_relative_error.is_finite());
+    }
+    let BackendVerifierReport::Fast(fast_report) = fast_certificate.output.backend_report() else {
+        panic!("expected fast verifier report");
+    };
+    for (certified, verified) in [
+        (
+            consistency.public_rhs_roundoff,
+            fast_report.public_evaluations.rhs,
+        ),
+        (
+            consistency.public_matrix_roundoff,
+            fast_report.public_evaluations.matrix,
+        ),
+    ] {
+        assert_eq!(
+            certified.forward_absolute_error_bound,
+            verified.forward_absolute_error_bound
+        );
+        assert_eq!(
+            certified.maximum_absolute_source,
+            verified.maximum_absolute_source
+        );
+        assert_eq!(
+            certified.maximum_absolute_intermediate,
+            verified.maximum_absolute_intermediate
+        );
+    }
     let certificate_json = serde_json::to_value(&fast_certificate.certificate).unwrap();
     let certificate_payload = certificate_json.get("payload").unwrap();
     assert_eq!(
         certificate_payload.get("schema").unwrap(),
-        "sparse-solve/validation-certificate/v3"
+        "sparse-solve/validation-certificate/v4"
     );
+
+    let root_offset = fast_proof
+        .windows(fast_prover_report.packed_codeword_root.len())
+        .position(|window| window == fast_prover_report.packed_codeword_root)
+        .expect("artifact contains its transcript-bound packed root");
+    let mut invalid_root = fast_proof.clone();
+    invalid_root[root_offset] ^= 1;
+    assert!(service.validate_submission(&invalid_root, 1_001).is_err());
 
     let exact_manifest = ValidationManifest {
         protocol: ProofProtocol::WhirField192L2V4,

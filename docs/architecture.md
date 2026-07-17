@@ -227,8 +227,8 @@ the relation after receiving all of `x`.
 | `ssv-field-sumcheck` | Reusable flat-table finite-field sumcheck with fixed coordinate and transcript conventions |
 | `ssv-whir-pcs` | Pinned Field192/WHIR commitment profile, opening composition, strict inner certificate framing, and work metrics |
 | `ssv-exact` | Q63.64/Field192 sparse-solve protocol composition and exact score report |
-| `ssv-fast` | Frozen binary64 contract, metric sumcheck, transcript, unit-circle code, Merkle multiproofs, tolerance scoring, and fast protocol composition |
-| `ssv-backends` | Exhaustive application dispatch across registered backends and conversion of accepted verifier reports into protocol-matched certificate scores |
+| `ssv-fast` | Frozen binary64 contract, metric sumcheck, transcript, unit-circle code, Merkle multiproofs, error-provenance diagnostics, and fast protocol composition |
+| `ssv-backends` | Exhaustive application dispatch across registered backends and conversion of structurally verified reports into protocol-matched certificate scores |
 | `ssv-service` | Transport-independent stateless issuance, provenance checks, backend dispatch, and certificate construction |
 
 The dependency direction is intentional:
@@ -280,7 +280,7 @@ no-wrap metadata without row scans. The result is an exact residual numerator an
 dyadic denominator for Q63.64 `x`; it is not a proof about unrounded solver
 arithmetic and it does not claim zero knowledge.
 
-### 6.3 `fast-binary64-unit-circle-v3`
+### 6.3 `fast-binary64-unit-circle-v4`
 
 The fast profile converts the same Q63.64 witness back to a frozen binary64
 representation and computes `R = Ax-b` under its binary64 contract. It packs
@@ -298,16 +298,21 @@ It composes:
    multiproofs.
 
 The verifier derives query indices after all roots are committed and uses the
-same generator-owned public evaluator for `A_tilde` and `b_tilde`. It reports
-scale-normalized numerical defects under a frozen tolerance policy and a
-conditional sampling curve.
+same generator-owned public evaluator for `A_tilde` and `b_tilde`. Exact
+relations such as framing, transcript replay, and Merkle authentication remain
+hard verification conditions. Approximate algebraic relations do not produce a
+protocol-level quality verdict: the verifier reports absolute defects and
+floor-relative errors under relation-specific, transcript-bound zero scales,
+along with public-evaluator roundoff provenance and a conditional sampling
+curve.
 
 This is a **provisional metric certificate**, not the exact profile with faster
 arithmetic. Structural framing, signatures, transcript binding, Merkle
-authentication, and public endpoint evaluation have ordinary discrete checks;
-the composition does not yet have one global theorem converting its local
-binary64 defect policy and sampled bad-fraction curves into a final numerical
-soundness bound. Passing consistency also says nothing about residual quality.
+authentication, and canonical public endpoint evaluation have ordinary
+discrete checks; the composition does not yet have one global theorem converting
+its observed binary64 defects and sampled bad-fraction curves into a final
+numerical soundness bound. The claimed residual and its diagnostics therefore
+do not establish residual quality by themselves.
 
 ## 7. Executable targets
 

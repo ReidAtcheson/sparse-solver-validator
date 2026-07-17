@@ -28,9 +28,12 @@ pub mod transcript;
 pub mod unit_circle;
 
 pub use backend::{
-    FastBackend, FastCommitmentReport, FastError, FastPrecommitment, FastPreflight,
-    FastProverContext, FastProverReport, FastSourceDigests, FastVerifierReport, FastVerifierWork,
+    FastBackend, FastCommitmentReport, FastDiagnosticLocation, FastDiagnosticObservation,
+    FastError, FastPrecommitment, FastPreflight, FastProverContext, FastProverReport,
+    FastPublicEvaluationDiagnostics, FastSourceDigests, FastVerifierDiagnostics,
+    FastVerifierReport, FastVerifierWork,
 };
+pub use ssv_problem::F64RoundoffDiagnostics;
 
 pub use float_contract::{
     FloatContractError, canonical_bits, canonicalize_source, decode_canonical_bits,
@@ -43,8 +46,8 @@ pub use merkle::{
     verify_complex_multiproof,
 };
 pub use score::{
-    DefectAccumulator, DefectSummary, FastValidationScore, MetricTolerance, POLICY_2, Policy2,
-    PolicyTranscriptParameters, conditional_miss_probabilities,
+    DefectAccumulator, DefectSummary, FastValidationScore, POLICY_3, Policy3,
+    PolicyTranscriptParameters, RelativeErrorObservation, conditional_miss_probabilities,
 };
 pub use sumcheck::{
     DefectObservation, ProductEndpoint, ProductEndpointClaim, ProductSumcheckProof,

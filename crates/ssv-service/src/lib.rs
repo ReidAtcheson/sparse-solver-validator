@@ -8,9 +8,7 @@
 #![forbid(unsafe_code)]
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use ssv_backends::{
-    AcceptedBackendReport, BackendError, BackendVerifierReport, verify as verify_backend,
-};
+use ssv_backends::{BackendError, BackendVerifierReport, verify as verify_backend};
 use ssv_canonical::Digest;
 use ssv_direct::maximum_backend_payload_bytes;
 use ssv_problem::{FinalizedRandomness, ProblemError, ProblemTemplate, TemplateRandomness};
@@ -44,7 +42,10 @@ pub struct StatelessValidatorService {
 #[derive(Clone, Debug)]
 pub struct ValidatedOutput {
     pub summary: ArtifactSummary,
-    pub report: AcceptedBackendReport,
+    /// Structurally and cryptographically verified backend output. Fast
+    /// binary64 discrepancies remain diagnostics rather than a service-level
+    /// quality decision.
+    pub report: BackendVerifierReport,
 }
 
 #[derive(Clone, Debug)]
@@ -261,7 +262,7 @@ impl StatelessValidatorService {
             .verify_challenge_context(&challenge.payload_canonical_bytes())
             .map_err(|_| ServiceError::ProblemProvenanceMismatch)?;
 
-        let report = verify_backend(&prelude)?.accept()?;
+        let report = verify_backend(&prelude)?;
         let output = ValidatedOutput {
             summary: prelude.summary(),
             report,
@@ -290,7 +291,7 @@ impl StatelessValidatorService {
             return Err(ServiceError::ChallengeExpiredDuringValidation);
         }
         let payload = CertificatePayload {
-            schema: CertificateSchema::V3,
+            schema: CertificateSchema::V4,
             issuer: self.config.issuer.clone(),
             key_id: self.config.key_id.clone(),
             issued_at_unix_seconds,
@@ -338,6 +339,6 @@ fn require_configured_lifetime(
 impl ValidatedOutput {
     #[must_use]
     pub const fn backend_report(&self) -> &BackendVerifierReport {
-        self.report.report()
+        &self.report
     }
 }

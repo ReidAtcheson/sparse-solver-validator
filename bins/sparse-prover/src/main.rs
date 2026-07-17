@@ -139,7 +139,7 @@ fn fast_commit(args: &CommonInputArgs, precommitment_path: &Path) -> Result<()> 
         .context("could not construct noninteractive fast precommitment")?;
     write_bytes(precommitment_path, &commitment.to_bytes())?;
 
-    println!("proof_kind=fast-binary64-unit-circle-v3");
+    println!("proof_kind=fast-binary64-unit-circle-v4");
     println!("challenge_mode=noninteractive-fiat-shamir");
     println!("precommitment_digest={}", report.precommitment_digest);
     println!(
@@ -172,10 +172,10 @@ fn fast_prove(args: &CommonInputArgs, precommitment_path: &Path, proof_path: &Pa
 }
 
 fn print_fast_prover_report(report: &FastProverReport) {
-    println!("proof_kind=fast-binary64-unit-circle-v3");
+    println!("proof_kind=fast-binary64-unit-circle-v4");
     println!("challenge_mode=noninteractive-fiat-shamir");
     println!("precommitment_digest={}", report.precommitment_digest);
-    println!("residual_squared_l2={:.17e}", report.residual_squared_l2);
+    println!("residual_squared_l2_claim={:.17e}", report.squared_l2_claim);
     println!(
         "recursive_query_trajectories={}",
         report.proximity_queries_per_round
@@ -218,8 +218,8 @@ fn load_inputs(args: &CommonInputArgs) -> Result<LoadedInputs> {
 }
 
 fn require_fast(statement: &PublicStatement) -> Result<()> {
-    if statement.manifest().protocol != ProofProtocol::FastBinary64UnitCircleV3 {
-        bail!("fast command requires a fast-binary64-unit-circle-v3 validation manifest");
+    if statement.manifest().protocol != ProofProtocol::FastBinary64UnitCircleV4 {
+        bail!("fast command requires a fast-binary64-unit-circle-v4 validation manifest");
     }
     Ok(())
 }

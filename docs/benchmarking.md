@@ -20,7 +20,7 @@ Measure the direct, exact, and fast profiles separately. A useful report answers
 5. At what problem size, if any, is the complete proof exchange smaller than
    transmitting binary64 `x`?
 6. Does an optimization improve the intended workload without changing protocol
-   bytes, acceptance, numerical policy, or memory elsewhere?
+   bytes, exact verification outcomes, numerical diagnostics, or memory elsewhere?
 
 A debug build, one timing, an internal allocation estimate, or a result copied
 from the research repository does not answer these questions.
@@ -200,8 +200,9 @@ no issuer interaction. Report:
   across rounds;
 - sumcheck rounds and scalar values;
 - opening paths and Merkle hashes;
-- four defect summaries and consistency-policy result;
-- residual squared L2; and
+- four floor-relative diagnostic summaries;
+- public RHS and matrix evaluator roundoff diagnostics;
+- residual squared-L2 claim; and
 - commit, prove, and verify time/RSS.
 
 The fast verifier regression conditions are:
@@ -234,14 +235,15 @@ from the noninteractive proof transcript.
 Every measured artifact must pass the independent validator. Additionally:
 
 - exact results match the proof-independent fixed relation exactly;
-- fast results pass structural verification and the frozen consistency policy;
+- fast results pass every exact structural and cryptographic verification check;
 - fast residual and defect data are retained even when comparing with exact;
 - the expected problem, manifest, proof, and challenge digests match;
 - strict EOF and mutation tests remain green; and
 - succinct-verifier no-scan/materialization counters remain zero.
 
-Discard and investigate a run that fails these gates. Do not average failed and
-accepted proofs together.
+Discard and investigate a run that fails these gates. Approximate diagnostics
+are measurements rather than correctness gates; retain and report them even
+when they are large rather than filtering benchmark samples by their values.
 
 ## 8. How to state results
 

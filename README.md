@@ -17,7 +17,7 @@ numerical audit.
 
 > `direct-reference-v1` is not succinct and does not hide `x`.
 > `whir-field192-l2-v4` proves an exact integer statement about once-quantized
-> Q63.64 `x`. `fast-binary64-unit-circle-v3` is an experimental metric
+> Q63.64 `x`. `fast-binary64-unit-circle-v4` is an experimental metric
 > certificate with no completed global numerical soundness theorem. None of the
 > profiles claims zero knowledge.
 
@@ -135,9 +135,13 @@ separate process-memory measurements. They use the same noninteractive
 Fiat--Shamir transcript and never contact an issuer; ordinary users should use
 the one-step `prove` command.
 
-The fast validator enforces the frozen consistency policy but does not apply a
-caller-selected residual-quality threshold. Its reported residual is a
-provisional binary64 metric, not the exact profile's dyadic result.
+The fast validator hard-fails malformed encodings, transcript mismatches,
+invalid Merkle openings, and other exact relations. Approximate binary64
+relations instead produce protocol-normalized error diagnostics; neither the
+protocol nor the validator applies a numerical-quality threshold. Its reported
+residual is a provisional binary64 claim, not the exact profile's dyadic result.
+Machine-readable output distinguishes structural verification from residual
+quality and retains public-evaluator roundoff provenance for later analysis.
 
 ## Local signed service workflow
 
