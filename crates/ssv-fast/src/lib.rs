@@ -43,8 +43,8 @@ pub use merkle::{
     verify_complex_multiproof,
 };
 pub use score::{
-    DefectAccumulator, DefectSummary, FastValidationScore, MetricTolerance, POLICY_2, Policy2,
-    PolicyTranscriptParameters, conditional_miss_probabilities,
+    DefectAccumulator, DefectSummary, FastValidationScore, POLICY_3, Policy3,
+    PolicyTranscriptParameters, RelativeErrorObservation, conditional_miss_probabilities,
 };
 pub use sumcheck::{
     DefectObservation, ProductEndpoint, ProductEndpointClaim, ProductSumcheckProof,

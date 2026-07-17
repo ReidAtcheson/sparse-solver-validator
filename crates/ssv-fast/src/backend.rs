@@ -47,20 +47,20 @@ use crate::transcript::{Transcript, TranscriptError};
 use crate::unit_circle::{ComplexValue, UnitCircleCodeword, UnitCircleError, fold_pair_at_index};
 
 const PRECOMMIT_MAGIC: &[u8; 8] = b"SSVFCM\0\0";
-const PRECOMMIT_VERSION: u16 = 4;
+const PRECOMMIT_VERSION: u16 = 5;
 const PAYLOAD_MAGIC: &[u8; 8] = b"SSVFST\0\0";
-const PAYLOAD_VERSION: u16 = 4;
-const PROOF_VERSION: u16 = 4;
+const PAYLOAD_VERSION: u16 = 5;
+const PROOF_VERSION: u16 = 5;
 const FINAL_FRAME: u16 = u16::MAX;
-const PRECOMMIT_DIGEST_DOMAIN: &[u8] = b"sparse-solve/fast-precommitment/v4";
-const PAYLOAD_DIGEST_DOMAIN: &[u8] = b"sparse-solve/fast-backend-payload/v4";
-const PROTOCOL_LABEL: &[u8] = b"sparse-solve/fast/coefficient-unit-circle-linear-opening/v4";
+const PRECOMMIT_DIGEST_DOMAIN: &[u8] = b"sparse-solve/fast-precommitment/v5";
+const PAYLOAD_DIGEST_DOMAIN: &[u8] = b"sparse-solve/fast-backend-payload/v5";
+const PROTOCOL_LABEL: &[u8] = b"sparse-solve/fast/coefficient-unit-circle-linear-opening/v5";
 const PUBLIC_EVALUATOR_ID: &[u8] = b"ssv-problem/succinct-public-evaluator/msb-mle/v1";
 const FLOAT_CONTRACT: &[u8] =
     b"binary64/rne/no-fma/reject-nan-inf-negzero-subnormal/unit-circle-coeff/v2";
 const CODE_BASIS: &[u8] =
     b"packed-[x||R]/msb-mle/bit-reversed-monomial-coefficients/unit-circle-rate-1/2";
-const ORACLE_TREE_LABEL: &[u8] = b"ssv-fast/v4/packed-unit-circle-oracle";
+const ORACLE_TREE_LABEL: &[u8] = b"ssv-fast/v5/packed-unit-circle-oracle";
 const MAX_PRECOMMITMENT_BYTES: usize = 4096;
 const MAX_PROOF_BYTES: usize = ssv_validation::MAX_SUCCINCT_PAYLOAD_BYTES;
 
@@ -203,7 +203,7 @@ impl FastPrecommitment {
         let mut output = Encoder::with_capacity(384);
         output.write_fixed_bytes(PRECOMMIT_MAGIC);
         output.write_u16(PRECOMMIT_VERSION);
-        output.write_u16(ProofProtocol::FastBinary64UnitCircleV3.wire_id());
+        output.write_u16(ProofProtocol::FastBinary64UnitCircleV4.wire_id());
         output.write_u16(policy.policy_id);
         output.write_u64(policy.numeric_absolute_bits);
         output.write_u64(policy.numeric_relative_bits);
@@ -241,7 +241,7 @@ impl FastPrecommitment {
         }
         if input.read_u16().map_err(framing)? != PRECOMMIT_VERSION
             || input.read_u16().map_err(framing)?
-                != ProofProtocol::FastBinary64UnitCircleV3.wire_id()
+                != ProofProtocol::FastBinary64UnitCircleV4.wire_id()
         {
             return Err(FastError::UnsupportedVersion);
         }
@@ -425,7 +425,7 @@ impl FastVerifierReport {
 
 #[derive(Debug, Error)]
 pub enum FastError {
-    #[error("fast backend requires fast-binary64-unit-circle-v3")]
+    #[error("fast backend requires fast-binary64-unit-circle-v4")]
     WrongProtocol,
     #[error("fast artifact has an unrecognized magic value")]
     BadMagic,
@@ -545,7 +545,7 @@ impl ValidationBackend for FastBackend {
     type VerifierReport = FastVerifierReport;
     type Error = FastError;
 
-    const PROTOCOL: ProofProtocol = ProofProtocol::FastBinary64UnitCircleV3;
+    const PROTOCOL: ProofProtocol = ProofProtocol::FastBinary64UnitCircleV4;
 
     fn prove(
         statement: &PublicStatement,
@@ -1019,7 +1019,7 @@ fn preflight_backend<'a>(
     statement: &VerifierStatement<'_>,
     payload_bytes: &'a [u8],
 ) -> Result<DecodedPreflight<'a>, FastError> {
-    if statement.protocol() != ProofProtocol::FastBinary64UnitCircleV3 {
+    if statement.protocol() != ProofProtocol::FastBinary64UnitCircleV4 {
         return Err(FastError::WrongProtocol);
     }
     if payload_bytes.len() > MAX_PROOF_BYTES {
@@ -1047,7 +1047,7 @@ fn preflight_backend<'a>(
 }
 
 fn validate_prover_statement(statement: &PublicStatement) -> Result<(), FastError> {
-    if statement.manifest().protocol != ProofProtocol::FastBinary64UnitCircleV3 {
+    if statement.manifest().protocol != ProofProtocol::FastBinary64UnitCircleV4 {
         return Err(FastError::WrongProtocol);
     }
     validate_length(statement.generated().dimension())
@@ -1840,7 +1840,7 @@ mod tests {
         let statement = PublicStatement::new(
             problem,
             ValidationManifest {
-                protocol: ProofProtocol::FastBinary64UnitCircleV3,
+                protocol: ProofProtocol::FastBinary64UnitCircleV4,
                 max_solution_elements: dimension as u64,
                 max_public_matrix_terms: 1024,
                 max_public_rhs_terms: 1024,

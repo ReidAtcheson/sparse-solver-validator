@@ -565,7 +565,7 @@ mod tests {
         for protocol in [
             ProofProtocol::DirectReferenceV1,
             ProofProtocol::WhirField192L2V4,
-            ProofProtocol::FastBinary64UnitCircleV3,
+            ProofProtocol::FastBinary64UnitCircleV4,
         ] {
             let statement = statement(protocol);
             let encoded = encode_artifact(&statement, &[1, 2, 3]).unwrap();

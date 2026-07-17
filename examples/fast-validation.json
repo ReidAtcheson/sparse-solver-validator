@@ -1,6 +1,6 @@
 {
   "schema": "sparse-solve/validation/v1",
-  "protocol": "fast-binary64-unit-circle-v3",
+  "protocol": "fast-binary64-unit-circle-v4",
   "max_solution_elements": 16777216,
   "max_public_matrix_terms": 4096,
   "max_public_rhs_terms": 4096

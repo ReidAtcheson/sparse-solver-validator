@@ -15,10 +15,10 @@ use ssv_canonical::{
 use thiserror::Error;
 
 const CHALLENGE_SIGNATURE_DOMAIN: &[u8] = b"sparse-solve/challenge-signature/ed25519/v1";
-const CERTIFICATE_SIGNATURE_DOMAIN: &[u8] = b"sparse-solve/certificate-signature/ed25519/v3";
+const CERTIFICATE_SIGNATURE_DOMAIN: &[u8] = b"sparse-solve/certificate-signature/ed25519/v4";
 const CHALLENGE_DIGEST_DOMAIN: &[u8] = b"sparse-solve/challenge/v1";
 const MANIFEST_DIGEST_DOMAIN: &[u8] = b"sparse-solve/validation-manifest/v1";
-const CERTIFICATE_DIGEST_DOMAIN: &[u8] = b"sparse-solve/certificate/v3";
+const CERTIFICATE_DIGEST_DOMAIN: &[u8] = b"sparse-solve/certificate/v4";
 
 pub const MAX_ID_BYTES: usize = 256;
 pub const MAX_CHALLENGE_BYTES: usize = 2 * 1024;
@@ -136,9 +136,9 @@ pub enum ProofProtocol {
     /// Exact Q63.64 relation with Field192 sumchecks and a pinned WHIR PCS.
     #[serde(rename = "whir-field192-l2-v4")]
     WhirField192L2V4,
-    /// Experimental binary64 metric certificate with unit-circle openings.
-    #[serde(rename = "fast-binary64-unit-circle-v3")]
-    FastBinary64UnitCircleV3,
+    /// Experimental binary64 diagnostics with unit-circle openings.
+    #[serde(rename = "fast-binary64-unit-circle-v4")]
+    FastBinary64UnitCircleV4,
 }
 
 impl ProofProtocol {
@@ -148,7 +148,7 @@ impl ProofProtocol {
         match self {
             Self::DirectReferenceV1 => 1,
             Self::WhirField192L2V4 => 2,
-            Self::FastBinary64UnitCircleV3 => 4,
+            Self::FastBinary64UnitCircleV4 => 5,
         }
     }
 
@@ -158,7 +158,7 @@ impl ProofProtocol {
         match value {
             1 => Some(Self::DirectReferenceV1),
             2 => Some(Self::WhirField192L2V4),
-            4 => Some(Self::FastBinary64UnitCircleV3),
+            5 => Some(Self::FastBinary64UnitCircleV4),
             _ => None,
         }
     }
@@ -260,17 +260,27 @@ impl<'de> Deserialize<'de> for Unsigned192 {
     }
 }
 
-/// One category of normalized binary64 consistency observations.
+/// One category of floor-relative binary64 consistency observations.
+///
+/// Each observation uses
+/// `abs(actual - expected) / max(min(abs(actual), abs(expected)), zero_scale)`.
+/// The normalization-scale extrema preserve the un-floored denominator
+/// provenance needed to interpret the aggregates. None of these fields is a
+/// protocol-level quality verdict.
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DefectMetrics {
+    pub checks: u64,
+    pub zero_scale: f64,
     pub maximum_absolute_defect: f64,
-    pub maximum_normalized_defect: f64,
-    pub rms_normalized_defect: f64,
-    pub threshold_exceedances: u64,
+    pub maximum_relative_error: f64,
+    pub rms_relative_error: f64,
+    pub minimum_normalization_scale: f64,
+    pub maximum_normalization_scale: f64,
 }
 
-/// Auditable summary of the provisional fast validator's four checks.
+/// Auditable diagnostic summary of the provisional fast validator's four
+/// approximate relation families.
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FastConsistencyMetrics {
@@ -281,7 +291,10 @@ pub struct FastConsistencyMetrics {
     pub recursive_query_trajectories: u32,
 }
 
-/// Protocol-specific score semantics carried by a signed certificate.
+/// Protocol-specific result semantics carried by a signed certificate.
+///
+/// The fast variant authenticates a prover claim and observed consistency
+/// diagnostics. It does not assert an a posteriori error bound for that claim.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum CertifiedScore {
@@ -292,17 +305,17 @@ pub enum CertifiedScore {
         numerator: Unsigned192,
         denominator_power: u32,
     },
-    #[serde(rename = "fast-binary64-squared-l2-v1")]
-    FastBinary64SquaredL2V1 {
-        squared_l2: f64,
-        consistency: FastConsistencyMetrics,
+    #[serde(rename = "fast-binary64-diagnostics-v1")]
+    FastBinary64DiagnosticsV1 {
+        squared_l2_claim: f64,
+        consistency: Box<FastConsistencyMetrics>,
     },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum CertificateSchema {
-    #[serde(rename = "sparse-solve/validation-certificate/v3")]
-    V3,
+    #[serde(rename = "sparse-solve/validation-certificate/v4")]
+    V4,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -352,11 +365,11 @@ pub enum ProtocolError {
     InvalidSolutionLimit,
     #[error("validation manifest allows an invalid public-evaluation term limit")]
     InvalidPublicEvaluationLimit,
-    #[error("certificate contains a non-finite or negative residual metric")]
+    #[error("certificate contains a non-finite or negative residual metric or claim")]
     InvalidResidual,
     #[error("certificate score semantics do not match its proof protocol")]
     ScoreProtocolMismatch,
-    #[error("certificate contains invalid or policy-failing fast consistency metrics")]
+    #[error("certificate contains invalid fast consistency diagnostics")]
     InvalidFastConsistency,
     #[error("certificate contains an invalid exact residual denominator")]
     InvalidExactDenominator,
@@ -599,15 +612,19 @@ impl CanonicalEncode for Unsigned192 {
 impl DefectMetrics {
     fn validate(&self) -> Result<(), ProtocolError> {
         let values = [
+            self.zero_scale,
             self.maximum_absolute_defect,
-            self.maximum_normalized_defect,
-            self.rms_normalized_defect,
+            self.maximum_relative_error,
+            self.rms_relative_error,
+            self.minimum_normalization_scale,
+            self.maximum_normalization_scale,
         ];
-        if values
-            .iter()
-            .any(|value| !value.is_finite() || value.is_sign_negative())
-            || self.maximum_normalized_defect > 1.0
-            || self.threshold_exceedances != 0
+        if self.checks == 0
+            || values
+                .iter()
+                .any(|value| !value.is_finite() || value.is_sign_negative())
+            || self.minimum_normalization_scale > self.maximum_normalization_scale
+            || self.rms_relative_error > self.maximum_relative_error
         {
             return Err(ProtocolError::InvalidFastConsistency);
         }
@@ -617,10 +634,13 @@ impl DefectMetrics {
 
 impl CanonicalEncode for DefectMetrics {
     fn encode(&self, output: &mut Encoder) {
+        output.write_u64(self.checks);
+        output.write_u64(self.zero_scale.to_bits());
         output.write_u64(self.maximum_absolute_defect.to_bits());
-        output.write_u64(self.maximum_normalized_defect.to_bits());
-        output.write_u64(self.rms_normalized_defect.to_bits());
-        output.write_u64(self.threshold_exceedances);
+        output.write_u64(self.maximum_relative_error.to_bits());
+        output.write_u64(self.rms_relative_error.to_bits());
+        output.write_u64(self.minimum_normalization_scale.to_bits());
+        output.write_u64(self.maximum_normalization_scale.to_bits());
     }
 }
 
@@ -668,13 +688,13 @@ impl CertifiedScore {
                 }
             }
             (
-                ProofProtocol::FastBinary64UnitCircleV3,
-                Self::FastBinary64SquaredL2V1 {
-                    squared_l2,
+                ProofProtocol::FastBinary64UnitCircleV4,
+                Self::FastBinary64DiagnosticsV1 {
+                    squared_l2_claim,
                     consistency,
                 },
             ) => {
-                if !squared_l2.is_finite() || squared_l2.is_sign_negative() {
+                if !squared_l2_claim.is_finite() || squared_l2_claim.is_sign_negative() {
                     return Err(ProtocolError::InvalidResidual);
                 }
                 consistency.validate()
@@ -699,12 +719,12 @@ impl CanonicalEncode for CertifiedScore {
                 numerator.encode(output);
                 output.write_u32(*denominator_power);
             }
-            Self::FastBinary64SquaredL2V1 {
-                squared_l2,
+            Self::FastBinary64DiagnosticsV1 {
+                squared_l2_claim,
                 consistency,
             } => {
                 output.write_u16(3);
-                output.write_u64(squared_l2.to_bits());
+                output.write_u64(squared_l2_claim.to_bits());
                 consistency.encode(output);
             }
         }
@@ -713,7 +733,7 @@ impl CanonicalEncode for CertifiedScore {
 
 impl CanonicalEncode for CertificatePayload {
     fn encode(&self, output: &mut Encoder) {
-        output.write_u16(3);
+        output.write_u16(4);
         output.write_str(&self.issuer);
         output.write_str(&self.key_id);
         output.write_i64(self.issued_at_unix_seconds);
@@ -835,13 +855,13 @@ mod tests {
     }
 
     #[test]
-    fn fast_v3_has_a_fresh_wire_id() {
-        assert_eq!(ProofProtocol::FastBinary64UnitCircleV3.wire_id(), 4);
+    fn fast_v4_has_a_fresh_wire_id() {
+        assert_eq!(ProofProtocol::FastBinary64UnitCircleV4.wire_id(), 5);
         assert_eq!(
-            ProofProtocol::from_wire_id(4),
-            Some(ProofProtocol::FastBinary64UnitCircleV3)
+            ProofProtocol::from_wire_id(5),
+            Some(ProofProtocol::FastBinary64UnitCircleV4)
         );
-        assert_eq!(ProofProtocol::from_wire_id(3), None);
+        assert_eq!(ProofProtocol::from_wire_id(4), None);
     }
 
     #[test]
@@ -888,7 +908,7 @@ mod tests {
     fn certificate_signatures_bind_metrics_and_provenance() {
         let key = signing_key();
         let payload = CertificatePayload {
-            schema: CertificateSchema::V3,
+            schema: CertificateSchema::V4,
             issuer: "test-issuer".to_owned(),
             key_id: "test-key".to_owned(),
             issued_at_unix_seconds: 1_500,
@@ -913,7 +933,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             &encode_to_vec(&certificate.payload)[..2],
-            &3_u16.to_be_bytes()
+            &4_u16.to_be_bytes()
         );
 
         let mut changed = certificate.clone();
@@ -946,14 +966,17 @@ mod tests {
     fn signed_fast_certificate_survives_json_round_trip() {
         let key = signing_key();
         let zero = DefectMetrics {
+            checks: 1,
+            zero_scale: 2.0_f64.powi(-42),
             maximum_absolute_defect: 0.0,
-            maximum_normalized_defect: 0.0,
-            rms_normalized_defect: 0.0,
-            threshold_exceedances: 0,
+            maximum_relative_error: 0.0,
+            rms_relative_error: 0.0,
+            minimum_normalization_scale: 0.0,
+            maximum_normalization_scale: 0.0,
         };
         let certificate = SignedCertificate::sign(
             CertificatePayload {
-                schema: CertificateSchema::V3,
+                schema: CertificateSchema::V4,
                 issuer: "test-issuer".to_owned(),
                 key_id: "test-key".to_owned(),
                 issued_at_unix_seconds: 1_500,
@@ -961,21 +984,24 @@ mod tests {
                 problem_digest: Digest::from_bytes([2; 32]),
                 validation_manifest_digest: Digest::from_bytes([3; 32]),
                 proof_digest: Digest::from_bytes([4; 32]),
-                protocol: ProofProtocol::FastBinary64UnitCircleV3,
-                score: CertifiedScore::FastBinary64SquaredL2V1 {
-                    squared_l2: 0.0,
-                    consistency: FastConsistencyMetrics {
+                protocol: ProofProtocol::FastBinary64UnitCircleV4,
+                score: CertifiedScore::FastBinary64DiagnosticsV1 {
+                    squared_l2_claim: 0.0,
+                    consistency: Box::new(FastConsistencyMetrics {
                         norm_sumcheck: zero,
                         matvec_sumcheck: DefectMetrics {
+                            checks: 4,
+                            zero_scale: 2.0_f64.powi(-42),
                             maximum_absolute_defect: 6.938_893_903_907_228e-18,
-                            maximum_normalized_defect: 2.104_791_105_834_217_8e-5,
-                            rms_normalized_defect: 9.914_397_065_476_954e-6,
-                            threshold_exceedances: 0,
+                            maximum_relative_error: 1.25,
+                            rms_relative_error: 0.75,
+                            minimum_normalization_scale: 0.0,
+                            maximum_normalization_scale: 4.0,
                         },
                         linear_opening: zero,
                         unit_circle_folds: zero,
                         recursive_query_trajectories: 32,
-                    },
+                    }),
                 },
                 validator_build: "test-build".to_owned(),
             },
@@ -983,7 +1009,19 @@ mod tests {
         )
         .unwrap();
 
-        let encoded = serde_json::to_vec(&certificate).unwrap();
+        let value = serde_json::to_value(&certificate).unwrap();
+        assert_eq!(
+            value["payload"]["schema"],
+            "sparse-solve/validation-certificate/v4"
+        );
+        assert_eq!(
+            value["payload"]["score"]["kind"],
+            "fast-binary64-diagnostics-v1"
+        );
+        assert_eq!(value["payload"]["score"]["squared_l2_claim"], 0.0);
+        assert!(value["payload"]["score"].get("squared_l2").is_none());
+
+        let encoded = serde_json::to_vec(&value).unwrap();
         let decoded: SignedCertificate = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(
             encode_to_vec(&decoded.payload),
@@ -995,12 +1033,15 @@ mod tests {
     }
 
     #[test]
-    fn fast_certificate_accepts_up_to_64_distinct_small_domain_queries() {
+    fn fast_certificate_records_up_to_64_distinct_small_domain_queries() {
         let zero = DefectMetrics {
+            checks: 1,
+            zero_scale: 2.0_f64.powi(-42),
             maximum_absolute_defect: 0.0,
-            maximum_normalized_defect: 0.0,
-            rms_normalized_defect: 0.0,
-            threshold_exceedances: 0,
+            maximum_relative_error: 0.0,
+            rms_relative_error: 0.0,
+            minimum_normalization_scale: 0.0,
+            maximum_normalization_scale: 0.0,
         };
         let mut consistency = FastConsistencyMetrics {
             norm_sumcheck: zero,
@@ -1020,6 +1061,26 @@ mod tests {
         consistency.recursive_query_trajectories = 65;
         assert!(matches!(
             consistency.validate(),
+            Err(ProtocolError::InvalidFastConsistency)
+        ));
+    }
+
+    #[test]
+    fn fast_certificate_does_not_turn_relative_error_into_a_quality_gate() {
+        let mut diagnostics = DefectMetrics {
+            checks: 2,
+            zero_scale: 2.0_f64.powi(-42),
+            maximum_absolute_defect: 1.0,
+            maximum_relative_error: 4.0,
+            rms_relative_error: 3.0,
+            minimum_normalization_scale: 0.0,
+            maximum_normalization_scale: 2.0,
+        };
+        assert!(diagnostics.validate().is_ok());
+
+        diagnostics.minimum_normalization_scale = 3.0;
+        assert!(matches!(
+            diagnostics.validate(),
             Err(ProtocolError::InvalidFastConsistency)
         ));
     }
