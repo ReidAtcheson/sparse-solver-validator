@@ -288,18 +288,146 @@ cryptographic attack requirement. It shows that a dimension-independent,
 useful `L2` bound cannot be derived from this single observation for arbitrary
 signed errors.
 
-Candidate remedies to evaluate are:
-
-1. several independent, well-conditioned Rademacher or Johnson--Lindenstrauss
-   sketches of `A X - b - R`;
-2. complex unit-circle challenges with an orthogonality/Parseval analysis;
-3. direct random row checks when the generator's row sparsity makes them
-   affordable; or
-4. an explicit incoherence or spectral-shape condition, if such a condition is
-   meaningful for the intended workloads.
-
+The leading replacement candidate is a challenge-driven, oversampled Hadamard
+sketch. Complex unit-circle sketches, direct random row checks, and an explicit
+incoherence or spectral-shape condition remain alternatives to evaluate.
 Repeating the current central MLE sample reduces a tail probability but does
 not remove its dimension-dependent conditioning.
+
+#### 6.2.1 Challenge-driven oversampled Hadamard sketches
+
+Let `N = 2^m` be the padded dimension and, for a challenged column index
+`a in {0,1}^m`, define the unnormalized Hadamard column
+
+```text
+h_a(i) = (-1)^<a,i>.
+```
+
+For the global consistency error
+
+```text
+D = A X - b - R,
+```
+
+one supervised observation is the ordinary linear sketch
+
+```text
+z_a = h_a^T D.
+```
+
+Uniform Hadamard columns satisfy
+
+```text
+E_a[h_a h_a^T] = I,
+E_a[abs(h_a^T D)^2] = norm(D)^2.
+```
+
+This is the useful linear-algebra interpretation missing from the current row
+MLE observation. The current equality-polynomial vector is a positive
+Kronecker-product averaging vector; `h_a` is a signed Kronecker-product vector
+from an orthogonal basis.
+
+The least disruptive protocol design changes only the row sketch. It retains
+the existing column MLE point `v`, committed-vector opening, and product
+sumcheck. The prover forms
+
+```text
+c = A^T h_a
+```
+
+and proves
+
+```text
+c^T X = h_a^T A X.
+```
+
+The terminal public/committed factors are then
+
+```text
+(h_a^T A w(v)) * (w(v)^T X),
+```
+
+where `w(v)_j = eq_j(v)`. The generator-owned public evaluator would need
+succinct, supervised operations for
+
+```text
+h_a^T b
+h_a^T A w(v).
+```
+
+For the registered periodic tridiagonal family, this appears compatible with
+work proportional to the generator period and `log N`: both `h_a` and `w(v)`
+are separable over index bits, while the existing public evaluator already
+handles the carry structure introduced by neighboring indices. This complexity
+claim must be demonstrated by a reference-equivalent implementation and
+measured; the protocol must not hide an `O(N)` public scan.
+
+A fully transformed alternative would use
+
+```text
+A_hat(a,b) = h_a^T A h_b
+X_hat(b)   = h_b^T X
+h_a^T A X  = (1 / N) * sum_b A_hat(a,b) X_hat(b).
+```
+
+That formulation exposes individual entries of `H^T A H`, but it also requires
+authenticated Hadamard-domain openings of `X` and a transformed-coordinate
+sumcheck. The hybrid `h_a^T A w(v)` endpoint is therefore the preferred first
+prototype.
+
+In the binary64 profile, one observation is not intended to carry the final
+confidence statement. After the packed oracle root and all data determining
+`D` are fixed, the supervisor repeatedly performs
+
+```text
+challenge a_1 -> verify sketch 1
+challenge a_2 -> verify sketch 2
+...
+challenge a_k -> verify sketch k.
+```
+
+Each sketch proof must receive its own fresh challenges in the sequential
+model of Section 6.5. The repetition count and confidence allocation must be
+fixed before observing the sketches, or be covered by an anytime-valid rule.
+Stopping after favorable observations and reporting a fixed-sample confidence
+level is invalid. Individual sketch observations and their deterministic
+binary64 error intervals must remain available to the bound calculator;
+oversampling reduces statistical uncertainty, not roundoff.
+
+Sampling columns from one fixed Hadamard basis has a serious worst-case
+limitation. Although the squared observation is unbiased, a nonzero `D` may be
+concentrated in one Hadamard mode. Sampling `k` distinct columns then misses it
+with probability `1 - k / N`. Consequently, a small number of plain Hadamard
+columns cannot give a useful distribution-free upper confidence bound.
+
+The primary design to analyze should therefore randomize the basis as well as
+the column. For example, let `S_t` be a fresh challenge-derived Rademacher
+diagonal and observe
+
+```text
+z_t = h_(a_t)^T S_t D.
+```
+
+For fixed `a_t`, the vector `S_t h_(a_t)` is a Rademacher sketch. An arbitrary
+independent sign diagonal, however, destroys the simple bit-separable public
+contraction: a short seed makes the signs reproducible but does not by itself
+make `h_(a_t)^T S_t A w(v)` succinctly evaluable. The design therefore needs a
+challenge-derived sign family with both a proved small-ball property and a
+generator-owned succinct contraction algorithm. The theorem must specify how
+the signs are generated, how much independence is required, and whether a
+short challenge seed is interpreted through a cryptographic random oracle or
+an explicit bounded-independence family. Independently randomized Hadamard
+bases with supervised contractions are another candidate. If no such family
+exists at useful cost, plain Hadamard oversampling can support only a theorem
+with an explicit spectral-spread assumption, not the desired
+distribution-free result.
+
+The residual-consistency theorem must derive a simultaneous upper bound on
+`norm(D)` from the interval-valued observations `{z_t}`. It must cover the
+chosen sketch's lower-tail or small-ball probability, the number of sequential
+samples, sampling with or without replacement, adaptive transcript messages,
+and deterministic errors in both public bilinear evaluation and authenticated
+linear openings. Merely citing the unbiased second moment is insufficient.
 
 ### 6.3 Robust numerical unit-circle proximity
 
@@ -418,7 +546,8 @@ The following are research candidates, not changes to policy 3:
    signing a theorem-specific per-round accumulator.
 2. Report deterministic roundoff envelopes for every verifier operation used
    by the theorem.
-3. Add independent, well-conditioned global residual-consistency sketches.
+3. Add sequential, independently challenged randomized-Hadamard
+   residual-consistency sketches, retaining each interval-valued observation.
 4. Split fold summaries by round and bind a useful oracle magnitude or energy
    cap.
 5. Make the randomness/attempt model machine-readable.
@@ -465,7 +594,15 @@ generic `passes=true` field.
 ### Phase 3: residual-consistency sketch design
 
 - Quantify the conditioning of the current MLE point on representative sizes.
-- Prototype Rademacher/JL, complex-unit-circle, and direct-row alternatives.
+- Implement a reference hybrid Hadamard/MLE check with public endpoint
+  `h_a^T A w(v)` and compare it with direct computation.
+- Measure plain-Hadamard oversampling, including errors concentrated in one or
+  a few Hadamard modes.
+- Prototype challenge-derived randomized-Hadamard sign families that offer
+  both a small-ball theorem and a succinct generator-owned public contraction.
+- Compare predetermined sequential sample counts and anytime-valid stopping
+  rules, retaining deterministic binary64 intervals for every observation.
+- Retain complex-unit-circle and direct-row sketches as comparative designs.
 - Compare verifier work, proof bytes, memory, and interval tightness.
 - Select a sketch only after the benchmark and theorem constants are known.
 
@@ -572,11 +709,14 @@ This proposal does not attempt to:
    authenticate?
 5. How many independent repetitions are needed before worst-case bounds become
    practically informative?
-6. Should services provide post-precommitment randomness, or is an explicit
+6. Which randomized-Hadamard sign family simultaneously gives useful
+   distribution-free small-ball bounds and succinct public evaluation for the
+   registered matrix generators?
+7. Should services provide post-precommitment randomness, or is an explicit
    attempt budget sufficient for the intended deployment?
-7. Should certificates carry per-round bound inputs, or rely on availability of
+8. Should certificates carry per-round bound inputs, or rely on availability of
    the certificate-bound proof digest and deterministic replay?
-8. Which confidence levels should be standardized for presentation without
+9. Which confidence levels should be standardized for presentation without
    implying an application policy?
 
 ## 13. Suggested research narrative
@@ -588,9 +728,11 @@ A concise paper or blog-post progression is:
 3. A deterministic decomposition converts committed-residual bounds into a
    final residual interval.
 4. The current central MLE challenge exposes a concrete conditioning barrier.
-5. Sampled fold checks need magnitude control in addition to bad-fraction
+5. Sequential randomized-Hadamard sketches separate statistically meaningful
+   residual sampling from the MLE machinery used for succinct openings.
+6. Sampled fold checks need magnitude control in addition to bad-fraction
    estimates.
-6. Better sketches, deterministic roundoff envelopes, and a fixed randomness
+7. Better sketches, deterministic roundoff envelopes, and a fixed randomness
    model turn provenance into an a posteriori certificate.
 
 The honest conclusion should distinguish feasibility from present readiness:
