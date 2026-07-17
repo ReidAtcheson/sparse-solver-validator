@@ -7,6 +7,11 @@
 
 use crate::sumcheck::DefectObservation;
 use crate::unit_circle::ComplexValue;
+use ssv_service_protocol::{
+    FAST_POLICY_3_ID, FAST_POLICY_3_LINEAR_OPENING_ZERO_SCALE, FAST_POLICY_3_MATVEC_ZERO_SCALE,
+    FAST_POLICY_3_NORM_ZERO_SCALE, FAST_POLICY_3_PROXIMITY_QUERY_TARGET,
+    FAST_POLICY_3_UNIT_CIRCLE_FOLD_ZERO_SCALE,
+};
 
 /// Frozen fast-validation diagnostic policy 3.
 ///
@@ -20,25 +25,25 @@ pub const POLICY_3: Policy3 = Policy3;
 
 impl Policy3 {
     /// Identifier absorbed by the enclosing transcript.
-    pub const ID: u16 = 3;
+    pub const ID: u16 = FAST_POLICY_3_ID;
 
     /// Normalization floor for squared-residual norm relations.
     ///
     /// This is `(2^-42)^2`, because these relations have squared-residual
     /// units. It is a reporting scale, not a theorem-derived error allowance.
-    pub const NORM_ZERO_SCALE: f64 = 5.169_878_828_456_423e-26; // 2^-84
+    pub const NORM_ZERO_SCALE: f64 = FAST_POLICY_3_NORM_ZERO_SCALE;
 
     /// Normalization floor for matrix-vector product relations.
-    pub const MATVEC_ZERO_SCALE: f64 = 2.273_736_754_432_320_6e-13; // 2^-42
+    pub const MATVEC_ZERO_SCALE: f64 = FAST_POLICY_3_MATVEC_ZERO_SCALE;
 
     /// Normalization floor for linear-opening relations.
-    pub const LINEAR_OPENING_ZERO_SCALE: f64 = 2.273_736_754_432_320_6e-13; // 2^-42
+    pub const LINEAR_OPENING_ZERO_SCALE: f64 = FAST_POLICY_3_LINEAR_OPENING_ZERO_SCALE;
 
     /// Normalization floor for recursive unit-circle fold relations.
-    pub const UNIT_CIRCLE_FOLD_ZERO_SCALE: f64 = 3.637_978_807_091_713e-12; // 2^-38
+    pub const UNIT_CIRCLE_FOLD_ZERO_SCALE: f64 = FAST_POLICY_3_UNIT_CIRCLE_FOLD_ZERO_SCALE;
 
     /// Maximum number of distinct recursive query trajectories.
-    pub const PROXIMITY_QUERY_TARGET: usize = 64;
+    pub const PROXIMITY_QUERY_TARGET: usize = FAST_POLICY_3_PROXIMITY_QUERY_TARGET as usize;
 
     /// Returns the exact transcript-binding tuple for this policy.
     #[must_use]

@@ -141,6 +141,19 @@ pub enum ProofProtocol {
     FastBinary64UnitCircleV4,
 }
 
+/// Immutable numerical parameters for fast diagnostic policy 3.
+///
+/// These values are protocol semantics rather than acceptance tolerances. The
+/// fast backend binds their exact binary64 encodings into its precommitment,
+/// and certificate validation uses the same constants when checking signed
+/// summaries.
+pub const FAST_POLICY_3_ID: u16 = 3;
+pub const FAST_POLICY_3_NORM_ZERO_SCALE: f64 = 5.169_878_828_456_423e-26; // 2^-84
+pub const FAST_POLICY_3_MATVEC_ZERO_SCALE: f64 = 2.273_736_754_432_320_6e-13; // 2^-42
+pub const FAST_POLICY_3_LINEAR_OPENING_ZERO_SCALE: f64 = 2.273_736_754_432_320_6e-13; // 2^-42
+pub const FAST_POLICY_3_UNIT_CIRCLE_FOLD_ZERO_SCALE: f64 = 3.637_978_807_091_713e-12; // 2^-38
+pub const FAST_POLICY_3_PROXIMITY_QUERY_TARGET: u32 = 64;
+
 impl ProofProtocol {
     /// Stable discriminator used by common proof containers and signatures.
     #[must_use]
@@ -650,9 +663,21 @@ impl FastConsistencyMetrics {
         self.matvec_sumcheck.validate()?;
         self.linear_opening.validate()?;
         self.unit_circle_folds.validate()?;
+        if self.norm_sumcheck.zero_scale.to_bits() != FAST_POLICY_3_NORM_ZERO_SCALE.to_bits()
+            || self.matvec_sumcheck.zero_scale.to_bits()
+                != FAST_POLICY_3_MATVEC_ZERO_SCALE.to_bits()
+            || self.linear_opening.zero_scale.to_bits()
+                != FAST_POLICY_3_LINEAR_OPENING_ZERO_SCALE.to_bits()
+            || self.unit_circle_folds.zero_scale.to_bits()
+                != FAST_POLICY_3_UNIT_CIRCLE_FOLD_ZERO_SCALE.to_bits()
+        {
+            return Err(ProtocolError::InvalidFastConsistency);
+        }
         // Query indices are distinct and transcript-derived. Small domains can
         // contain fewer than the policy target of 64 unique trajectories.
-        if self.recursive_query_trajectories == 0 || self.recursive_query_trajectories > 64 {
+        if self.recursive_query_trajectories == 0
+            || self.recursive_query_trajectories > FAST_POLICY_3_PROXIMITY_QUERY_TARGET
+        {
             return Err(ProtocolError::InvalidFastConsistency);
         }
         Ok(())
@@ -827,6 +852,18 @@ mod tests {
         SigningKey::from_bytes(&[7; 32])
     }
 
+    fn zero_metrics(zero_scale: f64) -> DefectMetrics {
+        DefectMetrics {
+            checks: 1,
+            zero_scale,
+            maximum_absolute_defect: 0.0,
+            maximum_relative_error: 0.0,
+            rms_relative_error: 0.0,
+            minimum_normalization_scale: 0.0,
+            maximum_normalization_scale: 0.0,
+        }
+    }
+
     fn payload() -> ChallengePayload {
         ChallengePayload {
             schema: ChallengeSchema::V1,
@@ -965,15 +1002,9 @@ mod tests {
     #[test]
     fn signed_fast_certificate_survives_json_round_trip() {
         let key = signing_key();
-        let zero = DefectMetrics {
-            checks: 1,
-            zero_scale: 2.0_f64.powi(-42),
-            maximum_absolute_defect: 0.0,
-            maximum_relative_error: 0.0,
-            rms_relative_error: 0.0,
-            minimum_normalization_scale: 0.0,
-            maximum_normalization_scale: 0.0,
-        };
+        let norm_zero = zero_metrics(FAST_POLICY_3_NORM_ZERO_SCALE);
+        let linear_zero = zero_metrics(FAST_POLICY_3_LINEAR_OPENING_ZERO_SCALE);
+        let fold_zero = zero_metrics(FAST_POLICY_3_UNIT_CIRCLE_FOLD_ZERO_SCALE);
         let certificate = SignedCertificate::sign(
             CertificatePayload {
                 schema: CertificateSchema::V4,
@@ -988,18 +1019,18 @@ mod tests {
                 score: CertifiedScore::FastBinary64DiagnosticsV1 {
                     squared_l2_claim: 0.0,
                     consistency: Box::new(FastConsistencyMetrics {
-                        norm_sumcheck: zero,
+                        norm_sumcheck: norm_zero,
                         matvec_sumcheck: DefectMetrics {
                             checks: 4,
-                            zero_scale: 2.0_f64.powi(-42),
+                            zero_scale: FAST_POLICY_3_MATVEC_ZERO_SCALE,
                             maximum_absolute_defect: 6.938_893_903_907_228e-18,
                             maximum_relative_error: 1.25,
                             rms_relative_error: 0.75,
                             minimum_normalization_scale: 0.0,
                             maximum_normalization_scale: 4.0,
                         },
-                        linear_opening: zero,
-                        unit_circle_folds: zero,
+                        linear_opening: linear_zero,
+                        unit_circle_folds: fold_zero,
                         recursive_query_trajectories: 32,
                     }),
                 },
@@ -1034,20 +1065,11 @@ mod tests {
 
     #[test]
     fn fast_certificate_records_up_to_64_distinct_small_domain_queries() {
-        let zero = DefectMetrics {
-            checks: 1,
-            zero_scale: 2.0_f64.powi(-42),
-            maximum_absolute_defect: 0.0,
-            maximum_relative_error: 0.0,
-            rms_relative_error: 0.0,
-            minimum_normalization_scale: 0.0,
-            maximum_normalization_scale: 0.0,
-        };
         let mut consistency = FastConsistencyMetrics {
-            norm_sumcheck: zero,
-            matvec_sumcheck: zero,
-            linear_opening: zero,
-            unit_circle_folds: zero,
+            norm_sumcheck: zero_metrics(FAST_POLICY_3_NORM_ZERO_SCALE),
+            matvec_sumcheck: zero_metrics(FAST_POLICY_3_MATVEC_ZERO_SCALE),
+            linear_opening: zero_metrics(FAST_POLICY_3_LINEAR_OPENING_ZERO_SCALE),
+            unit_circle_folds: zero_metrics(FAST_POLICY_3_UNIT_CIRCLE_FOLD_ZERO_SCALE),
             recursive_query_trajectories: 1,
         };
         assert!(consistency.validate().is_ok());
@@ -1069,7 +1091,7 @@ mod tests {
     fn fast_certificate_does_not_turn_relative_error_into_a_quality_gate() {
         let mut diagnostics = DefectMetrics {
             checks: 2,
-            zero_scale: 2.0_f64.powi(-42),
+            zero_scale: FAST_POLICY_3_MATVEC_ZERO_SCALE,
             maximum_absolute_defect: 1.0,
             maximum_relative_error: 4.0,
             rms_relative_error: 3.0,
@@ -1081,6 +1103,24 @@ mod tests {
         diagnostics.minimum_normalization_scale = 3.0;
         assert!(matches!(
             diagnostics.validate(),
+            Err(ProtocolError::InvalidFastConsistency)
+        ));
+    }
+
+    #[test]
+    fn fast_certificate_requires_policy_three_zero_scales() {
+        let mut consistency = FastConsistencyMetrics {
+            norm_sumcheck: zero_metrics(FAST_POLICY_3_NORM_ZERO_SCALE),
+            matvec_sumcheck: zero_metrics(FAST_POLICY_3_MATVEC_ZERO_SCALE),
+            linear_opening: zero_metrics(FAST_POLICY_3_LINEAR_OPENING_ZERO_SCALE),
+            unit_circle_folds: zero_metrics(FAST_POLICY_3_UNIT_CIRCLE_FOLD_ZERO_SCALE),
+            recursive_query_trajectories: 1,
+        };
+        assert!(consistency.validate().is_ok());
+
+        consistency.norm_sumcheck.zero_scale = FAST_POLICY_3_MATVEC_ZERO_SCALE;
+        assert!(matches!(
+            consistency.validate(),
             Err(ProtocolError::InvalidFastConsistency)
         ));
     }

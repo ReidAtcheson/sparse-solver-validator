@@ -228,7 +228,7 @@ the relation after receiving all of `x`.
 | `ssv-whir-pcs` | Pinned Field192/WHIR commitment profile, opening composition, strict inner certificate framing, and work metrics |
 | `ssv-exact` | Q63.64/Field192 sparse-solve protocol composition and exact score report |
 | `ssv-fast` | Frozen binary64 contract, metric sumcheck, transcript, unit-circle code, Merkle multiproofs, error-provenance diagnostics, and fast protocol composition |
-| `ssv-backends` | Exhaustive application dispatch across registered backends and conversion of accepted verifier reports into protocol-matched certificate scores |
+| `ssv-backends` | Exhaustive application dispatch across registered backends and conversion of structurally verified reports into protocol-matched certificate scores |
 | `ssv-service` | Transport-independent stateless issuance, provenance checks, backend dispatch, and certificate construction |
 
 The dependency direction is intentional:

@@ -487,6 +487,11 @@ for:
 - linear-opening sumcheck; and
 - unit-circle folds.
 
+The in-process fast verifier additionally retains every observation with its
+relation location: sumcheck round or endpoint, and unit-circle query trajectory
+and fold round (plus each final-value check). Signed certificates carry the
+corresponding family summaries after validating their policy-3 zero scales.
+
 No approximate diagnostic causes protocol verification to accept or reject.
 The binary64 squared-L2 value is explicitly a claim, and residual-quality policy
 remains an application concern.

@@ -28,9 +28,9 @@ pub mod transcript;
 pub mod unit_circle;
 
 pub use backend::{
-    FastBackend, FastCommitmentReport, FastError, FastPrecommitment, FastPreflight,
-    FastProverContext, FastProverReport, FastSourceDigests, FastVerifierDiagnostics,
-    FastVerifierReport, FastVerifierWork,
+    FastBackend, FastCommitmentReport, FastDiagnosticLocation, FastDiagnosticObservation,
+    FastError, FastPrecommitment, FastPreflight, FastProverContext, FastProverReport,
+    FastSourceDigests, FastVerifierDiagnostics, FastVerifierReport, FastVerifierWork,
 };
 
 pub use float_contract::{

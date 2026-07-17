@@ -403,13 +403,33 @@ pub struct FastVerifierWork {
     pub accounted_high_watermark_bytes: usize,
 }
 
+/// Stable location for one approximate relation observation.
+///
+/// The relation family is supplied by the owning field of
+/// [`FastVerifierDiagnostics`]. Sumcheck vectors contain one entry per round
+/// followed by an endpoint entry. Fold vectors identify both the transcript
+/// query trajectory and fold round, plus the two final-value checks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FastDiagnosticLocation {
+    SumcheckRound { round: u32 },
+    SumcheckEndpoint,
+    UnitCircleFold { query_index: u64, round: u32 },
+    UnitCircleFinalValue { value_index: u8 },
+}
+
 /// Per-check provenance for every approximate relation family.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FastDiagnosticObservation {
+    pub location: FastDiagnosticLocation,
+    pub observation: RelativeErrorObservation,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct FastVerifierDiagnostics {
-    pub norm_sumcheck: Vec<RelativeErrorObservation>,
-    pub matvec_sumcheck: Vec<RelativeErrorObservation>,
-    pub linear_opening_sumcheck: Vec<RelativeErrorObservation>,
-    pub unit_circle_folds: Vec<RelativeErrorObservation>,
+    pub norm_sumcheck: Vec<FastDiagnosticObservation>,
+    pub matvec_sumcheck: Vec<FastDiagnosticObservation>,
+    pub linear_opening_sumcheck: Vec<FastDiagnosticObservation>,
+    pub unit_circle_folds: Vec<FastDiagnosticObservation>,
 }
 
 /// Structurally and cryptographically authenticated diagnostic result.
@@ -444,7 +464,7 @@ pub enum FastError {
     EvaluatorMismatch,
     #[error("fast precommitment does not match the supplied solution")]
     PrecommitmentMismatch,
-    #[error("fast policy parameters differ from frozen policy 2")]
+    #[error("fast policy parameters differ from frozen policy 3")]
     PolicyMismatch,
     #[error("fast transcript shape is inconsistent with the public statement")]
     TranscriptShape,
@@ -838,14 +858,22 @@ fn verify_backend(
     )?;
     let mut norm_defects = DefectAccumulator::policy3_norm_sumcheck();
     let mut norm_observations = Vec::with_capacity(norm_verification.round_defects.len() + 1);
-    for &observation in &norm_verification.round_defects {
-        norm_observations.push(norm_defects.observe(observation));
+    for (round, &observation) in norm_verification.round_defects.iter().enumerate() {
+        norm_observations.push(FastDiagnosticObservation {
+            location: FastDiagnosticLocation::SumcheckRound {
+                round: u32::try_from(round).map_err(|_| FastError::ResourceLimit)?,
+            },
+            observation: norm_defects.observe(observation),
+        });
     }
-    norm_observations.push(norm_defects.observe(verify_product_endpoint(
-        &norm_verification.endpoint,
-        proof.residual_at_row_point,
-        proof.residual_at_row_point,
-    )?));
+    norm_observations.push(FastDiagnosticObservation {
+        location: FastDiagnosticLocation::SumcheckEndpoint,
+        observation: norm_defects.observe(verify_product_endpoint(
+            &norm_verification.endpoint,
+            proof.residual_at_row_point,
+            proof.residual_at_row_point,
+        )?),
+    });
     absorb_float(
         &mut transcript,
         b"residual-at-shared-row-point",
@@ -875,14 +903,22 @@ fn verify_backend(
     )?;
     let mut matvec_defects = DefectAccumulator::policy3_matvec_sumcheck();
     let mut matvec_observations = Vec::with_capacity(matvec_verification.round_defects.len() + 1);
-    for &observation in &matvec_verification.round_defects {
-        matvec_observations.push(matvec_defects.observe(observation));
+    for (round, &observation) in matvec_verification.round_defects.iter().enumerate() {
+        matvec_observations.push(FastDiagnosticObservation {
+            location: FastDiagnosticLocation::SumcheckRound {
+                round: u32::try_from(round).map_err(|_| FastError::ResourceLimit)?,
+            },
+            observation: matvec_defects.observe(observation),
+        });
     }
-    matvec_observations.push(matvec_defects.observe(verify_product_endpoint(
-        &matvec_verification.endpoint,
-        matrix.value,
-        proof.solution_at_column_point,
-    )?));
+    matvec_observations.push(FastDiagnosticObservation {
+        location: FastDiagnosticLocation::SumcheckEndpoint,
+        observation: matvec_defects.observe(verify_product_endpoint(
+            &matvec_verification.endpoint,
+            matrix.value,
+            proof.solution_at_column_point,
+        )?),
+    });
     absorb_float(
         &mut transcript,
         b"solution-at-column-point",
@@ -927,14 +963,22 @@ fn verify_backend(
     )?;
     let mut opening_defects = DefectAccumulator::policy3_linear_opening_sumcheck();
     let mut opening_observations = Vec::with_capacity(opening_verification.round_defects.len() + 1);
-    for &observation in &opening_verification.round_defects {
-        opening_observations.push(opening_defects.observe(observation));
+    for (round, &observation) in opening_verification.round_defects.iter().enumerate() {
+        opening_observations.push(FastDiagnosticObservation {
+            location: FastDiagnosticLocation::SumcheckRound {
+                round: u32::try_from(round).map_err(|_| FastError::ResourceLimit)?,
+            },
+            observation: opening_defects.observe(observation),
+        });
     }
-    opening_observations.push(opening_defects.observe(verify_product_endpoint(
-        &opening_verification.endpoint,
-        proof.opening_endpoint,
-        expected_weight_endpoint,
-    )?));
+    opening_observations.push(FastDiagnosticObservation {
+        location: FastDiagnosticLocation::SumcheckEndpoint,
+        observation: opening_defects.observe(verify_product_endpoint(
+            &opening_verification.endpoint,
+            proof.opening_endpoint,
+            expected_weight_endpoint,
+        )?),
+    });
     absorb_float(
         &mut transcript,
         b"linear-opening-source-endpoint",
@@ -1392,7 +1436,7 @@ fn verify_folding_opening(
 ) -> Result<
     (
         crate::score::DefectSummary,
-        Vec<RelativeErrorObservation>,
+        Vec<FastDiagnosticObservation>,
         u64,
         u64,
     ),
@@ -1446,6 +1490,7 @@ fn verify_folding_opening(
     let mut defects = DefectAccumulator::policy3_unit_circle_folds();
     let mut observations = Vec::new();
     for &base_index in &query_plan.indices {
+        let query_index = u64::try_from(base_index).map_err(|_| FastError::ResourceLimit)?;
         let mut index = base_index;
         let mut current_domain = initial_domain;
         for round in 0..challenges.len() {
@@ -1471,14 +1516,25 @@ fn verify_folding_opening(
                     low_index,
                 )?
             };
-            observations.push(defects.observe_unit_circle_fold(actual, expected));
+            observations.push(FastDiagnosticObservation {
+                location: FastDiagnosticLocation::UnitCircleFold {
+                    query_index,
+                    round: u32::try_from(round).map_err(|_| FastError::ResourceLimit)?,
+                },
+                observation: defects.observe_unit_circle_fold(actual, expected),
+            });
             index = low_index;
             current_domain = half;
         }
     }
     let claimed = ComplexValue::from_real(opening_endpoint)?;
-    for value in proof.final_values {
-        observations.push(defects.observe_unit_circle_fold(value, claimed));
+    for (value_index, &value) in proof.final_values.iter().enumerate() {
+        observations.push(FastDiagnosticObservation {
+            location: FastDiagnosticLocation::UnitCircleFinalValue {
+                value_index: u8::try_from(value_index).map_err(|_| FastError::ResourceLimit)?,
+            },
+            observation: defects.observe_unit_circle_fold(value, claimed),
+        });
     }
     Ok((defects.finish(), observations, merkle_hashes, opening_paths))
 }
@@ -1875,6 +1931,50 @@ mod tests {
         (payload, report)
     }
 
+    fn calibration_fixture() -> PublicStatement {
+        let problem = ProblemTemplate {
+            schema: TemplateSchema::V1,
+            randomness: TemplateRandomness::LiteralV1 {
+                seed: InstanceSeed::from_bytes([16; 32]),
+            },
+            matrix: MatrixSpec::SeededSymmetricTridiagonalV1 {
+                dimension: 16,
+                boundary: BoundaryRule::TruncateV1,
+                off_diagonal: OffDiagonalValues::SeededPeriodicNegativeDyadicV1 {
+                    period_bits: 0,
+                    fractional_bits: 52,
+                    minimum_magnitude_mantissa: 1,
+                    maximum_magnitude_mantissa: 1,
+                },
+                diagonal: DiagonalConstruction::AbsoluteRowSumPlusMarginV1 {
+                    margin_mantissa: 1024,
+                },
+            },
+            rhs: RhsSpec::ManufacturedOnesV1,
+            requested_outputs: vec![RequestedOutput::SquaredL2ResidualV1],
+        }
+        .finalize_literal()
+        .unwrap();
+        PublicStatement::new(
+            problem,
+            ValidationManifest {
+                protocol: ProofProtocol::FastBinary64UnitCircleV4,
+                max_solution_elements: 16,
+                max_public_matrix_terms: 1024,
+                max_public_rhs_terms: 1024,
+                ..ValidationManifest::default()
+            },
+            None,
+        )
+        .unwrap()
+    }
+
+    fn zero_sumcheck(rounds: usize) -> ProductSumcheckProof {
+        ProductSumcheckProof {
+            rounds: vec![QuadraticBernstein::new(0.0, 0.0, 0.0); rounds],
+        }
+    }
+
     #[test]
     fn noninteractive_query_only_backend_round_trips() {
         for dimension in [3, 5, 16] {
@@ -1896,6 +1996,54 @@ mod tests {
                 report.diagnostics.unit_circle_folds.len() as u64,
                 report.score.unit_circle_folds.checks
             );
+            assert!(matches!(
+                report
+                    .diagnostics
+                    .norm_sumcheck
+                    .last()
+                    .map(|observation| observation.location),
+                Some(FastDiagnosticLocation::SumcheckEndpoint)
+            ));
+            assert!(matches!(
+                report
+                    .diagnostics
+                    .matvec_sumcheck
+                    .last()
+                    .map(|observation| observation.location),
+                Some(FastDiagnosticLocation::SumcheckEndpoint)
+            ));
+            assert!(matches!(
+                report
+                    .diagnostics
+                    .linear_opening_sumcheck
+                    .last()
+                    .map(|observation| observation.location),
+                Some(FastDiagnosticLocation::SumcheckEndpoint)
+            ));
+            assert!(
+                report
+                    .diagnostics
+                    .unit_circle_folds
+                    .iter()
+                    .any(|observation| {
+                        matches!(
+                            observation.location,
+                            FastDiagnosticLocation::UnitCircleFold { round: 0, .. }
+                        )
+                    })
+            );
+            assert!(
+                report
+                    .diagnostics
+                    .unit_circle_folds
+                    .iter()
+                    .any(|observation| {
+                        matches!(
+                            observation.location,
+                            FastDiagnosticLocation::UnitCircleFinalValue { value_index: 1 }
+                        )
+                    })
+            );
             assert_eq!(report.work.generator_row_queries, 0);
             assert_eq!(report.work.solution_elements_materialized, 0);
             assert_eq!(report.work.residual_elements_materialized, 0);
@@ -1907,6 +2055,156 @@ mod tests {
                 (2 * dimension.next_power_of_two()).min(64) as u32
             );
         }
+    }
+
+    #[test]
+    fn all_zero_dimension_sixteen_artifact_is_accepted_and_reports_calibration() {
+        let statement = calibration_fixture();
+        let dimension = statement.generated().dimension();
+        let padded_len = dimension.next_power_of_two();
+        let variables = padded_len.ilog2() as usize;
+        let opening_variables = variables + 1;
+        // This is deliberately a verifier-side calibration artifact: its
+        // committed oracle and every prover message are zero, while the
+        // public RHS supplies the one nonzero matvec claim.
+        let packed = vec![0.0; 2 * padded_len];
+        let codeword = UnitCircleCodeword::encode(&packed).unwrap();
+        let root = complex_root(
+            &oracle_tree_label(0, codeword.evaluations().len()),
+            codeword.evaluations(),
+        )
+        .unwrap();
+        let material = PreparedMaterial {
+            logical_len: dimension,
+            padded_len,
+            solution: vec![0.0; dimension],
+            residual: vec![0.0; dimension],
+            packed,
+            codeword,
+            root,
+            sources: FastSourceDigests {
+                exact_witness: [0; 32],
+                binary64_solution: [0; 32],
+                binary64_residual: [0; 32],
+            },
+        };
+        let evaluator = EvaluatorBinding::from_metadata(
+            statement.generated().public_evaluation_plan().metadata(),
+        )
+        .unwrap();
+        let commitment = make_precommitment(
+            statement.transcript_digest(),
+            statement.problem_digest(),
+            statement.manifest_digest(),
+            evaluator,
+            &material,
+        )
+        .unwrap();
+
+        let norm_sumcheck = zero_sumcheck(variables);
+        let mut transcript = initialize_transcript(&commitment).unwrap();
+        absorb_float(&mut transcript, b"residual-squared-l2-claim", 0.0).unwrap();
+        let mut norm_point = Vec::with_capacity(variables);
+        for (round, polynomial) in norm_sumcheck.rounds.iter().enumerate() {
+            norm_point.push(sumcheck_challenge(
+                &mut transcript,
+                b"residual-norm",
+                round,
+                polynomial,
+            ));
+        }
+        absorb_float(&mut transcript, b"residual-at-shared-row-point", 0.0).unwrap();
+
+        let rhs = statement
+            .generated()
+            .public_evaluation_plan()
+            .evaluate_rhs_mle_f64(&norm_point)
+            .unwrap();
+        assert_eq!(rhs.value, 2.0_f64.powi(-42));
+        absorb_float(&mut transcript, b"matvec-initial-claim", rhs.value).unwrap();
+        let matvec_sumcheck = zero_sumcheck(variables);
+        for (round, polynomial) in matvec_sumcheck.rounds.iter().enumerate() {
+            sumcheck_challenge(&mut transcript, b"matvec-product", round, polynomial);
+        }
+        absorb_float(&mut transcript, b"solution-at-column-point", 0.0).unwrap();
+
+        transcript
+            .challenge_dyadic_f64(b"linear-opening-batching-challenge")
+            .unwrap();
+        absorb_float(&mut transcript, b"linear-opening-initial-claim", 0.0).unwrap();
+        let opening_sumcheck = zero_sumcheck(opening_variables);
+        let mut fold_codeword = material.codeword.clone();
+        let mut fold_roots = Vec::with_capacity(opening_variables);
+        let mut fold_challenges = Vec::with_capacity(opening_variables);
+        for (round, polynomial) in opening_sumcheck.rounds.iter().enumerate() {
+            let challenge = sumcheck_challenge(
+                &mut transcript,
+                b"linear-opening-product",
+                round,
+                polynomial,
+            );
+            fold_challenges.push(challenge);
+            fold_codeword = fold_codeword.fold(challenge).unwrap();
+            let root = complex_root(
+                &oracle_tree_label(round + 1, fold_codeword.evaluations().len()),
+                fold_codeword.evaluations(),
+            )
+            .unwrap();
+            transcript.absorb_root(b"linear-opening-fold-root", &root);
+            fold_roots.push(root);
+        }
+        absorb_float(&mut transcript, b"linear-opening-source-endpoint", 0.0).unwrap();
+        let query_plan = draw_query_plan(&mut transcript, material.codeword.message_len()).unwrap();
+        let folding = build_folding_opening(
+            material.codeword.clone(),
+            &fold_roots,
+            &fold_challenges,
+            &query_plan,
+        )
+        .unwrap();
+        let proof = FastProof {
+            logical_len: dimension,
+            residual_squared_l2: 0.0,
+            norm_sumcheck,
+            residual_at_row_point: 0.0,
+            matvec_sumcheck,
+            solution_at_column_point: 0.0,
+            opening_sumcheck,
+            opening_endpoint: 0.0,
+            folding,
+        };
+        let proof_bytes = encode_proof(&proof).unwrap();
+        let payload = encode_backend_payload(&commitment, &proof_bytes).unwrap();
+        let report = FastBackend::verify(&statement.verifier_statement(), &payload).unwrap();
+
+        assert_eq!(report.score.squared_l2_claim, 0.0);
+        assert_eq!(report.score.matvec_sumcheck.max_relative, 1.0);
+        assert_eq!(
+            report.score.matvec_sumcheck.rms_relative,
+            1.0 / (variables as f64 + 1.0).sqrt()
+        );
+        let calibration = report
+            .diagnostics
+            .matvec_sumcheck
+            .iter()
+            .find(|observation| observation.observation.relative_error == 1.0)
+            .expect("the all-zero matvec round must be reported");
+        assert_eq!(
+            calibration.location,
+            FastDiagnosticLocation::SumcheckRound { round: 0 }
+        );
+        assert_eq!(calibration.observation.actual_magnitude, 0.0);
+        assert_eq!(
+            calibration.observation.expected_magnitude,
+            2.0_f64.powi(-42)
+        );
+        assert_eq!(calibration.observation.absolute_defect, 2.0_f64.powi(-42));
+        assert_eq!(calibration.observation.normalization_scale, 0.0);
+        assert_eq!(calibration.observation.zero_scale, 2.0_f64.powi(-42));
+        assert_eq!(calibration.observation.relative_error, 1.0);
+        assert_eq!(report.score.norm_sumcheck.max_relative, 0.0);
+        assert_eq!(report.score.linear_opening_sumcheck.max_relative, 0.0);
+        assert_eq!(report.score.unit_circle_folds.max_relative, 0.0);
     }
 
     #[test]
