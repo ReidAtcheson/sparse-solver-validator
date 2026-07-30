@@ -14,8 +14,8 @@ use ssv_direct::maximum_backend_payload_bytes;
 use ssv_problem::{FinalizedRandomness, ProblemError, ProblemTemplate, TemplateRandomness};
 use ssv_service_protocol::{
     CertificatePayload, CertificateSchema, ChallengePayload, ChallengeSchema, MAX_CHALLENGE_BYTES,
-    MAX_ID_BYTES, MAX_SOLUTION_ELEMENTS_LIMIT, ProtocolError, RetryPolicy, SignedCertificate,
-    SignedChallenge,
+    MAX_SOLUTION_ELEMENTS_LIMIT, ProtocolError, RetryPolicy, SignedCertificate, SignedChallenge,
+    validate_identifier,
 };
 use ssv_validation::{
     ArtifactPrelude, ArtifactSummary, MAX_PUBLIC_STATEMENT_BYTES, MAX_SUCCINCT_ARTIFACT_BYTES,
@@ -130,23 +130,9 @@ impl StatelessValidatorService {
                 "maximum solution elements is outside backend bounds",
             ));
         }
-        // Exercise signed-payload validation for issuer/key bounds.
-        let probe = ChallengePayload {
-            schema: ChallengeSchema::V1,
-            issuer: config.issuer.clone(),
-            key_id: config.key_id.clone(),
-            issued_at_unix_seconds: 0,
-            expires_at_unix_seconds: 1,
-            entropy: Digest::from_bytes([0; 32]),
-            problem_template_digest: Digest::from_bytes([0; 32]),
-            retry_policy: RetryPolicy::ReplayAllowedV1,
-        };
-        probe.validate()?;
-        if config.validator_build.is_empty() || config.validator_build.len() > MAX_ID_BYTES {
-            return Err(ServiceError::InvalidConfiguration(
-                "validator build identifier must not be empty",
-            ));
-        }
+        validate_identifier("issuer", &config.issuer)?;
+        validate_identifier("key_id", &config.key_id)?;
+        validate_identifier("validator_build", &config.validator_build)?;
         Ok(Self {
             config,
             signing_key,

@@ -409,8 +409,8 @@ pub enum ProtocolError {
 
 impl ChallengePayload {
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        validate_id("issuer", &self.issuer)?;
-        validate_id("key_id", &self.key_id)?;
+        validate_identifier("issuer", &self.issuer)?;
+        validate_identifier("key_id", &self.key_id)?;
         if self.issued_at_unix_seconds < 0 || self.expires_at_unix_seconds < 0 {
             return Err(ProtocolError::NegativeTimestamp);
         }
@@ -864,9 +864,9 @@ impl SignedCertificate {
 
 impl CertificatePayload {
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        validate_id("issuer", &self.issuer)?;
-        validate_id("key_id", &self.key_id)?;
-        validate_id("validator_build", &self.validator_build)?;
+        validate_identifier("issuer", &self.issuer)?;
+        validate_identifier("key_id", &self.key_id)?;
+        validate_identifier("validator_build", &self.validator_build)?;
         if self.issued_at_unix_seconds < 0 {
             return Err(ProtocolError::NegativeTimestamp);
         }
@@ -881,7 +881,11 @@ fn signature_message(domain: &[u8], payload: &[u8]) -> Vec<u8> {
     output.into_bytes()
 }
 
-fn validate_id(field: &'static str, value: &str) -> Result<(), ProtocolError> {
+/// Validates the syntax shared by identifiers in signed protocol payloads.
+///
+/// Identifiers contain 1 through [`MAX_ID_BYTES`] visible ASCII bytes. Spaces,
+/// control bytes, and non-ASCII text are rejected.
+pub fn validate_identifier(field: &'static str, value: &str) -> Result<(), ProtocolError> {
     if value.is_empty()
         || value.len() > MAX_ID_BYTES
         || !value.bytes().all(|byte| (b'!'..=b'~').contains(&byte))
