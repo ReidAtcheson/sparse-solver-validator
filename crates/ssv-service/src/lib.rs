@@ -8,7 +8,9 @@
 #![forbid(unsafe_code)]
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use ssv_backends::{BackendError, BackendVerifierReport, verify as verify_backend};
+use ssv_backends::{
+    BackendError, BackendVerifierReport, verify_with_cancellation as verify_backend,
+};
 use ssv_canonical::Digest;
 use ssv_direct::maximum_backend_payload_bytes;
 use ssv_problem::{
@@ -24,6 +26,8 @@ use ssv_validation::{
     MAX_SUCCINCT_ARTIFACT_BYTES, MAX_SUCCINCT_PAYLOAD_BYTES, ValidationError,
 };
 use thiserror::Error;
+
+pub use ssv_validation::ValidationCancellation;
 
 #[derive(Clone, Debug)]
 pub struct ServiceConfig {
@@ -82,6 +86,8 @@ pub enum ServiceError {
     PublicEvaluationLimit,
     #[error("proof protocol {protocol:?} is not enabled by this service")]
     ProtocolNotAllowed { protocol: ProofProtocol },
+    #[error("validation was cancelled")]
+    ValidationCancelled,
     #[error("hosted validation requires a signed challenge; literal local mode is rejected")]
     SignedChallengeRequired,
     #[error("challenge lifetime differs from this service's configured policy")]
@@ -216,6 +222,25 @@ impl StatelessValidatorService {
         self.validate_owned_submission(proof_bytes, validation_started_at_unix_seconds)
     }
 
+    /// Validates a borrowed artifact while polling a shared cancellation
+    /// signal throughout common admission and backend verification.
+    pub fn validate_submission_with_cancellation(
+        &self,
+        proof_bytes: &[u8],
+        validation_started_at_unix_seconds: i64,
+        cancellation: &ValidationCancellation,
+    ) -> Result<ValidatedSubmission, ServiceError> {
+        self.validate_owned_submission_with_cancellation(
+            proof_bytes,
+            validation_started_at_unix_seconds,
+            cancellation,
+        )
+    }
+
+    /// Validates an owned artifact without a cancellation source.
+    ///
+    /// Ownership lets an HTTP adapter move its body directly onto a blocking
+    /// worker without first cloning it.
     pub fn validate_owned_submission<B>(
         &self,
         proof_bytes: B,
@@ -224,6 +249,28 @@ impl StatelessValidatorService {
     where
         B: AsRef<[u8]>,
     {
+        self.validate_owned_submission_with_cancellation(
+            proof_bytes,
+            validation_started_at_unix_seconds,
+            &ValidationCancellation::never(),
+        )
+    }
+
+    /// Validates an owned artifact with cooperative cancellation.
+    ///
+    /// Registered backends check the signal at bounded phase or loop
+    /// checkpoints. Cancellation is cooperative rather than a hard thread
+    /// interruption.
+    pub fn validate_owned_submission_with_cancellation<B>(
+        &self,
+        proof_bytes: B,
+        validation_started_at_unix_seconds: i64,
+        cancellation: &ValidationCancellation,
+    ) -> Result<ValidatedSubmission, ServiceError>
+    where
+        B: AsRef<[u8]>,
+    {
+        require_not_cancelled(cancellation)?;
         let element_limit = self.config.maximum_solution_elements;
         let direct_limit = maximum_backend_payload_bytes(
             usize::try_from(element_limit).map_err(|_| ServiceError::SolutionElementLimit)?,
@@ -246,6 +293,7 @@ impl StatelessValidatorService {
             }
             other => ServiceError::Artifact(other),
         })?;
+        require_not_cancelled(cancellation)?;
 
         let challenge = prelude
             .statement()
@@ -286,8 +334,11 @@ impl StatelessValidatorService {
             .problem()
             .verify_challenge_context(&challenge.payload_canonical_bytes())
             .map_err(|_| ServiceError::ProblemProvenanceMismatch)?;
+        require_not_cancelled(cancellation)?;
 
-        let report = verify_backend(&prelude)?;
+        let report = verify_backend(&prelude, cancellation);
+        require_not_cancelled(cancellation)?;
+        let report = report?;
         let output = ValidatedOutput {
             summary: prelude.summary(),
             report,
@@ -357,6 +408,13 @@ impl StatelessValidatorService {
         }
         Ok(())
     }
+}
+
+fn require_not_cancelled(cancellation: &ValidationCancellation) -> Result<(), ServiceError> {
+    if cancellation.is_cancelled() {
+        return Err(ServiceError::ValidationCancelled);
+    }
+    Ok(())
 }
 
 fn require_configured_lifetime(

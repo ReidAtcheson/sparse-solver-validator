@@ -409,10 +409,19 @@ verifier-work envelope.
 The Cloud Run request timeout defaults to 300 seconds and can be configured from
 1 to 3600 seconds. On expiry, Cloud Run closes the connection and returns 504;
 the container may continue processing the abandoned request. This server has a
-separate default handler deadline of 120 seconds. The example retains Cloud
-Run's 300-second timeout so the application deadline normally fires first. If
-either value changes, keep the platform timeout longer than the application
-deadline and test the largest supported proofs. See [Configure request
+separate default validation deadline of 120 seconds. It begins after Axum has
+admitted the bounded proof body and covers worker-capacity wait, verification,
+and certification; it is not an upload deadline. On expiry, the server signals
+cooperative cancellation, waits for the blocking worker to release its
+capacity, and then returns 408. Fixed-profile non-interruptible phases can make
+that response slightly later than the configured deadline.
+
+The example retains Cloud Run's 300-second timeout so the application deadline
+normally fires first and has time to finish cancellation cleanup. If either
+value changes, keep the platform timeout longer than the application deadline
+and test the largest supported proofs. During graceful shutdown, admitted
+validations finish or reach their application deadlines; forced revision
+termination stops their threads with the process. See [Configure request
 timeout](https://cloud.google.com/run/docs/configuring/request-timeout).
 
 ## 11. Migration notes for another GCP project or account

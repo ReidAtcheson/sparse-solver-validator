@@ -24,7 +24,9 @@ use ssv_problem::{
 use ssv_relation::{FixedWitness, RelationError};
 use ssv_service_protocol::ProofProtocol;
 use ssv_solution::Solution;
-use ssv_validation::{PrecommitBackend, PublicStatement, ValidationBackend, VerifierStatement};
+use ssv_validation::{
+    PrecommitBackend, PublicStatement, ValidationBackend, ValidationCancellation, VerifierStatement,
+};
 use thiserror::Error;
 
 use crate::float_contract::{
@@ -472,6 +474,8 @@ pub enum FastError {
     Framing(String),
     #[error("fast artifact exceeds a fixed resource bound")]
     ResourceLimit,
+    #[error("fast verification was cancelled")]
+    Cancelled,
     #[error("fast artifact is bound to a different public statement")]
     StatementMismatch,
     #[error("fast artifact is bound to a different registered public evaluator")]
@@ -574,6 +578,23 @@ impl FastBackend {
     ) -> Result<FastPreflight, FastError> {
         Ok(preflight_backend(statement, payload)?.report)
     }
+
+    /// Verifies without a cancellation source.
+    pub fn verify(
+        statement: &VerifierStatement<'_>,
+        payload: &[u8],
+    ) -> Result<FastVerifierReport, FastError> {
+        Self::verify_with_cancellation(statement, payload, &ValidationCancellation::never())
+    }
+
+    /// Verifies while polling a cooperative-cancellation signal.
+    pub fn verify_with_cancellation(
+        statement: &VerifierStatement<'_>,
+        payload: &[u8],
+        cancellation: &ValidationCancellation,
+    ) -> Result<FastVerifierReport, FastError> {
+        verify_backend(statement, payload, cancellation)
+    }
 }
 
 impl ValidationBackend for FastBackend {
@@ -595,8 +616,9 @@ impl ValidationBackend for FastBackend {
     fn verify(
         statement: &VerifierStatement<'_>,
         payload: &[u8],
+        cancellation: &ValidationCancellation,
     ) -> Result<Self::VerifierReport, Self::Error> {
-        verify_backend(statement, payload)
+        verify_backend(statement, payload, cancellation)
     }
 }
 
@@ -845,9 +867,13 @@ fn prove_backend(
 fn verify_backend(
     statement: &VerifierStatement<'_>,
     payload_bytes: &[u8],
+    cancellation: &ValidationCancellation,
 ) -> Result<FastVerifierReport, FastError> {
+    require_not_cancelled(cancellation)?;
     let preflight = preflight_backend(statement, payload_bytes)?;
+    require_not_cancelled(cancellation)?;
     let proof = decode_proof(preflight.proof_bytes, statement.dimension())?;
+    require_not_cancelled(cancellation)?;
     let commitment = preflight.commitment;
     let padded_len = commitment.evaluator.padded_dimension;
     let variables = commitment.evaluator.variables;
@@ -870,6 +896,7 @@ fn verify_backend(
             sumcheck_challenge(&mut transcript, b"residual-norm", round, polynomial)
         },
     )?;
+    require_not_cancelled(cancellation)?;
     let mut norm_defects = DefectAccumulator::policy3_norm_sumcheck();
     let mut norm_observations = Vec::with_capacity(norm_verification.round_defects.len() + 1);
     for (round, &observation) in norm_verification.round_defects.iter().enumerate() {
@@ -897,6 +924,7 @@ fn verify_backend(
     let rhs = statement
         .public_evaluator()
         .evaluate_rhs_mle_f64(&norm_verification.endpoint.point)?;
+    require_not_cancelled(cancellation)?;
     let matvec_initial_claim = canonical_protocol_float(rhs.value + proof.residual_at_row_point)?;
     absorb_float(
         &mut transcript,
@@ -911,10 +939,12 @@ fn verify_backend(
             sumcheck_challenge(&mut transcript, b"matvec-product", round, polynomial)
         },
     )?;
+    require_not_cancelled(cancellation)?;
     let matrix = statement.public_evaluator().evaluate_matrix_mle_f64(
         &norm_verification.endpoint.point,
         &matvec_verification.endpoint.point,
     )?;
+    require_not_cancelled(cancellation)?;
     let mut matvec_defects = DefectAccumulator::policy3_matvec_sumcheck();
     let mut matvec_observations = Vec::with_capacity(matvec_verification.round_defects.len() + 1);
     for (round, &observation) in matvec_verification.round_defects.iter().enumerate() {
@@ -969,6 +999,7 @@ fn verify_backend(
             challenge
         },
     )?;
+    require_not_cancelled(cancellation)?;
     let expected_weight_endpoint = combined_form_evaluation(
         &matvec_verification.endpoint.point,
         &norm_verification.endpoint.point,
@@ -1006,7 +1037,9 @@ fn verify_backend(
         &opening_verification.endpoint.point,
         proof.opening_endpoint,
         &query_plan,
+        cancellation,
     )?;
+    require_not_cancelled(cancellation)?;
 
     let norm_sumcheck = norm_defects.finish();
     let matvec_sumcheck = matvec_defects.finish();
@@ -1463,6 +1496,7 @@ fn verify_folding_opening(
     challenges: &[f64],
     opening_endpoint: f64,
     query_plan: &QueryPlan,
+    cancellation: &ValidationCancellation,
 ) -> Result<
     (
         crate::score::DefectSummary,
@@ -1492,6 +1526,7 @@ fn verify_folding_opening(
     let mut opening_paths = 0_u64;
     let mut round_indices = Vec::with_capacity(challenges.len());
     for round in 0..challenges.len() {
+        require_not_cancelled(cancellation)?;
         let expected_indices = selected_indices_for_round(query_plan, domain_len)?;
         let openings = &proof.round_openings[round];
         let root = if round == 0 {
@@ -1529,6 +1564,7 @@ fn verify_folding_opening(
         .try_reserve_exact(observation_count)
         .map_err(|_| FastError::ResourceLimit)?;
     for &base_index in &query_plan.indices {
+        require_not_cancelled(cancellation)?;
         let query_index = u64::try_from(base_index).map_err(|_| FastError::ResourceLimit)?;
         let mut index = base_index;
         let mut current_domain = initial_domain;
@@ -1577,6 +1613,13 @@ fn verify_folding_opening(
     }
     debug_assert_eq!(observations.len(), observation_count);
     Ok((defects.finish(), observations, merkle_hashes, opening_paths))
+}
+
+fn require_not_cancelled(cancellation: &ValidationCancellation) -> Result<(), FastError> {
+    if cancellation.is_cancelled() {
+        return Err(FastError::Cancelled);
+    }
+    Ok(())
 }
 
 fn selected_indices_for_round(
@@ -2339,6 +2382,16 @@ mod tests {
 
         let preflight = FastBackend::preflight(&statement.verifier_statement(), &payload).unwrap();
         assert_eq!(preflight.precommitment_digest, commitment.digest());
+        let cancellation = ValidationCancellation::new();
+        cancellation.cancel();
+        assert!(matches!(
+            FastBackend::verify_with_cancellation(
+                &statement.verifier_statement(),
+                &payload,
+                &cancellation
+            ),
+            Err(FastError::Cancelled)
+        ));
         FastBackend::verify(&statement.verifier_statement(), &payload).unwrap();
 
         let first_challenge = initialize_transcript(&commitment)

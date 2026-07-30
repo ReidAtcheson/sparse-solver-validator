@@ -313,9 +313,16 @@ work, and enable only the protocols the deployment intends to serve.
   checked independently on each request; they add no stored request state.
 - An exact proof under the same signed problem header is the required follow-up
   when exact field soundness is needed.
-- The built-in timeout, body limit, and validation concurrency cap are local
-  safety controls. Production authentication, quotas/rate limits, bounded edge
-  admission, and protected key management remain deployment responsibilities.
+- The proof-body limit and validation concurrency cap bound locally admitted
+  work. The application deadline starts after a bounded proof body reaches the
+  validation handler, covers worker-capacity wait and verification, and
+  cooperatively cancels verifier loops before returning `408`.
+- Cancellation is an in-memory signal owned by one request; it adds no durable
+  state. A graceful shutdown stops accepting new traffic and lets admitted
+  validations finish or reach their configured deadlines.
+- Production authentication, quotas/rate limits, bounded edge admission,
+  upload deadlines, and protected key management remain deployment
+  responsibilities.
 
 ## Development checks
 

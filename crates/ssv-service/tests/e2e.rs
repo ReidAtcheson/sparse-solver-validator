@@ -2,7 +2,7 @@ use ed25519_dalek::SigningKey;
 use ssv_backends::{BackendProverReport, BackendVerifierReport, prove_single_stage};
 use ssv_canonical::Digest;
 use ssv_problem::{ProblemTemplate, RhsSpec};
-use ssv_service::{ServiceConfig, ServiceError, StatelessValidatorService};
+use ssv_service::{ServiceConfig, ServiceError, StatelessValidatorService, ValidationCancellation};
 use ssv_service_protocol::{
     CertifiedScore, MAX_ID_BYTES, MAX_PUBLIC_EVALUATION_TERMS_LIMIT, ProofProtocol, ProtocolError,
     SignedChallenge, ValidationManifest,
@@ -152,6 +152,20 @@ fn service_rejects_invalid_deployment_policy() {
     assert!(matches!(
         StatelessValidatorService::new(config, SigningKey::from_bytes(&[7; 32])),
         Err(ServiceError::InvalidConfiguration(_))
+    ));
+}
+
+#[test]
+fn cancelled_validation_stops_before_artifact_parsing() {
+    let cancellation = ValidationCancellation::new();
+    cancellation.cancel();
+    assert!(matches!(
+        service().validate_submission_with_cancellation(
+            b"not a validation artifact",
+            1_001,
+            &cancellation
+        ),
+        Err(ServiceError::ValidationCancelled)
     ));
 }
 

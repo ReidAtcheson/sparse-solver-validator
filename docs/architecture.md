@@ -366,7 +366,9 @@ not add an issuer interaction.
   matrix rows.
 - Bounded readers validate lengths before allocation. The HTTP adapter
   authenticates public context before backend proof work and limits concurrent
-  blocking validation.
+  blocking validation. A blocking worker owns its capacity permit until it
+  exits; request deadlines and dropped request futures signal cooperative
+  cancellation rather than detaching verifier work.
 
 Performance reports in backend structs are diagnostic work accounting, not RSS
 measurements or hard memory bounds. Current-repository performance claims require
@@ -381,6 +383,10 @@ RNG access, key files, and socket binding remain adapter concerns. Development
 uses a file-backed Ed25519 key. Deployments must provide protected key material
 and configure request, concurrency, and platform time limits for their resource
 budget.
+
+The cancellation token is per-request, process-local control state. It is not
+challenge, proof, result, replay, or leaderboard state and therefore does not
+change the externally stateless service model.
 
 The service intentionally stores no challenge, proof, result, or
 leaderboard state. Signed objects authenticate their bytes and timestamps, but

@@ -40,6 +40,8 @@ pub enum SolutionError {
     Json(#[from] serde_json::Error),
     #[error("solution JSON exceeds its resource limit")]
     ResourceLimit,
+    #[error("solution validation was cancelled")]
+    Cancelled,
     #[error("unsupported solution schema")]
     UnsupportedSchema,
     #[error("solution has {actual} values but the problem requires {expected}")]
@@ -61,6 +63,17 @@ struct ParsedDocument {
 impl Solution {
     /// Validates values under the repository's strict binary64 source policy.
     pub fn new(values: Vec<f64>, expected_len: usize) -> Result<Self, SolutionError> {
+        Self::new_with_cancellation(values, expected_len, || false)
+    }
+
+    /// Validates values while polling a caller-owned cancellation signal.
+    ///
+    /// The signal is checked at least once per 4,096 values.
+    pub fn new_with_cancellation(
+        values: Vec<f64>,
+        expected_len: usize,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<Self, SolutionError> {
         if values.len() != expected_len {
             return Err(SolutionError::WrongLength {
                 expected: expected_len,
@@ -68,7 +81,13 @@ impl Solution {
             });
         }
         for (index, value) in values.iter().copied().enumerate() {
+            if index.is_multiple_of(RESERVE_CHUNK) && is_cancelled() {
+                return Err(SolutionError::Cancelled);
+            }
             validate_value(index, value)?;
+        }
+        if is_cancelled() {
+            return Err(SolutionError::Cancelled);
         }
         Ok(Self {
             values: values.into_boxed_slice(),
@@ -537,6 +556,20 @@ mod tests {
             Solution::from_json_reader(encoded.as_slice(), 3).unwrap(),
             solution
         );
+    }
+
+    #[test]
+    fn in_memory_validation_observes_cancellation() {
+        let checks = Cell::new(0);
+        let result = Solution::new_with_cancellation(
+            vec![1.0; RESERVE_CHUNK + 1],
+            RESERVE_CHUNK + 1,
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() == 2
+            },
+        );
+        assert!(matches!(result, Err(SolutionError::Cancelled)));
     }
 
     #[test]
