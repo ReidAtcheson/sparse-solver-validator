@@ -479,6 +479,21 @@ After precommitment binding, the transcript is fixed as follows:
 The third sumcheck is required. A Merkle root and sampled code proximity do not
 by themselves authenticate an arbitrary MLE endpoint supplied by the prover.
 
+The prover retains the geometrically shrinking codeword levels created by step
+4. Their combined evaluation count is less than twice the initial codeword.
+After the query locations are known, root-free scans of those levels construct
+only the unselected Merkle frontier subtrees needed by each multiproof; no level
+is folded again and no committed root is reconstructed. The linear-opening
+weights are filled directly into their final `2N` table.
+
+Before allocating these tables, the backend applies a checked peak-memory
+model. It accounts for `176N` bytes of simultaneously live size-dependent
+buffers plus two maximum-size proof encodings and rejects estimates above 1
+GiB. This is a conservative bound on backend-owned buffers; it excludes the
+caller-owned problem and solution and allocator metadata. Large codeword and
+table allocations remain fallible below that ceiling and report the backend
+resource-limit error on failure.
+
 ### 9.5 Zero scales and diagnostic semantics
 
 Fast policy 3 classifies every verifier relation as exact or approximate. Exact

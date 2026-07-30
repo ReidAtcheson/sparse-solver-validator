@@ -31,6 +31,7 @@ pub use backend::{
     FastBackend, FastCommitmentReport, FastDiagnosticLocation, FastDiagnosticObservation,
     FastError, FastPrecommitment, FastPreflight, FastProverContext, FastProverReport,
     FastPublicEvaluationDiagnostics, FastVerifierDiagnostics, FastVerifierReport, FastVerifierWork,
+    MAX_FAST_PROVER_ESTIMATED_BACKEND_PEAK_BYTES,
 };
 pub use ssv_problem::F64RoundoffDiagnostics;
 

@@ -15,6 +15,7 @@
 //! reuse the lower layers without cloning a whole validator.
 
 use std::collections::BTreeSet;
+use std::mem::size_of;
 
 use ssv_canonical::{DecodeLimits, Digest, Encoder, Reader, domain_separated_digest};
 use ssv_problem::{
@@ -33,9 +34,8 @@ use crate::float_contract::{
     decode_canonical_bits,
 };
 use crate::merkle::{
-    ComplexMultiProof, MerkleError, MerkleRoot, streaming_complex_root,
-    streaming_complex_root_and_multiproof_iter, streaming_complex_root_iter,
-    verify_complex_multiproof,
+    ComplexMultiProof, MerkleError, MerkleRoot, streaming_complex_multiproof_iter,
+    streaming_complex_root, streaming_complex_root_iter, verify_complex_multiproof,
 };
 use crate::score::{
     DefectAccumulator, FastValidationScore, POLICY_3, Policy3, RelativeErrorObservation,
@@ -64,6 +64,18 @@ const CODE_BASIS: &[u8] =
 const ORACLE_TREE_LABEL: &[u8] = b"ssv-fast/v6/packed-unit-circle-oracle";
 const MAX_PRECOMMITMENT_BYTES: usize = 4096;
 const MAX_PROOF_BYTES: usize = ssv_validation::MAX_SUCCINCT_PAYLOAD_BYTES;
+/// Maximum preflight estimate for backend-owned fast-prover memory.
+///
+/// The estimate excludes the caller-owned problem and solution and allocator
+/// metadata. Allocation failure below this deterministic ceiling is still
+/// reported as [`FastError::ResourceLimit`].
+pub const MAX_FAST_PROVER_ESTIMATED_BACKEND_PEAK_BYTES: usize = 1024 * 1024 * 1024;
+const FAST_PROVER_FIXED_PEAK_BYTES: usize = 2 * MAX_PROOF_BYTES;
+// At the opening-sumcheck peak the backend owns solution and residual tables
+// (2n f64), packed values and weights (4n f64), and less than 8n retained
+// complex evaluations across the geometric folding hierarchy.
+const FAST_PROVER_PEAK_BYTES_PER_PADDED_ELEMENT: usize =
+    6 * size_of::<f64>() + 8 * size_of::<ComplexValue>();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EvaluatorBinding {
@@ -338,6 +350,13 @@ pub struct FastCommitmentReport {
     pub material_preparations: u64,
     pub rows_scanned: u64,
     pub nonzeros_scanned: u64,
+    /// Conservative preflight estimate for backend-owned prover memory.
+    pub estimated_backend_peak_bytes: usize,
+    pub codeword_folds: u64,
+    /// Complete Merkle-root reductions, excluding root-free multiproof scans.
+    pub merkle_root_computations: u64,
+    /// Root-free scans that construct canonical multiproof frontiers.
+    pub merkle_multiproof_passes: u64,
 }
 
 /// Work and identity reported by one proof-producing operation.
@@ -357,6 +376,13 @@ pub struct FastProverReport {
     pub material_preparations: u64,
     pub rows_scanned: u64,
     pub nonzeros_scanned: u64,
+    /// Conservative preflight estimate for backend-owned prover memory.
+    pub estimated_backend_peak_bytes: usize,
+    pub codeword_folds: u64,
+    /// Complete Merkle-root reductions, excluding root-free multiproof scans.
+    pub merkle_root_computations: u64,
+    /// Root-free scans that construct canonical multiproof frontiers.
+    pub merkle_multiproof_passes: u64,
 }
 
 /// Cheap, bounded framing and statement-binding preflight for validators.
@@ -474,7 +500,7 @@ pub enum FastError {
     #[error("binary64 contract failed: {0}")]
     Float(#[from] FloatContractError),
     #[error("unit-circle encoding failed: {0}")]
-    UnitCircle(#[from] UnitCircleError),
+    UnitCircle(UnitCircleError),
     #[error("Merkle authentication failed: {0}")]
     Merkle(#[from] MerkleError),
     #[error("metric sumcheck failed structurally: {0}")]
@@ -491,6 +517,17 @@ pub enum FastError {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FastBackend;
 
+impl From<UnitCircleError> for FastError {
+    fn from(error: UnitCircleError) -> Self {
+        match error {
+            UnitCircleError::AllocationFailed | UnitCircleError::SizeOverflow => {
+                Self::ResourceLimit
+            }
+            error => Self::UnitCircle(error),
+        }
+    }
+}
+
 struct PreparedMaterial {
     logical_len: usize,
     padded_len: usize,
@@ -499,6 +536,7 @@ struct PreparedMaterial {
     packed: Vec<f64>,
     codeword: UnitCircleCodeword,
     root: MerkleRoot,
+    estimated_backend_peak_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -506,6 +544,9 @@ struct FastProverWork {
     material_preparations: u64,
     rows_scanned: u64,
     nonzeros_scanned: u64,
+    codeword_folds: u64,
+    merkle_root_computations: u64,
+    merkle_multiproof_passes: u64,
 }
 
 impl FastProverWork {
@@ -527,6 +568,30 @@ impl FastProverWork {
             .checked_add(
                 u64::try_from(problem.structural_nnz()).map_err(|_| FastError::ResourceLimit)?,
             )
+            .ok_or(FastError::ResourceLimit)?;
+        Ok(())
+    }
+
+    fn record_codeword_fold(&mut self) -> Result<(), FastError> {
+        self.codeword_folds = self
+            .codeword_folds
+            .checked_add(1)
+            .ok_or(FastError::ResourceLimit)?;
+        Ok(())
+    }
+
+    fn record_merkle_root_computation(&mut self) -> Result<(), FastError> {
+        self.merkle_root_computations = self
+            .merkle_root_computations
+            .checked_add(1)
+            .ok_or(FastError::ResourceLimit)?;
+        Ok(())
+    }
+
+    fn record_merkle_multiproof_pass(&mut self) -> Result<(), FastError> {
+        self.merkle_multiproof_passes = self
+            .merkle_multiproof_passes
+            .checked_add(1)
             .ok_or(FastError::ResourceLimit)?;
         Ok(())
     }
@@ -673,6 +738,10 @@ fn commit_backend(
         material_preparations: work.material_preparations,
         rows_scanned: work.rows_scanned,
         nonzeros_scanned: work.nonzeros_scanned,
+        estimated_backend_peak_bytes: material.estimated_backend_peak_bytes,
+        codeword_folds: work.codeword_folds,
+        merkle_root_computations: work.merkle_root_computations,
+        merkle_multiproof_passes: work.merkle_multiproof_passes,
     };
     Ok((commitment, report))
 }
@@ -712,7 +781,7 @@ fn prove_prepared(
 
     // The norm endpoint is reused as the row-compression point, authenticating
     // one residual MLE value for both application relations.
-    let padded_residual = pad_vector(&material.residual, material.padded_len);
+    let padded_residual = pad_vector(&material.residual, material.padded_len)?;
     let residual_squared_l2 =
         canonical_protocol_float(product_sum(&padded_residual, &padded_residual)?)?;
     absorb_float(
@@ -720,7 +789,7 @@ fn prove_prepared(
         b"residual-squared-l2-claim",
         residual_squared_l2,
     )?;
-    let residual_right = padded_residual.clone();
+    let residual_right = copy_f64_slice(&padded_residual)?;
     let (norm_sumcheck, norm_endpoint) = prove_product_owned(
         padded_residual,
         residual_right,
@@ -786,10 +855,26 @@ fn prove_prepared(
         batching_challenge,
     )?;
 
-    let mut fold_codeword = material.codeword.clone();
-    let opening_rounds = fold_codeword.message_len().ilog2() as usize;
-    let mut fold_roots = Vec::with_capacity(opening_rounds);
-    let mut fold_challenges = Vec::with_capacity(opening_rounds);
+    let codeword_message_len = material.codeword.message_len();
+    let codeword_len = material.codeword.evaluations().len();
+    let opening_rounds = codeword_message_len.ilog2() as usize;
+    let mut fold_levels = Vec::new();
+    fold_levels
+        .try_reserve_exact(
+            opening_rounds
+                .checked_add(1)
+                .ok_or(FastError::ResourceLimit)?,
+        )
+        .map_err(|_| FastError::ResourceLimit)?;
+    fold_levels.push(material.codeword);
+    let mut fold_roots = Vec::new();
+    fold_roots
+        .try_reserve_exact(opening_rounds)
+        .map_err(|_| FastError::ResourceLimit)?;
+    let mut fold_challenges = Vec::new();
+    fold_challenges
+        .try_reserve_exact(opening_rounds)
+        .map_err(|_| FastError::ResourceLimit)?;
     let mut fold_error = None;
     let (opening_sumcheck, opening_product_endpoint) = prove_product_owned(
         material.packed,
@@ -804,21 +889,25 @@ fn prove_prepared(
             );
             fold_challenges.push(challenge);
             if fold_error.is_none() {
-                match fold_codeword.fold(challenge).and_then(|next| {
+                let fold_result = (|| -> Result<_, FastError> {
+                    let current = fold_levels.last().ok_or(FastError::TranscriptShape)?;
+                    let next = current.fold(challenge)?;
+                    work.record_codeword_fold()?;
                     let label = oracle_tree_label(round + 1, next.evaluations().len());
-                    let root = complex_root(&label, next.evaluations())
-                        .map_err(|_| UnitCircleError::InvalidCodewordShape)?;
+                    let root = complex_root(&label, next.evaluations())?;
+                    work.record_merkle_root_computation()?;
                     Ok((next, root))
-                }) {
+                })();
+                match fold_result {
                     Ok((next, root)) => {
                         // The child root is fixed before the next polynomial
                         // and challenge enter the transcript.
                         transcript.absorb_root(b"linear-opening-fold-root", &root);
                         fold_roots.push(root);
-                        fold_codeword = next;
+                        fold_levels.push(next);
                     }
                     Err(error) => {
-                        fold_error = Some(FastError::UnitCircle(error));
+                        fold_error = Some(error);
                         let sentinel = [0_u8; 32];
                         transcript.absorb_root(b"linear-opening-fold-root", &sentinel);
                         fold_roots.push(sentinel);
@@ -841,18 +930,19 @@ fn prove_prepared(
         b"linear-opening-source-endpoint",
         opening_endpoint,
     )?;
-    if fold_codeword.message_len() != 1 || fold_codeword.evaluations().len() != 2 {
+    let final_codeword = fold_levels.last().ok_or(FastError::TranscriptShape)?;
+    if final_codeword.message_len() != 1 || final_codeword.evaluations().len() != 2 {
         return Err(FastError::TranscriptShape);
     }
 
     // Query locations are derived only after every recursive oracle is fixed.
-    let query_plan = draw_query_plan(&mut transcript, material.codeword.message_len())?;
-    let codeword_len = material.codeword.evaluations().len();
+    let query_plan = draw_query_plan(&mut transcript, codeword_message_len)?;
     let folding = build_folding_opening(
-        material.codeword,
+        fold_levels,
         &fold_roots,
         &fold_challenges,
         &query_plan,
+        &mut work,
     )?;
     let proof = FastProof {
         logical_len: material.logical_len,
@@ -882,6 +972,10 @@ fn prove_prepared(
         material_preparations: work.material_preparations,
         rows_scanned: work.rows_scanned,
         nonzeros_scanned: work.nonzeros_scanned,
+        estimated_backend_peak_bytes: material.estimated_backend_peak_bytes,
+        codeword_folds: work.codeword_folds,
+        merkle_root_computations: work.merkle_root_computations,
+        merkle_multiproof_passes: work.merkle_multiproof_passes,
     };
     Ok((payload, report))
 }
@@ -1196,6 +1290,32 @@ fn validate_length(logical_len: usize) -> Result<(), FastError> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FastProverMemoryEstimate {
+    padded_len: usize,
+    estimated_backend_peak_bytes: usize,
+}
+
+fn fast_prover_memory_preflight(logical_len: usize) -> Result<FastProverMemoryEstimate, FastError> {
+    validate_length(logical_len)?;
+    let padded_len = logical_len
+        .checked_next_power_of_two()
+        .ok_or(FastError::ResourceLimit)?;
+    let variable_bytes = padded_len
+        .checked_mul(FAST_PROVER_PEAK_BYTES_PER_PADDED_ELEMENT)
+        .ok_or(FastError::ResourceLimit)?;
+    let estimated_backend_peak_bytes = variable_bytes
+        .checked_add(FAST_PROVER_FIXED_PEAK_BYTES)
+        .ok_or(FastError::ResourceLimit)?;
+    if estimated_backend_peak_bytes > MAX_FAST_PROVER_ESTIMATED_BACKEND_PEAK_BYTES {
+        return Err(FastError::ResourceLimit);
+    }
+    Ok(FastProverMemoryEstimate {
+        padded_len,
+        estimated_backend_peak_bytes,
+    })
+}
+
 fn prepare_statement_material(
     statement: &PublicStatement,
     solution: &Solution,
@@ -1257,10 +1377,8 @@ fn prepare_material(
     work: &mut FastProverWork,
 ) -> Result<PreparedMaterial, FastError> {
     let logical_len = problem.dimension();
-    validate_length(logical_len)?;
-    let padded_len = logical_len
-        .checked_next_power_of_two()
-        .ok_or(FastError::ResourceLimit)?;
+    let memory = fast_prover_memory_preflight(logical_len)?;
+    let padded_len = memory.padded_len;
 
     if solution.as_slice().len() != logical_len {
         return Err(FastError::TranscriptShape);
@@ -1291,6 +1409,7 @@ fn prepare_material(
     }
     let label = oracle_tree_label(0, codeword.evaluations().len());
     let root = complex_root(&label, codeword.evaluations())?;
+    work.record_merkle_root_computation()?;
     work.record_material_preparation(problem)?;
     Ok(PreparedMaterial {
         logical_len,
@@ -1300,6 +1419,7 @@ fn prepare_material(
         packed,
         codeword,
         root,
+        estimated_backend_peak_bytes: memory.estimated_backend_peak_bytes,
     })
 }
 
@@ -1335,7 +1455,7 @@ fn prepare_matvec_tables(
         return Err(FastError::TranscriptShape);
     }
     let weights = equality_table(row_point)?;
-    let mut compressed_columns = vec![0.0; table_len];
+    let mut compressed_columns = zeroed_f64_vec(table_len)?;
     for (row, &weight) in weights.iter().take(problem.dimension()).enumerate() {
         for entry in problem.row(row).ok_or(FastError::TranscriptShape)? {
             let product = canonical_protocol_float(weight * entry.value.to_f64())?;
@@ -1346,7 +1466,7 @@ fn prepare_matvec_tables(
     work.record_sparse_scan(problem)?;
     Ok(MatVecTables {
         compressed_columns,
-        solution: pad_vector(solution, table_len),
+        solution: pad_vector(solution, table_len)?,
     })
 }
 
@@ -1379,12 +1499,13 @@ fn combined_opening_weights(
     {
         return Err(FastError::TranscriptShape);
     }
-    let solution = equality_table(solution_point)?;
-    let residual = equality_table(residual_point)?;
-    let mut weights = vec![0.0; 2 * padded_len];
-    weights[..padded_len].copy_from_slice(&solution);
-    for (output, value) in weights[padded_len..].iter_mut().zip(residual) {
-        *output = canonical_protocol_float(batching_challenge * value)?;
+    let output_len = padded_len.checked_mul(2).ok_or(FastError::ResourceLimit)?;
+    let mut weights = zeroed_f64_vec(output_len)?;
+    let (solution_weights, residual_weights) = weights.split_at_mut(padded_len);
+    fill_equality_table(solution_weights, solution_point)?;
+    fill_equality_table(residual_weights, residual_point)?;
+    for value in residual_weights {
+        *value = canonical_protocol_float(batching_challenge * *value)?;
     }
     Ok(weights)
 }
@@ -1424,23 +1545,57 @@ fn equality_table(point: &[f64]) -> Result<Vec<f64>, FastError> {
     let final_len = 1_usize
         .checked_shl(u32::try_from(point.len()).map_err(|_| FastError::ResourceLimit)?)
         .ok_or(FastError::ResourceLimit)?;
-    let mut table = vec![1.0];
-    for &coordinate in point {
-        let mut next = Vec::with_capacity(table.len() * 2);
-        for &weight in &table {
-            next.push(canonical_protocol_float(weight * (1.0 - coordinate))?);
-            next.push(canonical_protocol_float(weight * coordinate)?);
-        }
-        table = next;
-    }
-    debug_assert_eq!(table.len(), final_len);
+    let mut table = zeroed_f64_vec(final_len)?;
+    fill_equality_table(&mut table, point)?;
     Ok(table)
 }
 
-fn pad_vector(values: &[f64], len: usize) -> Vec<f64> {
-    let mut padded = vec![0.0; len];
+fn fill_equality_table(table: &mut [f64], point: &[f64]) -> Result<(), FastError> {
+    let final_len = 1_usize
+        .checked_shl(u32::try_from(point.len()).map_err(|_| FastError::ResourceLimit)?)
+        .ok_or(FastError::ResourceLimit)?;
+    if table.len() != final_len {
+        return Err(FastError::TranscriptShape);
+    }
+    table.fill(0.0);
+    table[0] = 1.0;
+    let mut active_len = 1_usize;
+    for &coordinate in point {
+        for index in (0..active_len).rev() {
+            let weight = table[index];
+            table[2 * index] = canonical_protocol_float(weight * (1.0 - coordinate))?;
+            table[2 * index + 1] = canonical_protocol_float(weight * coordinate)?;
+        }
+        active_len = active_len.checked_mul(2).ok_or(FastError::ResourceLimit)?;
+    }
+    debug_assert_eq!(active_len, final_len);
+    Ok(())
+}
+
+fn pad_vector(values: &[f64], len: usize) -> Result<Vec<f64>, FastError> {
+    if values.len() > len {
+        return Err(FastError::TranscriptShape);
+    }
+    let mut padded = zeroed_f64_vec(len)?;
     padded[..values.len()].copy_from_slice(values);
-    padded
+    Ok(padded)
+}
+
+fn zeroed_f64_vec(len: usize) -> Result<Vec<f64>, FastError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(len)
+        .map_err(|_| FastError::ResourceLimit)?;
+    values.resize(len, 0.0);
+    Ok(values)
+}
+
+fn copy_f64_slice(values: &[f64]) -> Result<Vec<f64>, FastError> {
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(values.len())
+        .map_err(|_| FastError::ResourceLimit)?;
+    copy.extend_from_slice(values);
+    Ok(copy)
 }
 
 fn canonical_protocol_float(value: f64) -> Result<f64, FastError> {
@@ -1484,26 +1639,33 @@ fn absorb_float(transcript: &mut Transcript, tag: &[u8], value: f64) -> Result<(
 }
 
 fn build_folding_opening(
-    initial: UnitCircleCodeword,
+    levels: Vec<UnitCircleCodeword>,
     roots: &[MerkleRoot],
     challenges: &[f64],
     query_plan: &QueryPlan,
+    work: &mut FastProverWork,
 ) -> Result<FoldingOpeningProof, FastError> {
-    if roots.len() != challenges.len() || roots.len() != initial.message_len().ilog2() as usize {
+    let initial = levels.first().ok_or(FastError::TranscriptShape)?;
+    if roots.len() != challenges.len()
+        || roots.len() != initial.message_len().ilog2() as usize
+        || levels.len() != roots.len().checked_add(1).ok_or(FastError::ResourceLimit)?
+    {
         return Err(FastError::TranscriptShape);
     }
-    let mut current = initial;
-    let mut round_openings = Vec::with_capacity(challenges.len());
-    for (round, &challenge) in challenges.iter().enumerate() {
-        let expected_root = if round == 0 {
-            let label = oracle_tree_label(0, current.evaluations().len());
-            complex_root(&label, current.evaluations())?
-        } else {
-            roots[round - 1]
-        };
+    let mut round_openings = Vec::new();
+    round_openings
+        .try_reserve_exact(challenges.len())
+        .map_err(|_| FastError::ResourceLimit)?;
+    for (round, current) in levels.iter().take(challenges.len()).enumerate() {
+        let child = &levels[round + 1];
+        if current.message_len().checked_div(2) != Some(child.message_len())
+            || current.evaluations().len().checked_div(2) != Some(child.evaluations().len())
+        {
+            return Err(FastError::TranscriptShape);
+        }
         let selected = selected_indices_for_round(query_plan, current.evaluations().len())?;
         let label = oracle_tree_label(round, current.evaluations().len());
-        let (actual_root, openings) = streaming_complex_root_and_multiproof_iter(
+        let openings = streaming_complex_multiproof_iter(
             &label,
             current
                 .evaluations()
@@ -1512,23 +1674,25 @@ fn build_folding_opening(
                 .map(ComplexValue::canonical_bits),
             &selected,
         )?;
-        if actual_root != expected_root {
-            return Err(FastError::TranscriptShape);
-        }
+        work.record_merkle_multiproof_pass()?;
         round_openings.push(openings);
-        current = current.fold(challenge)?;
-        let child_label = oracle_tree_label(round + 1, current.evaluations().len());
-        if complex_root(&child_label, current.evaluations())? != roots[round] {
-            return Err(FastError::TranscriptShape);
-        }
     }
-    if current.evaluations().len() != 2 {
+    let final_codeword = levels.last().ok_or(FastError::TranscriptShape)?;
+    if final_codeword.evaluations().len() != 2 {
         return Err(FastError::TranscriptShape);
     }
+    let mut proof_roots = Vec::new();
+    proof_roots
+        .try_reserve_exact(roots.len())
+        .map_err(|_| FastError::ResourceLimit)?;
+    proof_roots.extend_from_slice(roots);
     Ok(FoldingOpeningProof {
-        roots: roots.to_vec(),
+        roots: proof_roots,
         round_openings,
-        final_values: [current.evaluations()[0], current.evaluations()[1]],
+        final_values: [
+            final_codeword.evaluations()[0],
+            final_codeword.evaluations()[1],
+        ],
     })
 }
 
@@ -2047,6 +2211,92 @@ mod tests {
         (statement, solution)
     }
 
+    fn reference_equality_table(point: &[f64]) -> Vec<f64> {
+        let mut table = vec![1.0];
+        for &coordinate in point {
+            let mut next = Vec::with_capacity(table.len() * 2);
+            for &weight in &table {
+                next.push(canonical_protocol_float(weight * (1.0 - coordinate)).unwrap());
+                next.push(canonical_protocol_float(weight * coordinate).unwrap());
+            }
+            table = next;
+        }
+        table
+    }
+
+    #[test]
+    fn in_place_equality_tables_preserve_the_reference_bits() {
+        let points = [
+            vec![],
+            vec![0.0],
+            vec![1.0],
+            vec![0.25, 0.75],
+            vec![0.125, 0.5, 0.875],
+        ];
+        for point in &points {
+            let expected = reference_equality_table(point);
+            let actual = equality_table(point).unwrap();
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let solution_point = [0.25, 0.75, 0.5];
+        let residual_point = [0.875, 0.125, 1.0];
+        let batching_challenge = 0.375;
+        let mut expected = reference_equality_table(&solution_point);
+        expected.extend(
+            reference_equality_table(&residual_point)
+                .into_iter()
+                .map(|value| canonical_protocol_float(batching_challenge * value).unwrap()),
+        );
+        let actual = combined_opening_weights(
+            expected.len() / 2,
+            &solution_point,
+            &residual_point,
+            batching_challenge,
+        )
+        .unwrap();
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn prover_memory_preflight_has_a_checked_power_of_two_boundary() {
+        let accepted = fast_prover_memory_preflight(1 << 22).unwrap();
+        assert_eq!(accepted.padded_len, 1 << 22);
+        assert_eq!(
+            accepted.estimated_backend_peak_bytes,
+            FAST_PROVER_FIXED_PEAK_BYTES + (1 << 22) * FAST_PROVER_PEAK_BYTES_PER_PADDED_ELEMENT
+        );
+        assert!(
+            accepted.estimated_backend_peak_bytes <= MAX_FAST_PROVER_ESTIMATED_BACKEND_PEAK_BYTES
+        );
+        assert!(matches!(
+            fast_prover_memory_preflight(1 << 23),
+            Err(FastError::ResourceLimit)
+        ));
+        assert!(matches!(
+            FastError::from(UnitCircleError::AllocationFailed),
+            FastError::ResourceLimit
+        ));
+    }
+
     fn round_trip(dimension: usize) -> (Vec<u8>, FastVerifierReport) {
         let (statement, solution) = fixture(dimension, 2);
         let (commitment, _) = FastBackend::commit(&statement, &solution).unwrap();
@@ -2223,6 +2473,9 @@ mod tests {
             packed,
             codeword,
             root,
+            estimated_backend_peak_bytes: fast_prover_memory_preflight(dimension)
+                .unwrap()
+                .estimated_backend_peak_bytes,
         };
         let evaluator = EvaluatorBinding::from_metadata(
             statement.generated().public_evaluation_plan().metadata(),
@@ -2280,7 +2533,7 @@ mod tests {
             .unwrap();
         absorb_float(&mut transcript, b"linear-opening-initial-claim", 0.0).unwrap();
         let opening_sumcheck = zero_sumcheck(opening_variables);
-        let mut fold_codeword = material.codeword.clone();
+        let mut fold_levels = vec![material.codeword.clone()];
         let mut fold_roots = Vec::with_capacity(opening_variables);
         let mut fold_challenges = Vec::with_capacity(opening_variables);
         for (round, polynomial) in opening_sumcheck.rounds.iter().enumerate() {
@@ -2291,7 +2544,7 @@ mod tests {
                 polynomial,
             );
             fold_challenges.push(challenge);
-            fold_codeword = fold_codeword.fold(challenge).unwrap();
+            let fold_codeword = fold_levels.last().unwrap().fold(challenge).unwrap();
             let root = complex_root(
                 &oracle_tree_label(round + 1, fold_codeword.evaluations().len()),
                 fold_codeword.evaluations(),
@@ -2299,14 +2552,17 @@ mod tests {
             .unwrap();
             transcript.absorb_root(b"linear-opening-fold-root", &root);
             fold_roots.push(root);
+            fold_levels.push(fold_codeword);
         }
         absorb_float(&mut transcript, b"linear-opening-source-endpoint", 0.0).unwrap();
         let query_plan = draw_query_plan(&mut transcript, material.codeword.message_len()).unwrap();
+        let mut work = FastProverWork::default();
         let folding = build_folding_opening(
-            material.codeword.clone(),
+            fold_levels,
             &fold_roots,
             &fold_challenges,
             &query_plan,
+            &mut work,
         )
         .unwrap();
         let proof = FastProof {
@@ -2481,16 +2737,42 @@ mod tests {
 
         let rows = statement.generated().dimension() as u64;
         let nonzeros = statement.generated().structural_nnz() as u64;
+        let opening_rounds =
+            u64::from((2 * statement.generated().dimension().next_power_of_two()).ilog2());
+        let expected_root_computations = 1 + opening_rounds;
         assert_eq!(one_step_report.material_preparations, 1);
         assert_eq!(one_step_report.rows_scanned, 2 * rows);
         assert_eq!(one_step_report.nonzeros_scanned, 2 * nonzeros);
+        assert_eq!(one_step_report.codeword_folds, opening_rounds);
+        assert_eq!(
+            one_step_report.merkle_root_computations,
+            expected_root_computations
+        );
+        assert_eq!(one_step_report.merkle_multiproof_passes, opening_rounds);
 
         assert_eq!(commitment_report.material_preparations, 1);
         assert_eq!(commitment_report.rows_scanned, rows);
         assert_eq!(commitment_report.nonzeros_scanned, nonzeros);
+        assert_eq!(commitment_report.codeword_folds, 0);
+        assert_eq!(commitment_report.merkle_root_computations, 1);
+        assert_eq!(commitment_report.merkle_multiproof_passes, 0);
         assert_eq!(staged_report.material_preparations, 1);
         assert_eq!(staged_report.rows_scanned, 2 * rows);
         assert_eq!(staged_report.nonzeros_scanned, 2 * nonzeros);
+        assert_eq!(staged_report.codeword_folds, opening_rounds);
+        assert_eq!(
+            staged_report.merkle_root_computations,
+            expected_root_computations
+        );
+        assert_eq!(staged_report.merkle_multiproof_passes, opening_rounds);
+        assert_eq!(
+            one_step_report.estimated_backend_peak_bytes,
+            commitment_report.estimated_backend_peak_bytes
+        );
+        assert_eq!(
+            one_step_report.estimated_backend_peak_bytes,
+            staged_report.estimated_backend_peak_bytes
+        );
         assert_eq!(
             commitment_report.material_preparations + staged_report.material_preparations,
             2

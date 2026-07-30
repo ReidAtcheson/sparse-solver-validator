@@ -154,6 +154,19 @@ fn fast_commit(args: &CommonInputArgs, precommitment_path: &Path) -> Result<()> 
     );
     println!("commitment_rows_scanned={}", report.rows_scanned);
     println!("commitment_nonzeros_scanned={}", report.nonzeros_scanned);
+    println!(
+        "estimated_backend_peak_bytes={}",
+        report.estimated_backend_peak_bytes
+    );
+    println!("commitment_codeword_folds={}", report.codeword_folds);
+    println!(
+        "commitment_merkle_root_computations={}",
+        report.merkle_root_computations
+    );
+    println!(
+        "commitment_merkle_multiproof_passes={}",
+        report.merkle_multiproof_passes
+    );
     println!("precommitment_file={}", precommitment_path.display());
     Ok(())
 }
@@ -192,6 +205,19 @@ fn print_fast_prover_report(report: &FastProverReport) {
     );
     println!("prover_rows_scanned={}", report.rows_scanned);
     println!("prover_nonzeros_scanned={}", report.nonzeros_scanned);
+    println!(
+        "estimated_backend_peak_bytes={}",
+        report.estimated_backend_peak_bytes
+    );
+    println!("prover_codeword_folds={}", report.codeword_folds);
+    println!(
+        "prover_merkle_root_computations={}",
+        report.merkle_root_computations
+    );
+    println!(
+        "prover_merkle_multiproof_passes={}",
+        report.merkle_multiproof_passes
+    );
 }
 
 fn load_inputs(args: &CommonInputArgs) -> Result<LoadedInputs> {
