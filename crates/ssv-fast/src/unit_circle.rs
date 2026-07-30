@@ -126,6 +126,8 @@ pub enum UnitCircleError {
     NegativeZeroEncoding,
     #[error("unit-circle code dimensions overflow usize")]
     SizeOverflow,
+    #[error("unit-circle codeword allocation failed")]
+    AllocationFailed,
     #[error("unit-circle codeword shape is invalid")]
     InvalidCodewordShape,
     #[error("a one-coefficient unit-circle codeword cannot be folded further")]
@@ -160,7 +162,7 @@ impl UnitCircleCodeword {
             .checked_mul(2)
             .ok_or(UnitCircleError::SizeOverflow)?;
         let variables = message_len.trailing_zeros();
-        let mut evaluations = vec![ComplexValue::default(); evaluation_len];
+        let mut evaluations = zeroed_complex_values(evaluation_len)?;
         for (source_index, &value) in source.iter().enumerate() {
             evaluations[bit_reverse(source_index, variables)] = ComplexValue::from_real(value)?;
         }
@@ -205,7 +207,10 @@ impl UnitCircleCodeword {
         let next_message_len = self.message_len / 2;
         let next_evaluation_len = self.message_len;
         let complement = canonical_arithmetic_component(1.0 - challenge)?;
-        let mut evaluations = Vec::with_capacity(next_evaluation_len);
+        let mut evaluations = Vec::new();
+        evaluations
+            .try_reserve_exact(next_evaluation_len)
+            .map_err(|_| UnitCircleError::AllocationFailed)?;
 
         for index in 0..next_evaluation_len {
             let at_z = self.evaluations[index];
@@ -298,12 +303,14 @@ pub fn bit_reversed_source_coefficients(
     if source.is_empty() {
         return Err(UnitCircleError::EmptySource);
     }
-    let source = source
-        .iter()
-        .copied()
-        .map(ComplexValue::from_real)
-        .collect::<Result<Vec<_>, _>>()?;
-    padded_bit_reversal(&source)
+    let mut complex_source = Vec::new();
+    complex_source
+        .try_reserve_exact(source.len())
+        .map_err(|_| UnitCircleError::AllocationFailed)?;
+    for &value in source {
+        complex_source.push(ComplexValue::from_real(value)?);
+    }
+    padded_bit_reversal(&complex_source)
 }
 
 #[cfg(test)]
@@ -322,7 +329,7 @@ fn encode_complex(
         .checked_mul(2)
         .ok_or(UnitCircleError::SizeOverflow)?;
     let variables = message_len.trailing_zeros();
-    let mut evaluations = vec![ComplexValue::default(); evaluation_len];
+    let mut evaluations = zeroed_complex_values(evaluation_len)?;
     for (source_index, &value) in source.iter().enumerate() {
         evaluations[bit_reverse(source_index, variables)] = value;
     }
@@ -343,11 +350,20 @@ fn padded_bit_reversal(source: &[ComplexValue]) -> Result<Vec<ComplexValue>, Uni
         .checked_next_power_of_two()
         .ok_or(UnitCircleError::SizeOverflow)?;
     let variables = message_len.trailing_zeros();
-    let mut coefficients = vec![ComplexValue::default(); message_len];
+    let mut coefficients = zeroed_complex_values(message_len)?;
     for (source_index, &value) in source.iter().enumerate() {
         coefficients[bit_reverse(source_index, variables)] = value;
     }
     Ok(coefficients)
+}
+
+fn zeroed_complex_values(len: usize) -> Result<Vec<ComplexValue>, UnitCircleError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(len)
+        .map_err(|_| UnitCircleError::AllocationFailed)?;
+    values.resize(len, ComplexValue::default());
+    Ok(values)
 }
 
 fn bit_reverse(index: usize, variables: u32) -> usize {

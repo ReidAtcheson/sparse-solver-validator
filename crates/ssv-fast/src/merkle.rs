@@ -114,6 +114,127 @@ where
     Ok((root, proof))
 }
 
+/// Constructs a compact multiproof without recomputing the committed root.
+///
+/// This scans every value but hashes only the disjoint, unselected frontier
+/// subtrees required by the proof. The caller must have committed the same
+/// values in an earlier root pass; ordinary multiproof verification detects
+/// any disagreement. Selected indices must be strictly increasing.
+pub(crate) fn streaming_complex_multiproof_iter<I>(
+    tree_label: &[u8],
+    value_bits: I,
+    selected_indices: &[usize],
+) -> Result<ComplexMultiProof, MerkleError>
+where
+    I: ExactSizeIterator<Item = [u64; 2]>,
+{
+    let leaf_count = value_bits.len();
+    let padded_leaf_count = padded_leaf_count(leaf_count)?;
+    let expected_frontier = complex_multiproof_frontier_positions(leaf_count, selected_indices)?;
+    let tree_height = padded_leaf_count.ilog2() as usize;
+    let mut reduction: Vec<Option<SelectiveStreamingNode>> = vec![None; tree_height + 1];
+    let mut discovered_frontier = Vec::with_capacity(expected_frontier.len());
+    let mut selected_values = Vec::with_capacity(selected_indices.len());
+    let mut selected_cursor = 0_usize;
+
+    let padded_values = value_bits
+        .map(Some)
+        .chain((leaf_count..padded_leaf_count).map(|_| None));
+    for (leaf_index, value_bits) in padded_values.enumerate() {
+        let selected = selected_indices.get(selected_cursor) == Some(&leaf_index);
+        let hash = if selected {
+            selected_values
+                .push(value_bits.expect("a selected logical leaf cannot be synthetic padding"));
+            selected_cursor += 1;
+            None
+        } else {
+            Some(if let Some([real_bits, imaginary_bits]) = value_bits {
+                hash_complex_leaf(
+                    tree_label,
+                    leaf_count,
+                    leaf_index,
+                    real_bits,
+                    imaginary_bits,
+                )
+            } else {
+                hash_complex_padding(tree_label, leaf_count, leaf_index)
+            })
+        };
+        let mut node = SelectiveStreamingNode {
+            hash,
+            node_index: leaf_index,
+        };
+        let mut height = 0_usize;
+
+        while let Some(left) = reduction[height].take() {
+            debug_assert_eq!(left.node_index + 1, node.node_index);
+            let parent_hash = match (left.hash, node.hash) {
+                (Some(left_hash), Some(right_hash)) => Some(hash_complex_node(
+                    tree_label,
+                    leaf_count,
+                    height + 1,
+                    node.node_index / 2,
+                    &left_hash,
+                    &right_hash,
+                )),
+                (None, Some(right_hash)) => {
+                    discovered_frontier.push((
+                        FrontierPosition {
+                            level: height,
+                            index: node.node_index,
+                        },
+                        right_hash,
+                    ));
+                    None
+                }
+                (Some(left_hash), None) => {
+                    discovered_frontier.push((
+                        FrontierPosition {
+                            level: height,
+                            index: left.node_index,
+                        },
+                        left_hash,
+                    ));
+                    None
+                }
+                (None, None) => None,
+            };
+            node = SelectiveStreamingNode {
+                hash: parent_hash,
+                node_index: node.node_index / 2,
+            };
+            height += 1;
+        }
+        reduction[height] = Some(node);
+    }
+
+    debug_assert_eq!(selected_cursor, selected_indices.len());
+    debug_assert_eq!(selected_values.len(), selected_indices.len());
+    debug_assert_eq!(
+        reduction[tree_height]
+            .take()
+            .expect("power-of-two streaming reduction must produce one root")
+            .hash,
+        None
+    );
+    debug_assert!(reduction.into_iter().all(|node| node.is_none()));
+    discovered_frontier.sort_unstable_by_key(|(position, _)| (position.level, position.index));
+    debug_assert_eq!(
+        discovered_frontier
+            .iter()
+            .map(|(position, _)| *position)
+            .collect::<Vec<_>>(),
+        expected_frontier
+    );
+    Ok(ComplexMultiProof {
+        value_bits: selected_values,
+        frontier: discovered_frontier
+            .into_iter()
+            .map(|(_, hash)| hash)
+            .collect(),
+    })
+}
+
 /// Returns the exact number of frontier hashes for a public shape and indices.
 pub fn complex_multiproof_frontier_len(
     leaf_count: usize,
@@ -438,6 +559,12 @@ struct StreamingNode {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct SelectiveStreamingNode {
+    hash: Option<MerkleRoot>,
+    node_index: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct SelectedRange {
     start: usize,
     end: usize,
@@ -602,6 +729,11 @@ mod tests {
                 streaming_complex_root_and_multiproof(LABEL, &values, &selected).unwrap();
             assert_eq!(root, streaming_complex_root(LABEL, &values).unwrap());
             assert_eq!(
+                streaming_complex_multiproof_iter(LABEL, values.iter().copied(), &selected)
+                    .unwrap(),
+                proof
+            );
+            assert_eq!(
                 proof.value_bits,
                 selected
                     .iter()
@@ -637,6 +769,12 @@ mod tests {
             streaming_complex_root_and_multiproof_iter(LABEL, values.iter().copied(), &selected)
                 .unwrap(),
             streaming_complex_root_and_multiproof(LABEL, &values, &selected).unwrap()
+        );
+        assert_eq!(
+            streaming_complex_multiproof_iter(LABEL, values.iter().copied(), &selected).unwrap(),
+            streaming_complex_root_and_multiproof(LABEL, &values, &selected)
+                .unwrap()
+                .1
         );
     }
 
@@ -799,7 +937,18 @@ mod tests {
             Err(MerkleError::EmptyOpeningSet)
         );
         assert_eq!(
+            streaming_complex_multiproof_iter(LABEL, values.iter().copied(), &[]),
+            Err(MerkleError::EmptyOpeningSet)
+        );
+        assert_eq!(
             streaming_complex_root_and_multiproof(LABEL, &values, &[3]),
+            Err(MerkleError::IndexOutOfBounds {
+                index: 3,
+                leaf_count: 3,
+            })
+        );
+        assert_eq!(
+            streaming_complex_multiproof_iter(LABEL, values.iter().copied(), &[3]),
             Err(MerkleError::IndexOutOfBounds {
                 index: 3,
                 leaf_count: 3,
