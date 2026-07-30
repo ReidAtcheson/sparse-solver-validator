@@ -11,7 +11,7 @@
 
 use ssv_direct::{DirectBackend, DirectError, DirectProverReport, DirectVerifierReport};
 use ssv_exact::{ExactBackend, ExactError, ExactProverReport, ExactVerifierReport};
-use ssv_fast::{FastBackend, FastError, FastProverContext, FastProverReport, FastVerifierReport};
+use ssv_fast::{FastBackend, FastError, FastProverReport, FastVerifierReport};
 use ssv_service_protocol::{
     CertifiedScore, DefectMetrics, FastConsistencyMetrics, ProofProtocol,
     PublicEvaluatorRoundoffMetrics, Unsigned192,
@@ -71,9 +71,10 @@ where
 
 /// Proves any registered backend as one application operation.
 ///
-/// The fast path still fixes its packed-oracle commitment before deriving any
-/// Fiat--Shamir challenge. This wrapper simply keeps that local staging detail
-/// out of applications that do not need checkpointing or phase accounting.
+/// The fast path fixes its packed-oracle commitment before deriving any
+/// Fiat--Shamir challenge and retains the prepared private material across
+/// those local phases. Checkpointed callers use the separate commit/prove API,
+/// which recomputes and validates material across the process boundary.
 pub fn prove_single_stage(
     statement: &PublicStatement,
     solution: &Solution,
@@ -90,10 +91,7 @@ pub fn prove_single_stage(
             Ok((payload, BackendProverReport::Exact(report)))
         }
         ProofProtocol::FastBinary64UnitCircleV5 => {
-            let (commitment, _) = FastBackend::commit(statement, solution)?;
-            let context = FastProverContext::new(commitment);
-            let (payload, report) =
-                <FastBackend as ValidationBackend>::prove(statement, solution, &context)?;
+            let (payload, report) = FastBackend::prove_single_stage(statement, solution)?;
             Ok((payload, BackendProverReport::Fast(report)))
         }
     }
