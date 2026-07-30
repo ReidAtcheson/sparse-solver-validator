@@ -18,7 +18,8 @@ use ssv_service_protocol::{
 };
 use ssv_solution::Solution;
 use ssv_validation::{
-    ArtifactPrelude, PublicStatement, ReferenceValidationBackend, ValidationBackend,
+    ArtifactPrelude, BackendProtocolMismatch, BackendVerificationError, PublicStatement,
+    ReferenceValidationBackend, ValidationBackend,
 };
 use thiserror::Error;
 
@@ -50,8 +51,22 @@ pub enum BackendError {
     Exact(#[from] ExactError),
     #[error("fast backend failed: {0}")]
     Fast(#[from] FastError),
+    #[error(transparent)]
+    ProtocolMismatch(#[from] BackendProtocolMismatch),
     #[error("exact residual numerator does not fit the certificate's unsigned-192 field")]
     ExactScoreOverflow,
+}
+
+impl<E> From<BackendVerificationError<E>> for BackendError
+where
+    Self: From<E>,
+{
+    fn from(error: BackendVerificationError<E>) -> Self {
+        match error {
+            BackendVerificationError::ProtocolMismatch(error) => Self::ProtocolMismatch(error),
+            BackendVerificationError::Backend(error) => Self::from(error),
+        }
+    }
 }
 
 /// Proves any registered backend as one application operation.
