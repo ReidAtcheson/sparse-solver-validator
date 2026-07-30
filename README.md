@@ -310,8 +310,14 @@ budget; the service derives its proof-body cap from that value.
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+cargo test --workspace --doc --locked
+cargo test -p ssv-field-sumcheck --no-default-features --locked
 ```
+
+GitHub Actions runs this suite for every pull request and every push to `main`.
+Configure branch protection for `main` to require the `Rust checks` job from
+the `Rust CI` workflow before merging.
 
 Use `--release` for performance measurements.
