@@ -155,9 +155,10 @@ cargo run -p sparse-validator-server -- keygen \
 
 Start the service. It defaults to `0.0.0.0:$PORT`; loopback is convenient for
 local development. Its default maximum solution length is 16,777,216 elements,
-which matches the checked-in validation manifest. The HTTP proof-body cap is
-derived from that element limit, and the default request deadline is 120
-seconds:
+which matches the checked-in validation manifest. Matrix and RHS public
+evaluations default to at most 4,096 periodic terms each, all three registered
+protocols are enabled, and the default request deadline is 120 seconds. The HTTP
+proof-body cap is derived from the solution-element limit:
 
 ```sh
 cargo run -p sparse-validator-server -- serve \
@@ -167,6 +168,13 @@ cargo run -p sparse-validator-server -- serve \
   --issuer local-validator \
   --key-id local-key-v1
 ```
+
+These are immutable process settings, not submitter policy:
+`--maximum-public-matrix-terms`, `--maximum-public-rhs-terms`, and repeatable
+`--allowed-protocol` flags narrow the accepted workload. The equivalent
+environment variables are `SSV_MAXIMUM_PUBLIC_MATRIX_TERMS`,
+`SSV_MAXIMUM_PUBLIC_RHS_TERMS`, and comma-separated `SSV_ALLOWED_PROTOCOLS`.
+A manifest may choose a lower ceiling but cannot raise a deployment ceiling.
 
 Issue and verify a template-bound challenge:
 
@@ -278,7 +286,8 @@ the compatible listener, but not container or deployment manifests. The current
 server reads a hexadecimal signing key from a file, which a deployment must
 provide through an appropriately protected secret mount. Set
 `--maximum-solution-elements` to fit the deployment's request-size and memory
-budget; the service derives its proof-body cap from that value.
+budget, set the two public-term ceilings for the intended succinct-verifier
+work, and enable only the protocols the deployment intends to serve.
 
 ## Semantics and limitations
 
@@ -300,6 +309,8 @@ budget; the service derives its proof-body cap from that value.
   provisional fast metric into an exact or one-shot proof.
 - The service is stateless. Expiry is enforced, but replay prevention, one-shot
   challenges, and a global best residual require durable transactional state.
+  Deployment protocol and evaluator ceilings are immutable startup values
+  checked independently on each request; they add no stored request state.
 - An exact proof under the same signed problem header is the required follow-up
   when exact field soundness is needed.
 - The built-in timeout, body limit, and validation concurrency cap are local

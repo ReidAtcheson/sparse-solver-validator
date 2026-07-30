@@ -1,13 +1,14 @@
 use ed25519_dalek::SigningKey;
 use ssv_backends::{BackendProverReport, BackendVerifierReport, prove_single_stage};
 use ssv_canonical::Digest;
-use ssv_problem::ProblemTemplate;
+use ssv_problem::{ProblemTemplate, RhsSpec};
 use ssv_service::{ServiceConfig, ServiceError, StatelessValidatorService};
 use ssv_service_protocol::{
-    CertifiedScore, MAX_ID_BYTES, ProofProtocol, ProtocolError, SignedChallenge, ValidationManifest,
+    CertifiedScore, MAX_ID_BYTES, MAX_PUBLIC_EVALUATION_TERMS_LIMIT, ProofProtocol, ProtocolError,
+    SignedChallenge, ValidationManifest,
 };
 use ssv_solution::Solution;
-use ssv_validation::{ArtifactPrelude, PublicStatement, encode_artifact};
+use ssv_validation::{ArtifactPrelude, PublicStatement, ValidationError, encode_artifact};
 
 fn service_config() -> ServiceConfig {
     ServiceConfig {
@@ -16,6 +17,13 @@ fn service_config() -> ServiceConfig {
         challenge_lifetime_seconds: 900,
         maximum_future_skew_seconds: 5,
         maximum_solution_elements: 1024,
+        maximum_public_matrix_terms: 4096,
+        maximum_public_rhs_terms: 4096,
+        allowed_protocols: vec![
+            ProofProtocol::DirectReferenceV1,
+            ProofProtocol::WhirField192L2V4,
+            ProofProtocol::FastBinary64UnitCircleV4,
+        ],
         validator_build: "integration-test-build".to_owned(),
     }
 }
@@ -32,6 +40,17 @@ fn challenge_template() -> ProblemTemplate {
 fn local_template() -> ProblemTemplate {
     ProblemTemplate::from_json_slice(include_bytes!("../../../examples/local-template.json"))
         .unwrap()
+}
+
+fn seeded_rhs_challenge_template() -> ProblemTemplate {
+    let mut template = challenge_template();
+    template.rhs = RhsSpec::SeededPeriodicDyadicV1 {
+        period_bits: 3,
+        fractional_bits: 8,
+        minimum_mantissa: -4,
+        maximum_mantissa: 7,
+    };
+    template
 }
 
 fn manifest() -> ValidationManifest {
@@ -52,6 +71,30 @@ fn statement(
 fn single_stage_proof(statement: &PublicStatement, solution: &Solution) -> Vec<u8> {
     let (payload, _) = prove_single_stage(statement, solution).unwrap();
     encode_artifact(statement, &payload).unwrap()
+}
+
+fn empty_challenged_artifact(
+    issuer: &StatelessValidatorService,
+    template: &ProblemTemplate,
+    manifest: ValidationManifest,
+) -> Vec<u8> {
+    let challenge = issuer
+        .issue_challenge(template, Digest::from_bytes([39; 32]), 1_000)
+        .unwrap();
+    let problem = template
+        .finalize_with_challenge_context(&challenge.payload_canonical_bytes())
+        .unwrap();
+    let statement = statement(problem, manifest, Some(challenge));
+    encode_artifact(&statement, &[]).unwrap()
+}
+
+fn replace_once(encoded: &mut [u8], original: &[u8], replacement: &[u8]) {
+    assert_eq!(original.len(), replacement.len());
+    let position = encoded
+        .windows(original.len())
+        .position(|window| window == original)
+        .unwrap();
+    encoded[position..position + original.len()].copy_from_slice(replacement);
 }
 
 #[test]
@@ -85,6 +128,209 @@ fn service_rejects_validator_builds_that_are_invalid_in_certificates() {
     let mut maximum = service_config();
     maximum.validator_build = "x".repeat(MAX_ID_BYTES);
     assert!(StatelessValidatorService::new(maximum, SigningKey::from_bytes(&[7; 32])).is_ok());
+}
+
+#[test]
+fn service_rejects_invalid_deployment_policy() {
+    for (matrix_terms, rhs_terms) in [
+        (0, 1),
+        (1, 0),
+        (MAX_PUBLIC_EVALUATION_TERMS_LIMIT + 1, 1),
+        (1, MAX_PUBLIC_EVALUATION_TERMS_LIMIT + 1),
+    ] {
+        let mut config = service_config();
+        config.maximum_public_matrix_terms = matrix_terms;
+        config.maximum_public_rhs_terms = rhs_terms;
+        assert!(matches!(
+            StatelessValidatorService::new(config, SigningKey::from_bytes(&[7; 32])),
+            Err(ServiceError::InvalidConfiguration(_))
+        ));
+    }
+
+    let mut config = service_config();
+    config.allowed_protocols.clear();
+    assert!(matches!(
+        StatelessValidatorService::new(config, SigningKey::from_bytes(&[7; 32])),
+        Err(ServiceError::InvalidConfiguration(_))
+    ));
+}
+
+#[test]
+fn challenge_issuance_enforces_deployment_evaluator_limits() {
+    let mut matrix_config = service_config();
+    matrix_config.maximum_public_matrix_terms = 7;
+    let matrix_limited =
+        StatelessValidatorService::new(matrix_config, SigningKey::from_bytes(&[7; 32])).unwrap();
+    assert!(matches!(
+        matrix_limited.issue_challenge(&challenge_template(), Digest::from_bytes([40; 32]), 1_000),
+        Err(ServiceError::PublicEvaluationLimit)
+    ));
+
+    let mut rhs_config = service_config();
+    rhs_config.maximum_public_rhs_terms = 7;
+    let rhs_limited =
+        StatelessValidatorService::new(rhs_config, SigningKey::from_bytes(&[7; 32])).unwrap();
+    assert!(matches!(
+        rhs_limited.issue_challenge(
+            &seeded_rhs_challenge_template(),
+            Digest::from_bytes([41; 32]),
+            1_000
+        ),
+        Err(ServiceError::PublicEvaluationLimit)
+    ));
+}
+
+#[test]
+fn artifact_admission_rechecks_deployment_evaluator_limits() {
+    let issuer = service();
+    let mut matrix_artifact = empty_challenged_artifact(
+        &issuer,
+        &challenge_template(),
+        ValidationManifest {
+            max_solution_elements: 1_024,
+            max_public_matrix_terms: 8,
+            max_public_rhs_terms: 1,
+            ..ValidationManifest::default()
+        },
+    );
+    replace_once(
+        &mut matrix_artifact,
+        b"\"max_public_matrix_terms\":8",
+        b"\"max_public_matrix_terms\":7",
+    );
+    let mut matrix_config = service_config();
+    matrix_config.maximum_public_matrix_terms = 7;
+    let matrix_limited =
+        StatelessValidatorService::new(matrix_config, SigningKey::from_bytes(&[7; 32])).unwrap();
+    assert!(matches!(
+        matrix_limited.validate_submission(&matrix_artifact, 1_001),
+        Err(ServiceError::Artifact(
+            ValidationError::PublicEvaluationLimit
+        ))
+    ));
+
+    let mut rhs_artifact = empty_challenged_artifact(
+        &issuer,
+        &seeded_rhs_challenge_template(),
+        ValidationManifest {
+            max_solution_elements: 1_024,
+            max_public_matrix_terms: 8,
+            max_public_rhs_terms: 8,
+            ..ValidationManifest::default()
+        },
+    );
+    replace_once(
+        &mut rhs_artifact,
+        b"\"max_public_rhs_terms\":8",
+        b"\"max_public_rhs_terms\":7",
+    );
+    let mut rhs_config = service_config();
+    rhs_config.maximum_public_rhs_terms = 7;
+    let rhs_limited =
+        StatelessValidatorService::new(rhs_config, SigningKey::from_bytes(&[7; 32])).unwrap();
+    assert!(matches!(
+        rhs_limited.validate_submission(&rhs_artifact, 1_001),
+        Err(ServiceError::Artifact(
+            ValidationError::PublicEvaluationLimit
+        ))
+    ));
+}
+
+#[test]
+fn manifest_cannot_raise_deployment_evaluator_limits() {
+    let issuer = service();
+    let template = challenge_template();
+    let challenge = issuer
+        .issue_challenge(&template, Digest::from_bytes([42; 32]), 1_000)
+        .unwrap();
+    let problem = template
+        .finalize_with_challenge_context(&challenge.payload_canonical_bytes())
+        .unwrap();
+    let mut config = service_config();
+    config.maximum_public_matrix_terms = 8;
+    config.maximum_public_rhs_terms = 1;
+    let restricted =
+        StatelessValidatorService::new(config, SigningKey::from_bytes(&[7; 32])).unwrap();
+
+    for manifest in [
+        ValidationManifest {
+            max_solution_elements: 1_024,
+            max_public_matrix_terms: 9,
+            max_public_rhs_terms: 1,
+            ..ValidationManifest::default()
+        },
+        ValidationManifest {
+            max_solution_elements: 1_024,
+            max_public_matrix_terms: 8,
+            max_public_rhs_terms: 2,
+            ..ValidationManifest::default()
+        },
+    ] {
+        let statement = statement(problem.clone(), manifest, Some(challenge.clone()));
+        let artifact = encode_artifact(&statement, &[]).unwrap();
+        assert!(matches!(
+            restricted.validate_submission(&artifact, 1_001),
+            Err(ServiceError::Artifact(
+                ValidationError::PublicEvaluationLimit
+            ))
+        ));
+    }
+}
+
+#[test]
+fn every_disallowed_protocol_is_rejected_before_backend_verification() {
+    let issuer = service();
+    let template = challenge_template();
+    let challenge = issuer
+        .issue_challenge(&template, Digest::from_bytes([43; 32]), 1_000)
+        .unwrap();
+    let problem = template
+        .finalize_with_challenge_context(&challenge.payload_canonical_bytes())
+        .unwrap();
+
+    for (protocol, allowed_protocols) in [
+        (
+            ProofProtocol::DirectReferenceV1,
+            vec![ProofProtocol::WhirField192L2V4],
+        ),
+        (
+            ProofProtocol::WhirField192L2V4,
+            vec![ProofProtocol::FastBinary64UnitCircleV4],
+        ),
+        (
+            ProofProtocol::FastBinary64UnitCircleV4,
+            vec![ProofProtocol::DirectReferenceV1],
+        ),
+    ] {
+        let artifact = encode_artifact(
+            &statement(
+                problem.clone(),
+                ValidationManifest {
+                    protocol,
+                    max_solution_elements: 1_024,
+                    max_public_matrix_terms: 8,
+                    max_public_rhs_terms: 1,
+                    ..ValidationManifest::default()
+                },
+                Some(challenge.clone()),
+            ),
+            &[],
+        )
+        .unwrap();
+        let mut config = service_config();
+        config.maximum_public_matrix_terms = 8;
+        config.maximum_public_rhs_terms = 1;
+        config.allowed_protocols = allowed_protocols;
+        let restricted =
+            StatelessValidatorService::new(config, SigningKey::from_bytes(&[7; 32])).unwrap();
+
+        assert!(matches!(
+            restricted.validate_submission(&artifact, 1_001),
+            Err(ServiceError::ProtocolNotAllowed {
+                protocol: rejected
+            }) if rejected == protocol
+        ));
+    }
 }
 
 #[test]

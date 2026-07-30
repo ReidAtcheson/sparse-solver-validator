@@ -14,8 +14,8 @@ use ssv_problem::{
     SuccinctPublicEvaluator,
 };
 use ssv_service_protocol::{
-    MAX_CHALLENGE_BYTES, MAX_SOLUTION_ELEMENTS_LIMIT, ProofProtocol, ProtocolError,
-    SignedChallenge, ValidationManifest,
+    MAX_CHALLENGE_BYTES, MAX_PUBLIC_EVALUATION_TERMS_LIMIT, MAX_SOLUTION_ELEMENTS_LIMIT,
+    ProofProtocol, ProtocolError, SignedChallenge, ValidationManifest,
 };
 use ssv_solution::Solution;
 use thiserror::Error;
@@ -27,6 +27,11 @@ const PAYLOAD_FRAME: u16 = 1;
 const FINAL_FRAME: u16 = u16::MAX;
 const FRAME_VERSION: u16 = 1;
 const ARTIFACT_DIGEST_DOMAIN: &[u8] = b"sparse-solve/proof-artifact/v1";
+const REGISTERED_PROTOCOLS: &[ProofProtocol] = &[
+    ProofProtocol::DirectReferenceV1,
+    ProofProtocol::WhirField192L2V4,
+    ProofProtocol::FastBinary64UnitCircleV4,
+];
 
 pub const MAX_PUBLIC_STATEMENT_BYTES: usize = 1024 * 1024;
 /// Container ceiling. Registered succinct backends apply their tighter 64 MiB
@@ -38,6 +43,33 @@ pub const MAX_SUCCINCT_ARTIFACT_BYTES: usize =
     MAX_CHALLENGE_BYTES + MAX_PUBLIC_STATEMENT_BYTES + MAX_SUCCINCT_PAYLOAD_BYTES + 128;
 pub const MAX_ARTIFACT_BYTES: usize =
     MAX_CHALLENGE_BYTES + MAX_PUBLIC_STATEMENT_BYTES + MAX_BACKEND_PAYLOAD_BYTES + 128;
+
+/// Caller-owned ceilings applied while admitting an untrusted proof artifact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArtifactResourceLimits {
+    maximum_solution_elements: u64,
+    maximum_payload_bytes: usize,
+    maximum_public_matrix_terms: u64,
+    maximum_public_rhs_terms: u64,
+}
+
+impl ArtifactResourceLimits {
+    /// Creates immutable ceilings for one artifact-admission operation.
+    #[must_use]
+    pub const fn new(
+        maximum_solution_elements: u64,
+        maximum_payload_bytes: usize,
+        maximum_public_matrix_terms: u64,
+        maximum_public_rhs_terms: u64,
+    ) -> Self {
+        Self {
+            maximum_solution_elements,
+            maximum_payload_bytes,
+            maximum_public_matrix_terms,
+            maximum_public_rhs_terms,
+        }
+    }
+}
 
 /// Validated public input shared by every proof backend.
 #[derive(Clone, Debug)]
@@ -92,6 +124,8 @@ pub enum ValidationError {
     UnsupportedVersion,
     #[error("proof artifact exceeds a configured resource limit")]
     ResourceLimit,
+    #[error("proof protocol {protocol:?} is not allowed by the caller")]
+    ProtocolNotAllowed { protocol: ProofProtocol },
     #[error("public problem is invalid: {0}")]
     Problem(#[from] ProblemError),
     #[error("validation manifest is invalid: {0}")]
@@ -208,7 +242,23 @@ impl PublicStatement {
         manifest: ValidationManifest,
         challenge: Option<SignedChallenge>,
     ) -> Result<Self, ValidationError> {
-        problem.validate()?;
+        Self::new_with_public_evaluation_limits(
+            problem,
+            manifest,
+            challenge,
+            MAX_PUBLIC_EVALUATION_TERMS_LIMIT,
+            MAX_PUBLIC_EVALUATION_TERMS_LIMIT,
+        )
+    }
+
+    fn new_with_public_evaluation_limits(
+        problem: FinalizedProblem,
+        manifest: ValidationManifest,
+        challenge: Option<SignedChallenge>,
+        maximum_public_matrix_terms: u64,
+        maximum_public_rhs_terms: u64,
+    ) -> Result<Self, ValidationError> {
+        let evaluation = problem.public_evaluation_terms()?;
         manifest.validate()?;
         if let Some(challenge) = challenge.as_ref() {
             challenge
@@ -220,13 +270,28 @@ impl PublicStatement {
         if problem.dimension() > manifest.max_solution_elements {
             return Err(ValidationError::DimensionLimit);
         }
-        let generated = problem.compile()?;
-        let evaluation = generated.public_evaluation_plan().metadata();
-        if evaluation.matrix_period_terms as u64 > manifest.max_public_matrix_terms
-            || evaluation.rhs_period_terms as u64 > manifest.max_public_rhs_terms
+        if evaluation.matrix_period_terms > manifest.max_public_matrix_terms
+            || evaluation.rhs_period_terms > manifest.max_public_rhs_terms
+            || evaluation.matrix_period_terms > maximum_public_matrix_terms
+            || evaluation.rhs_period_terms > maximum_public_rhs_terms
         {
             return Err(ValidationError::PublicEvaluationLimit);
         }
+        let generated = problem.compile()?;
+        debug_assert_eq!(
+            generated
+                .public_evaluation_plan()
+                .metadata()
+                .matrix_period_terms as u64,
+            evaluation.matrix_period_terms
+        );
+        debug_assert_eq!(
+            generated
+                .public_evaluation_plan()
+                .metadata()
+                .rhs_period_terms as u64,
+            evaluation.rhs_period_terms
+        );
         let problem_digest = Digest::from_bytes(generated.problem_digest().into_bytes());
         let manifest_digest = manifest.digest()?;
         Ok(Self {
@@ -338,18 +403,49 @@ impl<'a> ArtifactPrelude<'a> {
         maximum_solution_elements: u64,
         maximum_payload_bytes: usize,
     ) -> Result<Self, ValidationError> {
-        if maximum_solution_elements == 0
-            || maximum_solution_elements > MAX_SOLUTION_ELEMENTS_LIMIT
-            || maximum_payload_bytes > MAX_BACKEND_PAYLOAD_BYTES
+        Self::parse_with_resource_limits(
+            encoded,
+            ArtifactResourceLimits::new(
+                maximum_solution_elements,
+                maximum_payload_bytes,
+                MAX_PUBLIC_EVALUATION_TERMS_LIMIT,
+                MAX_PUBLIC_EVALUATION_TERMS_LIMIT,
+            ),
+        )
+    }
+
+    pub fn parse_with_resource_limits(
+        encoded: &'a [u8],
+        resource_limits: ArtifactResourceLimits,
+    ) -> Result<Self, ValidationError> {
+        Self::parse_with_admission_policy(encoded, resource_limits, REGISTERED_PROTOCOLS)
+    }
+
+    /// Parses an artifact under caller-owned resource and protocol policy.
+    ///
+    /// The protocol header is checked before decoding public-statement JSON or
+    /// constructing generator-owned periodic tables.
+    pub fn parse_with_admission_policy(
+        encoded: &'a [u8],
+        resource_limits: ArtifactResourceLimits,
+        allowed_protocols: &[ProofProtocol],
+    ) -> Result<Self, ValidationError> {
+        if resource_limits.maximum_solution_elements == 0
+            || resource_limits.maximum_solution_elements > MAX_SOLUTION_ELEMENTS_LIMIT
+            || resource_limits.maximum_payload_bytes > MAX_BACKEND_PAYLOAD_BYTES
+            || resource_limits.maximum_public_matrix_terms == 0
+            || resource_limits.maximum_public_matrix_terms > MAX_PUBLIC_EVALUATION_TERMS_LIMIT
+            || resource_limits.maximum_public_rhs_terms == 0
+            || resource_limits.maximum_public_rhs_terms > MAX_PUBLIC_EVALUATION_TERMS_LIMIT
             || encoded.len() > MAX_ARTIFACT_BYTES
         {
             return Err(ValidationError::ResourceLimit);
         }
-        let limits = DecodeLimits {
+        let decode_limits = DecodeLimits {
             max_input_bytes: MAX_ARTIFACT_BYTES,
             max_field_bytes: MAX_ARTIFACT_BYTES,
         };
-        let mut input = Reader::new(encoded, limits).map_err(framing)?;
+        let mut input = Reader::new(encoded, decode_limits).map_err(framing)?;
         if input.read_fixed_bytes(MAGIC.len()).map_err(framing)? != MAGIC {
             return Err(ValidationError::Framing("bad proof magic".to_owned()));
         }
@@ -358,6 +454,9 @@ impl<'a> ArtifactPrelude<'a> {
         }
         let protocol = ProofProtocol::from_wire_id(input.read_u16().map_err(framing)?)
             .ok_or(ValidationError::UnsupportedVersion)?;
+        if !allowed_protocols.contains(&protocol) {
+            return Err(ValidationError::ProtocolNotAllowed { protocol });
+        }
         let flags = input.read_u32().map_err(framing)?;
         if flags & !FLAG_SIGNED_PROBLEM_CHALLENGE != 0 {
             return Err(ValidationError::UnsupportedVersion);
@@ -391,10 +490,21 @@ impl<'a> ArtifactPrelude<'a> {
         if manifest.protocol != protocol {
             return Err(ValidationError::ProtocolMismatch);
         }
-        if manifest.max_solution_elements > maximum_solution_elements {
+        if manifest.max_solution_elements > resource_limits.maximum_solution_elements {
             return Err(ValidationError::DimensionLimit);
         }
-        let statement = PublicStatement::new(problem, manifest, challenge)?;
+        if manifest.max_public_matrix_terms > resource_limits.maximum_public_matrix_terms
+            || manifest.max_public_rhs_terms > resource_limits.maximum_public_rhs_terms
+        {
+            return Err(ValidationError::PublicEvaluationLimit);
+        }
+        let statement = PublicStatement::new_with_public_evaluation_limits(
+            problem,
+            manifest,
+            challenge,
+            resource_limits.maximum_public_matrix_terms,
+            resource_limits.maximum_public_rhs_terms,
+        )?;
 
         if input.read_u16().map_err(framing)? != PAYLOAD_FRAME
             || input.read_u16().map_err(framing)? != FRAME_VERSION
@@ -403,7 +513,7 @@ impl<'a> ArtifactPrelude<'a> {
         }
         let payload_len = usize::try_from(input.read_u64().map_err(framing)?)
             .map_err(|_| ValidationError::ResourceLimit)?;
-        if payload_len > maximum_payload_bytes {
+        if payload_len > resource_limits.maximum_payload_bytes {
             return Err(ValidationError::ResourceLimit);
         }
         let payload = input.read_fixed_bytes(payload_len).map_err(framing)?;
@@ -613,7 +723,11 @@ mod tests {
         }
     }
 
-    fn statement(protocol: ProofProtocol) -> PublicStatement {
+    fn statement_with_term_limits(
+        protocol: ProofProtocol,
+        max_public_matrix_terms: u64,
+        max_public_rhs_terms: u64,
+    ) -> PublicStatement {
         let problem = ProblemTemplate {
             schema: TemplateSchema::V1,
             randomness: TemplateRandomness::LiteralV1 {
@@ -640,11 +754,88 @@ mod tests {
             ValidationManifest {
                 protocol,
                 max_solution_elements: 8,
+                max_public_matrix_terms,
+                max_public_rhs_terms,
                 ..ValidationManifest::default()
             },
             None,
         )
         .unwrap()
+    }
+
+    fn statement(protocol: ProofProtocol) -> PublicStatement {
+        statement_with_term_limits(
+            protocol,
+            ValidationManifest::default().max_public_matrix_terms,
+            ValidationManifest::default().max_public_rhs_terms,
+        )
+    }
+
+    #[test]
+    fn caller_owned_evaluator_limits_reject_over_budget_artifacts() {
+        let statement = statement_with_term_limits(ProofProtocol::DirectReferenceV1, 4, 1);
+        let encoded = encode_artifact(&statement, &[]).unwrap();
+        let limits = ArtifactResourceLimits::new(8, MAX_BACKEND_PAYLOAD_BYTES, 3, 1);
+
+        assert!(matches!(
+            ArtifactPrelude::parse_with_resource_limits(&encoded, limits),
+            Err(ValidationError::PublicEvaluationLimit)
+        ));
+    }
+
+    #[test]
+    fn manifest_cannot_raise_caller_owned_evaluator_limits() {
+        let statement = statement_with_term_limits(ProofProtocol::DirectReferenceV1, 5, 2);
+        let encoded = encode_artifact(&statement, &[]).unwrap();
+        let limits = ArtifactResourceLimits::new(8, MAX_BACKEND_PAYLOAD_BYTES, 4, 1);
+
+        assert!(matches!(
+            ArtifactPrelude::parse_with_resource_limits(&encoded, limits),
+            Err(ValidationError::PublicEvaluationLimit)
+        ));
+    }
+
+    #[test]
+    fn caller_owned_evaluator_limits_must_fit_protocol_bounds() {
+        let encoded = encode_artifact(&statement(ProofProtocol::DirectReferenceV1), &[]).unwrap();
+        for limits in [
+            ArtifactResourceLimits::new(8, MAX_BACKEND_PAYLOAD_BYTES, 0, 1),
+            ArtifactResourceLimits::new(8, MAX_BACKEND_PAYLOAD_BYTES, 1, 0),
+            ArtifactResourceLimits::new(
+                8,
+                MAX_BACKEND_PAYLOAD_BYTES,
+                MAX_PUBLIC_EVALUATION_TERMS_LIMIT + 1,
+                1,
+            ),
+            ArtifactResourceLimits::new(
+                8,
+                MAX_BACKEND_PAYLOAD_BYTES,
+                1,
+                MAX_PUBLIC_EVALUATION_TERMS_LIMIT + 1,
+            ),
+        ] {
+            assert!(matches!(
+                ArtifactPrelude::parse_with_resource_limits(&encoded, limits),
+                Err(ValidationError::ResourceLimit)
+            ));
+        }
+    }
+
+    #[test]
+    fn caller_protocol_policy_is_checked_from_the_fixed_header() {
+        let encoded = encode_artifact(&statement(ProofProtocol::DirectReferenceV1), &[]).unwrap();
+        let limits = ArtifactResourceLimits::new(8, MAX_BACKEND_PAYLOAD_BYTES, 4096, 4096);
+
+        assert!(matches!(
+            ArtifactPrelude::parse_with_admission_policy(
+                &encoded,
+                limits,
+                &[ProofProtocol::WhirField192L2V4]
+            ),
+            Err(ValidationError::ProtocolNotAllowed {
+                protocol: ProofProtocol::DirectReferenceV1
+            })
+        ));
     }
 
     #[test]

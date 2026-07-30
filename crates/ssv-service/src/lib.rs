@@ -11,15 +11,17 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use ssv_backends::{BackendError, BackendVerifierReport, verify as verify_backend};
 use ssv_canonical::Digest;
 use ssv_direct::maximum_backend_payload_bytes;
-use ssv_problem::{FinalizedRandomness, ProblemError, ProblemTemplate, TemplateRandomness};
+use ssv_problem::{
+    FinalizedRandomness, ProblemError, ProblemTemplate, PublicEvaluationTerms, TemplateRandomness,
+};
 use ssv_service_protocol::{
     CertificatePayload, CertificateSchema, ChallengePayload, ChallengeSchema, MAX_CHALLENGE_BYTES,
-    MAX_SOLUTION_ELEMENTS_LIMIT, ProtocolError, RetryPolicy, SignedCertificate, SignedChallenge,
-    validate_identifier,
+    MAX_PUBLIC_EVALUATION_TERMS_LIMIT, MAX_SOLUTION_ELEMENTS_LIMIT, ProofProtocol, ProtocolError,
+    RetryPolicy, SignedCertificate, SignedChallenge, validate_identifier,
 };
 use ssv_validation::{
-    ArtifactPrelude, ArtifactSummary, MAX_PUBLIC_STATEMENT_BYTES, MAX_SUCCINCT_ARTIFACT_BYTES,
-    MAX_SUCCINCT_PAYLOAD_BYTES, ValidationError,
+    ArtifactPrelude, ArtifactResourceLimits, ArtifactSummary, MAX_PUBLIC_STATEMENT_BYTES,
+    MAX_SUCCINCT_ARTIFACT_BYTES, MAX_SUCCINCT_PAYLOAD_BYTES, ValidationError,
 };
 use thiserror::Error;
 
@@ -30,6 +32,10 @@ pub struct ServiceConfig {
     pub challenge_lifetime_seconds: i64,
     pub maximum_future_skew_seconds: i64,
     pub maximum_solution_elements: u64,
+    pub maximum_public_matrix_terms: u64,
+    pub maximum_public_rhs_terms: u64,
+    /// Immutable protocol allowlist for this service process.
+    pub allowed_protocols: Vec<ProofProtocol>,
     pub validator_build: String,
 }
 
@@ -72,6 +78,10 @@ pub enum ServiceError {
     ChallengeRequiresDerivedTemplate,
     #[error("problem or manifest exceeds this service's solution-element policy")]
     SolutionElementLimit,
+    #[error("problem or manifest exceeds this service's public-evaluator term policy")]
+    PublicEvaluationLimit,
+    #[error("proof protocol {protocol:?} is not enabled by this service")]
+    ProtocolNotAllowed { protocol: ProofProtocol },
     #[error("hosted validation requires a signed challenge; literal local mode is rejected")]
     SignedChallengeRequired,
     #[error("challenge lifetime differs from this service's configured policy")]
@@ -130,6 +140,20 @@ impl StatelessValidatorService {
                 "maximum solution elements is outside backend bounds",
             ));
         }
+        if config.maximum_public_matrix_terms == 0
+            || config.maximum_public_matrix_terms > MAX_PUBLIC_EVALUATION_TERMS_LIMIT
+            || config.maximum_public_rhs_terms == 0
+            || config.maximum_public_rhs_terms > MAX_PUBLIC_EVALUATION_TERMS_LIMIT
+        {
+            return Err(ServiceError::InvalidConfiguration(
+                "public-evaluator term limits are outside protocol bounds",
+            ));
+        }
+        if config.allowed_protocols.is_empty() {
+            return Err(ServiceError::InvalidConfiguration(
+                "at least one proof protocol must be enabled",
+            ));
+        }
         validate_identifier("issuer", &config.issuer)?;
         validate_identifier("key_id", &config.key_id)?;
         validate_identifier("validator_build", &config.validator_build)?;
@@ -155,7 +179,7 @@ impl StatelessValidatorService {
         entropy: Digest,
         now_unix_seconds: i64,
     ) -> Result<SignedChallenge, ServiceError> {
-        template.validate()?;
+        let public_evaluation_terms = template.public_evaluation_terms()?;
         if !matches!(
             template.randomness,
             TemplateRandomness::ChallengeDerivedV1 { .. }
@@ -165,6 +189,7 @@ impl StatelessValidatorService {
         if template.dimension() > self.config.maximum_solution_elements {
             return Err(ServiceError::SolutionElementLimit);
         }
+        self.require_public_evaluation_terms(public_evaluation_terms)?;
         let expires_at_unix_seconds = now_unix_seconds
             .checked_add(self.config.challenge_lifetime_seconds)
             .ok_or(ServiceError::InvalidConfiguration(
@@ -205,8 +230,22 @@ impl StatelessValidatorService {
         )
         .ok_or(ServiceError::SolutionElementLimit)?;
         let payload_limit = direct_limit.max(MAX_SUCCINCT_PAYLOAD_BYTES);
-        let prelude =
-            ArtifactPrelude::parse_with_limits(proof_bytes.as_ref(), element_limit, payload_limit)?;
+        let prelude = ArtifactPrelude::parse_with_admission_policy(
+            proof_bytes.as_ref(),
+            ArtifactResourceLimits::new(
+                element_limit,
+                payload_limit,
+                self.config.maximum_public_matrix_terms,
+                self.config.maximum_public_rhs_terms,
+            ),
+            &self.config.allowed_protocols,
+        )
+        .map_err(|error| match error {
+            ValidationError::ProtocolNotAllowed { protocol } => {
+                ServiceError::ProtocolNotAllowed { protocol }
+            }
+            other => ServiceError::Artifact(other),
+        })?;
 
         let challenge = prelude
             .statement()
@@ -305,6 +344,18 @@ impl StatelessValidatorService {
         let validated =
             self.validate_submission(proof_bytes, validation_started_at_unix_seconds)?;
         self.certify(validated, validation_completed_at_unix_seconds)
+    }
+
+    fn require_public_evaluation_terms(
+        &self,
+        terms: PublicEvaluationTerms,
+    ) -> Result<(), ServiceError> {
+        if terms.matrix_period_terms > self.config.maximum_public_matrix_terms
+            || terms.rhs_period_terms > self.config.maximum_public_rhs_terms
+        {
+            return Err(ServiceError::PublicEvaluationLimit);
+        }
+        Ok(())
     }
 }
 
