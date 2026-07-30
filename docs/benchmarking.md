@@ -192,7 +192,12 @@ size. To compare phase costs with the research implementation or isolate memory
 peaks, additionally measure local `fast-commit` and `fast-prove` as separate
 processes and report their maximum RSS individually as well as the maximum of the
 two. These commands implement the same noninteractive transcript and introduce
-no issuer interaction. Report:
+no issuer interaction. The one-step report covers one material preparation plus
+the compressed-matvec scan. For staged measurements, add the preparation/scan
+counters from `fast-commit` and `fast-prove`; recomputation across that process
+boundary is intentional. The deterministic
+[fast-preparation fixture](../benchmarks/fast-preparation/README.md) preserves a
+one-step/staged comparison input and exact reproduction commands. Report:
 
 - complete artifact bytes and, when staged measurements are included, the
   diagnostic precommitment-file bytes without adding them to transmitted bytes;

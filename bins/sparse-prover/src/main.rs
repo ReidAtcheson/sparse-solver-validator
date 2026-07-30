@@ -148,6 +148,12 @@ fn fast_commit(args: &CommonInputArgs, precommitment_path: &Path) -> Result<()> 
     );
     println!("solution_elements={}", report.logical_len);
     println!("codeword_elements={}", report.codeword_len);
+    println!(
+        "commitment_material_preparations={}",
+        report.material_preparations
+    );
+    println!("commitment_rows_scanned={}", report.rows_scanned);
+    println!("commitment_nonzeros_scanned={}", report.nonzeros_scanned);
     println!("precommitment_file={}", precommitment_path.display());
     Ok(())
 }
@@ -179,6 +185,10 @@ fn print_fast_prover_report(report: &FastProverReport) {
     println!(
         "recursive_query_trajectories={}",
         report.proximity_queries_per_round
+    );
+    println!(
+        "prover_material_preparations={}",
+        report.material_preparations
     );
     println!("prover_rows_scanned={}", report.rows_scanned);
     println!("prover_nonzeros_scanned={}", report.nonzeros_scanned);

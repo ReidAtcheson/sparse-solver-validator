@@ -325,14 +325,25 @@ impl From<FastPrecommitment> for FastProverContext {
     }
 }
 
+/// Work and identity reported by one standalone precommitment operation.
+///
+/// A separately invoked proof reports its own recomputation and scans; staged
+/// end-to-end accounting is the sum of the two reports.
 #[derive(Clone, Debug)]
 pub struct FastCommitmentReport {
     pub precommitment_digest: Digest,
     pub packed_codeword_root: MerkleRoot,
     pub logical_len: usize,
     pub codeword_len: usize,
+    pub material_preparations: u64,
+    pub rows_scanned: u64,
+    pub nonzeros_scanned: u64,
 }
 
+/// Work and identity reported by one proof-producing operation.
+///
+/// Counters cover the selected call: either the complete one-step operation or
+/// the standalone proof phase, including its mandatory material recomputation.
 #[derive(Clone, Debug)]
 pub struct FastProverReport {
     pub payload_digest: Digest,
@@ -343,6 +354,7 @@ pub struct FastProverReport {
     pub proximity_queries_per_round: u32,
     pub squared_l2_claim: f64,
     pub payload_bytes: usize,
+    pub material_preparations: u64,
     pub rows_scanned: u64,
     pub nonzeros_scanned: u64,
 }
@@ -489,6 +501,37 @@ struct PreparedMaterial {
     root: MerkleRoot,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FastProverWork {
+    material_preparations: u64,
+    rows_scanned: u64,
+    nonzeros_scanned: u64,
+}
+
+impl FastProverWork {
+    fn record_material_preparation(&mut self, problem: &GeneratedProblem) -> Result<(), FastError> {
+        self.material_preparations = self
+            .material_preparations
+            .checked_add(1)
+            .ok_or(FastError::ResourceLimit)?;
+        self.record_sparse_scan(problem)
+    }
+
+    fn record_sparse_scan(&mut self, problem: &GeneratedProblem) -> Result<(), FastError> {
+        self.rows_scanned = self
+            .rows_scanned
+            .checked_add(u64::try_from(problem.dimension()).map_err(|_| FastError::ResourceLimit)?)
+            .ok_or(FastError::ResourceLimit)?;
+        self.nonzeros_scanned = self
+            .nonzeros_scanned
+            .checked_add(
+                u64::try_from(problem.structural_nnz()).map_err(|_| FastError::ResourceLimit)?,
+            )
+            .ok_or(FastError::ResourceLimit)?;
+        Ok(())
+    }
+}
+
 struct MatVecTables {
     compressed_columns: Vec<f64>,
     solution: Vec<f64>,
@@ -526,6 +569,19 @@ struct DecodedPreflight<'a> {
 }
 
 impl FastBackend {
+    /// Constructs a complete local proof while preparing private material once.
+    ///
+    /// The commitment is still fixed before any Fiat--Shamir challenge. Unlike
+    /// the checkpointable [`ValidationBackend::prove`] path, this operation
+    /// retains its private buffers between commitment and proof construction
+    /// because both phases execute in the same process.
+    pub fn prove_single_stage(
+        statement: &PublicStatement,
+        solution: &Solution,
+    ) -> Result<(Vec<u8>, FastProverReport), FastError> {
+        prove_single_stage_backend(statement, solution)
+    }
+
     /// Fixes the packed oracle before any Fiat--Shamir challenge is derived.
     ///
     /// Proof construction remains a separate deterministic stage so callers
@@ -606,24 +662,29 @@ fn commit_backend(
     statement: &PublicStatement,
     solution: &Solution,
 ) -> Result<(FastPrecommitment, FastCommitmentReport), FastError> {
-    validate_prover_statement(statement)?;
-    let material = prepare_material(statement.generated(), solution)?;
-    let evaluator =
-        EvaluatorBinding::from_metadata(statement.generated().public_evaluation_plan().metadata())?;
-    let commitment = make_precommitment(
-        statement.transcript_digest(),
-        statement.problem_digest(),
-        statement.manifest_digest(),
-        evaluator,
-        &material,
-    )?;
+    let mut work = FastProverWork::default();
+    let material = prepare_statement_material(statement, solution, &mut work)?;
+    let commitment = make_statement_precommitment(statement, &material)?;
     let report = FastCommitmentReport {
         precommitment_digest: commitment.digest(),
         packed_codeword_root: commitment.packed_codeword_root,
         logical_len: commitment.logical_len(),
         codeword_len: commitment.codeword_len,
+        material_preparations: work.material_preparations,
+        rows_scanned: work.rows_scanned,
+        nonzeros_scanned: work.nonzeros_scanned,
     };
     Ok((commitment, report))
+}
+
+fn prove_single_stage_backend(
+    statement: &PublicStatement,
+    solution: &Solution,
+) -> Result<(Vec<u8>, FastProverReport), FastError> {
+    let mut work = FastProverWork::default();
+    let material = prepare_statement_material(statement, solution, &mut work)?;
+    let commitment = make_statement_precommitment(statement, &material)?;
+    prove_prepared(statement, material, &commitment, work)
 }
 
 fn prove_backend(
@@ -631,19 +692,22 @@ fn prove_backend(
     solution: &Solution,
     context: &FastProverContext,
 ) -> Result<(Vec<u8>, FastProverReport), FastError> {
-    validate_prover_statement(statement)?;
-    let material = prepare_material(statement.generated(), solution)?;
+    let mut work = FastProverWork::default();
+    let material = prepare_statement_material(statement, solution, &mut work)?;
     let commitment = context.commitment();
-    let expected = make_precommitment(
-        statement.transcript_digest(),
-        statement.problem_digest(),
-        statement.manifest_digest(),
-        EvaluatorBinding::from_metadata(statement.generated().public_evaluation_plan().metadata())?,
-        &material,
-    )?;
+    let expected = make_statement_precommitment(statement, &material)?;
     if commitment != &expected {
         return Err(FastError::PrecommitmentMismatch);
     }
+    prove_prepared(statement, material, commitment, work)
+}
+
+fn prove_prepared(
+    statement: &PublicStatement,
+    material: PreparedMaterial,
+    commitment: &FastPrecommitment,
+    mut work: FastProverWork,
+) -> Result<(Vec<u8>, FastProverReport), FastError> {
     let mut transcript = initialize_transcript(commitment)?;
 
     // The norm endpoint is reused as the row-compression point, authenticating
@@ -686,6 +750,7 @@ fn prove_backend(
         statement.generated(),
         &material.solution,
         &norm_endpoint.point,
+        &mut work,
     )?;
     let (matvec_sumcheck, matvec_endpoint) = prove_product_owned(
         matvec_tables.compressed_columns,
@@ -805,16 +870,6 @@ fn prove_backend(
     if payload.len() > MAX_PROOF_BYTES {
         return Err(FastError::ResourceLimit);
     }
-    // Proof construction scans rows once for binary64 R and once for the
-    // compressed matvec table.
-    let rows_scanned = u64::try_from(material.logical_len)
-        .map_err(|_| FastError::ResourceLimit)?
-        .checked_mul(2)
-        .ok_or(FastError::ResourceLimit)?;
-    let nonzeros_scanned = u64::try_from(statement.generated().structural_nnz())
-        .map_err(|_| FastError::ResourceLimit)?
-        .checked_mul(2)
-        .ok_or(FastError::ResourceLimit)?;
     let report = FastProverReport {
         payload_digest: domain_separated_digest(PAYLOAD_DIGEST_DOMAIN, &payload),
         precommitment_digest: commitment.digest(),
@@ -824,8 +879,9 @@ fn prove_backend(
         proximity_queries_per_round: query_plan.indices.len() as u32,
         squared_l2_claim: residual_squared_l2,
         payload_bytes: payload.len(),
-        rows_scanned,
-        nonzeros_scanned,
+        material_preparations: work.material_preparations,
+        rows_scanned: work.rows_scanned,
+        nonzeros_scanned: work.nonzeros_scanned,
     };
     Ok((payload, report))
 }
@@ -1140,6 +1196,28 @@ fn validate_length(logical_len: usize) -> Result<(), FastError> {
     Ok(())
 }
 
+fn prepare_statement_material(
+    statement: &PublicStatement,
+    solution: &Solution,
+    work: &mut FastProverWork,
+) -> Result<PreparedMaterial, FastError> {
+    validate_prover_statement(statement)?;
+    prepare_material(statement.generated(), solution, work)
+}
+
+fn make_statement_precommitment(
+    statement: &PublicStatement,
+    material: &PreparedMaterial,
+) -> Result<FastPrecommitment, FastError> {
+    make_precommitment(
+        statement.transcript_digest(),
+        statement.problem_digest(),
+        statement.manifest_digest(),
+        EvaluatorBinding::from_metadata(statement.generated().public_evaluation_plan().metadata())?,
+        material,
+    )
+}
+
 fn make_precommitment(
     statement_digest: Digest,
     problem_digest: Digest,
@@ -1176,6 +1254,7 @@ fn make_precommitment(
 fn prepare_material(
     problem: &GeneratedProblem,
     solution: &Solution,
+    work: &mut FastProverWork,
 ) -> Result<PreparedMaterial, FastError> {
     let logical_len = problem.dimension();
     validate_length(logical_len)?;
@@ -1212,6 +1291,7 @@ fn prepare_material(
     }
     let label = oracle_tree_label(0, codeword.evaluations().len());
     let root = complex_root(&label, codeword.evaluations())?;
+    work.record_material_preparation(problem)?;
     Ok(PreparedMaterial {
         logical_len,
         padded_len,
@@ -1248,6 +1328,7 @@ fn prepare_matvec_tables(
     problem: &GeneratedProblem,
     solution: &[f64],
     row_point: &[f64],
+    work: &mut FastProverWork,
 ) -> Result<MatVecTables, FastError> {
     let table_len = problem.dimension().next_power_of_two();
     if row_point.len() != table_len.ilog2() as usize || solution.len() != problem.dimension() {
@@ -1262,6 +1343,7 @@ fn prepare_matvec_tables(
                 canonical_protocol_float(compressed_columns[entry.column] + product)?;
         }
     }
+    work.record_sparse_scan(problem)?;
     Ok(MatVecTables {
         compressed_columns,
         solution: pad_vector(solution, table_len),
@@ -2328,7 +2410,12 @@ mod tests {
             Err(ssv_relation::RelationError::WitnessOutOfRange { index: 0 })
         ));
 
-        let material = prepare_material(statement.generated(), &solution).unwrap();
+        let material = prepare_material(
+            statement.generated(),
+            &solution,
+            &mut FastProverWork::default(),
+        )
+        .unwrap();
         assert!(
             material
                 .solution
@@ -2350,7 +2437,12 @@ mod tests {
         let fixed = ssv_relation::FixedWitness::from_solution(&solution, 8).unwrap();
         assert!(fixed.as_slice().iter().all(|&candidate| candidate == 0));
 
-        let material = prepare_material(statement.generated(), &solution).unwrap();
+        let material = prepare_material(
+            statement.generated(),
+            &solution,
+            &mut FastProverWork::default(),
+        )
+        .unwrap();
         assert!(
             material
                 .solution
@@ -2366,6 +2458,63 @@ mod tests {
         let context = FastProverContext::new(commitment);
         let (payload, _) = FastBackend::prove(&statement, &solution, &context).unwrap();
         FastBackend::verify(&statement.verifier_statement(), &payload).unwrap();
+    }
+
+    #[test]
+    fn one_step_reuses_material_and_matches_staged_bytes_and_work() {
+        let (statement, solution) = fixture(8, 2);
+        let (one_step_payload, one_step_report) =
+            FastBackend::prove_single_stage(&statement, &solution).unwrap();
+
+        let (commitment, commitment_report) = FastBackend::commit(&statement, &solution).unwrap();
+        let context = FastProverContext::new(commitment.clone());
+        let (staged_payload, staged_report) =
+            FastBackend::prove(&statement, &solution, &context).unwrap();
+
+        let (one_step_commitment, one_step_proof) =
+            decode_backend_payload(&one_step_payload).unwrap();
+        let (staged_commitment, staged_proof) = decode_backend_payload(&staged_payload).unwrap();
+        assert_eq!(one_step_commitment.to_bytes(), commitment.to_bytes());
+        assert_eq!(staged_commitment.to_bytes(), commitment.to_bytes());
+        assert_eq!(one_step_proof, staged_proof);
+        assert_eq!(one_step_payload, staged_payload);
+
+        let rows = statement.generated().dimension() as u64;
+        let nonzeros = statement.generated().structural_nnz() as u64;
+        assert_eq!(one_step_report.material_preparations, 1);
+        assert_eq!(one_step_report.rows_scanned, 2 * rows);
+        assert_eq!(one_step_report.nonzeros_scanned, 2 * nonzeros);
+
+        assert_eq!(commitment_report.material_preparations, 1);
+        assert_eq!(commitment_report.rows_scanned, rows);
+        assert_eq!(commitment_report.nonzeros_scanned, nonzeros);
+        assert_eq!(staged_report.material_preparations, 1);
+        assert_eq!(staged_report.rows_scanned, 2 * rows);
+        assert_eq!(staged_report.nonzeros_scanned, 2 * nonzeros);
+        assert_eq!(
+            commitment_report.material_preparations + staged_report.material_preparations,
+            2
+        );
+        assert_eq!(
+            commitment_report.rows_scanned + staged_report.rows_scanned,
+            3 * rows
+        );
+        assert_eq!(
+            commitment_report.nonzeros_scanned + staged_report.nonzeros_scanned,
+            3 * nonzeros
+        );
+    }
+
+    #[test]
+    fn staged_proving_recomputes_material_before_accepting_a_commitment() {
+        let (statement, solution) = fixture(8, 2);
+        let (commitment, _) = FastBackend::commit(&statement, &solution).unwrap();
+        let changed_solution = Solution::new(vec![0.0; 8], 8).unwrap();
+        let context = FastProverContext::new(commitment);
+        assert!(matches!(
+            FastBackend::prove(&statement, &changed_solution, &context),
+            Err(FastError::PrecommitmentMismatch)
+        ));
     }
 
     #[test]

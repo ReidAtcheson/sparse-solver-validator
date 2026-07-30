@@ -335,9 +335,11 @@ remain authoritative.
 Reads a finalized problem, validation manifest, and solver-owned `x` file.
 `prove` exhaustively dispatches direct, exact, and fast profiles and writes the
 same strict outer artifact format. For fast proofs it performs commitment and
-Fiat--Shamir completion inside one process. Local `fast-commit` and `fast-prove`
-commands retain those implementation stages for diagnostics and separate
-process-memory benchmarks; neither contacts an issuer.
+Fiat--Shamir completion inside one process while retaining one prepared private
+material bundle. Local `fast-commit` and `fast-prove` commands retain those
+implementation stages for diagnostics and separate process-memory benchmarks;
+the latter recomputes and validates material against the persisted
+precommitment, and neither command contacts an issuer.
 
 ### `sparse-validator`
 

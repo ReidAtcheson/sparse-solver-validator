@@ -134,7 +134,10 @@ cargo run --release -p sparse-validator -- verify \
 `fast-commit` and `fast-prove` remain available as local diagnostic stages for
 separate process-memory measurements. They use the same noninteractive
 Fiat--Shamir transcript and never contact an issuer; ordinary users should use
-the one-step `prove` command.
+the one-step `prove` command. One-step proving retains its prepared private
+material between commitment and proof construction. The staged commands
+deliberately recompute and validate that material across the process boundary
+and report each phase's scan counters separately.
 
 The fast validator hard-fails malformed encodings, transcript mismatches,
 invalid Merkle openings, and other exact relations. Approximate binary64
