@@ -89,7 +89,7 @@ pub fn prove_single_stage(
                 <ExactBackend as ValidationBackend>::prove(statement, solution, &())?;
             Ok((payload, BackendProverReport::Exact(report)))
         }
-        ProofProtocol::FastBinary64UnitCircleV4 => {
+        ProofProtocol::FastBinary64UnitCircleV5 => {
             let (commitment, _) = FastBackend::commit(statement, solution)?;
             let context = FastProverContext::new(commitment);
             let (payload, report) =
@@ -116,7 +116,7 @@ pub fn verify_with_cancellation(
         ProofProtocol::WhirField192L2V4 => Ok(BackendVerifierReport::Exact(
             prelude.verify_with_cancellation::<ExactBackend>(cancellation)?,
         )),
-        ProofProtocol::FastBinary64UnitCircleV4 => Ok(BackendVerifierReport::Fast(Box::new(
+        ProofProtocol::FastBinary64UnitCircleV5 => Ok(BackendVerifierReport::Fast(Box::new(
             prelude.verify_with_cancellation::<FastBackend>(cancellation)?,
         ))),
     }
@@ -128,7 +128,7 @@ impl BackendVerifierReport {
         match self {
             Self::Direct(_) => ProofProtocol::DirectReferenceV1,
             Self::Exact(_) => ProofProtocol::WhirField192L2V4,
-            Self::Fast(_) => ProofProtocol::FastBinary64UnitCircleV4,
+            Self::Fast(_) => ProofProtocol::FastBinary64UnitCircleV5,
         }
     }
 

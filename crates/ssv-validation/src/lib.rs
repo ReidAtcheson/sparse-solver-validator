@@ -33,7 +33,7 @@ const ARTIFACT_DIGEST_DOMAIN: &[u8] = b"sparse-solve/proof-artifact/v1";
 const REGISTERED_PROTOCOLS: &[ProofProtocol] = &[
     ProofProtocol::DirectReferenceV1,
     ProofProtocol::WhirField192L2V4,
-    ProofProtocol::FastBinary64UnitCircleV4,
+    ProofProtocol::FastBinary64UnitCircleV5,
 ];
 
 pub const MAX_PUBLIC_STATEMENT_BYTES: usize = 1024 * 1024;
@@ -760,7 +760,7 @@ mod tests {
         type VerifierReport = ();
         type Error = Infallible;
 
-        const PROTOCOL: ProofProtocol = ProofProtocol::FastBinary64UnitCircleV4;
+        const PROTOCOL: ProofProtocol = ProofProtocol::FastBinary64UnitCircleV5;
 
         fn prove(
             _statement: &PublicStatement,
@@ -939,7 +939,7 @@ mod tests {
         for protocol in [
             ProofProtocol::DirectReferenceV1,
             ProofProtocol::WhirField192L2V4,
-            ProofProtocol::FastBinary64UnitCircleV4,
+            ProofProtocol::FastBinary64UnitCircleV5,
         ] {
             let statement = statement(protocol);
             let encoded = encode_artifact(&statement, &[1, 2, 3]).unwrap();
@@ -976,7 +976,7 @@ mod tests {
             Err(BackendVerificationError::ProtocolMismatch(
                 BackendProtocolMismatch {
                     artifact_protocol: ProofProtocol::WhirField192L2V4,
-                    backend_protocol: ProofProtocol::FastBinary64UnitCircleV4,
+                    backend_protocol: ProofProtocol::FastBinary64UnitCircleV5,
                 }
             ))
         ));

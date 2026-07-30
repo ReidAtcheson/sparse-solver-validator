@@ -22,7 +22,7 @@ fn service_config() -> ServiceConfig {
         allowed_protocols: vec![
             ProofProtocol::DirectReferenceV1,
             ProofProtocol::WhirField192L2V4,
-            ProofProtocol::FastBinary64UnitCircleV4,
+            ProofProtocol::FastBinary64UnitCircleV5,
         ],
         validator_build: "integration-test-build".to_owned(),
     }
@@ -309,10 +309,10 @@ fn every_disallowed_protocol_is_rejected_before_backend_verification() {
         ),
         (
             ProofProtocol::WhirField192L2V4,
-            vec![ProofProtocol::FastBinary64UnitCircleV4],
+            vec![ProofProtocol::FastBinary64UnitCircleV5],
         ),
         (
-            ProofProtocol::FastBinary64UnitCircleV4,
+            ProofProtocol::FastBinary64UnitCircleV5,
             vec![ProofProtocol::DirectReferenceV1],
         ),
     ] {
@@ -534,7 +534,7 @@ fn hosted_fast_and_exact_followup_share_the_signed_problem_header() {
         .finalize_with_challenge_context(&problem_challenge.payload_canonical_bytes())
         .unwrap();
     let fast_manifest = ValidationManifest {
-        protocol: ProofProtocol::FastBinary64UnitCircleV4,
+        protocol: ProofProtocol::FastBinary64UnitCircleV5,
         max_solution_elements: 1_024,
         ..ValidationManifest::default()
     };

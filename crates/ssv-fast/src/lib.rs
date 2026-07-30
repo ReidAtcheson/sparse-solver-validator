@@ -30,14 +30,12 @@ pub mod unit_circle;
 pub use backend::{
     FastBackend, FastCommitmentReport, FastDiagnosticLocation, FastDiagnosticObservation,
     FastError, FastPrecommitment, FastPreflight, FastProverContext, FastProverReport,
-    FastPublicEvaluationDiagnostics, FastSourceDigests, FastVerifierDiagnostics,
-    FastVerifierReport, FastVerifierWork,
+    FastPublicEvaluationDiagnostics, FastVerifierDiagnostics, FastVerifierReport, FastVerifierWork,
 };
 pub use ssv_problem::F64RoundoffDiagnostics;
 
 pub use float_contract::{
     FloatContractError, canonical_bits, canonicalize_source, decode_canonical_bits,
-    i128_vector_digest, vector_digest,
 };
 pub use merkle::{
     ComplexMultiProof, MerkleError, MerkleRoot, complex_multiproof_frontier_len,

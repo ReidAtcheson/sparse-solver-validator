@@ -85,32 +85,6 @@ pub fn canonicalize_arithmetic(value: f64) -> Result<f64, FloatContractError> {
     }
 }
 
-/// Hashes a canonical binary64 vector with its semantic label and length.
-pub fn vector_digest(label: &[u8], values: &[f64]) -> Result<[u8; 32], FloatContractError> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"sparse-solution/fast-validation/source-vector/v1\0");
-    hasher.update(&(label.len() as u64).to_le_bytes());
-    hasher.update(label);
-    hasher.update(&(values.len() as u64).to_le_bytes());
-    for &value in values {
-        hasher.update(&canonical_bits(value)?.to_le_bytes());
-    }
-    Ok(*hasher.finalize().as_bytes())
-}
-
-/// Hashes an exact signed-integer source vector without dropping low bits.
-pub fn i128_vector_digest(label: &[u8], values: &[i128]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"sparse-solution/fast-validation/i128-source-vector/v1\0");
-    hasher.update(&(label.len() as u64).to_le_bytes());
-    hasher.update(label);
-    hasher.update(&(values.len() as u64).to_le_bytes());
-    for &value in values {
-        hasher.update(&value.to_le_bytes());
-    }
-    *hasher.finalize().as_bytes()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,23 +120,5 @@ mod tests {
             canonicalize_arithmetic(f64::INFINITY),
             Err(FloatContractError::NonFiniteArithmetic)
         );
-    }
-
-    #[test]
-    fn vector_digest_binds_label_length_order_and_bits() {
-        let baseline = vector_digest(b"x", &[1.0, 2.0]).unwrap();
-        assert_ne!(baseline, vector_digest(b"r", &[1.0, 2.0]).unwrap());
-        assert_ne!(baseline, vector_digest(b"x", &[2.0, 1.0]).unwrap());
-        assert_ne!(baseline, vector_digest(b"x", &[1.0]).unwrap());
-        assert_eq!(
-            vector_digest(b"x", &[0.0]).unwrap(),
-            vector_digest(b"x", &[-0.0]).unwrap()
-        );
-    }
-
-    #[test]
-    fn integer_vector_digest_preserves_low_witness_bits() {
-        let baseline = i128_vector_digest(b"x", &[1_i128 << 64]);
-        assert_ne!(baseline, i128_vector_digest(b"x", &[(1_i128 << 64) + 1]));
     }
 }

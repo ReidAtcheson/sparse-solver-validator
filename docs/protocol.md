@@ -29,7 +29,7 @@ Three proof kinds are registered:
 | --- | --- | ---: | ---: |
 | `direct-reference-v1` | Independent binary64 relation computation | yes | yes |
 | `whir-field192-l2-v4` | Exact integer statement for Q63.64 `x` | no | no |
-| `fast-binary64-unit-circle-v4` | Provisional sampled metric diagnostics | no | no |
+| `fast-binary64-unit-circle-v5` | Provisional sampled metric diagnostics | no | no |
 
 The direct profile is not succinct. The exact and fast profiles receive a
 restricted verifier statement with the registered public-MLE evaluator but no
@@ -375,15 +375,19 @@ queries and materializes zero solution or residual elements.
 
 ### 9.1 Semantics and floating contract
 
-`fast-binary64-unit-circle-v4` is a provisional metric certificate. It applies
-the exact path's one-time Q63.64 witness conversion, converts that witness back
-to binary64 deterministically, and computes `R = Ax-b` under a frozen binary64
-policy. Solver input rejects negative zero; internal source normalization maps
-either arithmetic zero sign to positive zero, while transcript decoders reject a
-negative-zero encoding. NaN, infinity, and source/transcript subnormals are
-rejected. Protocol arithmetic rejects non-finite results and flushes subnormal
-results to positive zero. The operation order is fixed and does not silently
-introduce FMA.
+`fast-binary64-unit-circle-v5` is a provisional metric certificate. It applies
+directly to the solver's canonical binary64 `x` and computes `R = Ax-b` under a
+frozen binary64 policy. It imposes no Q63.64 range, grid, or cross-profile
+witness-identity requirement. Solver input rejects negative zero; internal
+source normalization maps either arithmetic zero sign to positive zero, while
+transcript decoders reject a negative-zero encoding. NaN, infinity, and
+source/transcript subnormals are rejected. Protocol arithmetic rejects
+non-finite results and flushes subnormal results to positive zero. The operation
+order is fixed and does not silently introduce FMA.
+
+Version 5 deliberately retires version 4 rather than reinterpreting its proof
+bytes. Version-4 manifest names, wire discriminator 5, and source-digest-bearing
+inner framing are rejected; clients must regenerate fast manifests and proofs.
 
 The profile pads `x` and `R` to `N = next_power_of_two(n)` and packs:
 
@@ -397,10 +401,11 @@ W = [x_0, ..., x_(N-1), R_0, ..., R_(N-1)].
 many complex roots of unity as coefficients. The resulting rate-one-half
 unit-circle codeword is committed with a BLAKE3 Merkle root.
 
-The strict precommitment binds the statement, problem, manifest,
-public-evaluator metadata, numerical policy, code basis, source digests, shapes,
-and packed codeword root before the first algebraic challenge. Source digests
-are linkage metadata; the root plus opening protocol supplies proof binding.
+The strict precommitment binds the statement, problem, manifest, typed
+public-evaluator version and metadata, numerical policy, code basis, shapes, and
+packed codeword root before the first algebraic challenge. It contains no
+prover-asserted source digests: the authenticated root and opening protocol are
+the fast witness binding.
 
 ### 9.3 Noninteractive challenge derivation
 
@@ -409,7 +414,7 @@ canonical precommitment and public statement. Each challenge is then derived by
 Fiat--Shamir only after absorbing every message on which it depends:
 
 ```text
-precommitment = H(statement, policy, shapes, source digests, packed root)
+precommitment = H(statement, evaluator, policy, shapes, packed root)
 challenge_0   = FS(precommitment, first claim)
 challenge_k   = FS(all transcript messages through round k)
 ```
@@ -426,7 +431,9 @@ short header lifetimes, issuance and submission quotas, per-principal rate
 limits, and audit logs can constrain service abuse, but cannot prove that only
 one local commitment was attempted. Fast remains a provisional metric result.
 An exact proof for the same finalized problem and signed header is the assurance
-follow-up when exact field soundness is required.
+follow-up when exact field soundness is required. It proves a separately
+quantized Q63.64 witness; neither profile claims that its private `x` is
+identical to the other's.
 
 ### 9.4 Proof schedule
 
