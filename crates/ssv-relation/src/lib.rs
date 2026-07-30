@@ -1,11 +1,9 @@
 //! Proof-system-independent semantics of the canonical fixed-point relation.
 //!
-//! A solver may operate however it likes, but succinct backends first round its
+//! A solver may operate however it likes, but the exact backend rounds its
 //! binary64 output once to signed Q63.64. Matrix and RHS values remain exact
-//! dyadics. The exact backend consumes the bounded integer residual relation;
-//! the fast backend shares only [`FixedWitness`] quantization before computing
-//! its own frozen binary64 residual. This crate contains no transcript or
-//! commitment code.
+//! dyadics. This crate owns the bounded integer residual relation and contains
+//! no transcript or commitment code.
 
 #![forbid(unsafe_code)]
 
@@ -83,16 +81,6 @@ impl FixedWitness {
     #[must_use]
     pub const fn as_slice(&self) -> &[i128] {
         &self.values
-    }
-
-    /// Frozen conversion used by the experimental binary64 backend.
-    #[must_use]
-    pub fn to_binary64(&self) -> Vec<f64> {
-        const SCALE: f64 = 18_446_744_073_709_551_616.0;
-        self.values
-            .iter()
-            .map(|&value| value as f64 / SCALE)
-            .collect()
     }
 }
 
@@ -270,7 +258,9 @@ fn binary64_to_q63_64(value: f64) -> Option<i128> {
     let unbiased_exponent = exponent_bits - 1023;
     let shift = unbiased_exponent + 12;
     let magnitude = if shift >= 0 {
-        significand.checked_shl(u32::try_from(shift).ok()?)?
+        let shift = u32::try_from(shift).ok()?;
+        let scale = 1_u128.checked_shl(shift)?;
+        significand.checked_mul(scale)?
     } else {
         let right = u32::try_from(-shift).ok()?;
         if right >= 128 {
@@ -359,6 +349,8 @@ mod tests {
             assert_eq!(binary64_to_q63_64(value), Some(expected));
         }
         assert_eq!(binary64_to_q63_64(2.0_f64.powi(63)), None);
+        assert_eq!(binary64_to_q63_64(2.0_f64.powi(70)), None);
+        assert_eq!(binary64_to_q63_64(-2.0_f64.powi(70)), None);
         assert_eq!(binary64_to_q63_64(-2.0_f64.powi(63)), Some(i128::MIN));
     }
 
@@ -370,7 +362,13 @@ mod tests {
         assert!(relation.residuals().iter().all(|&value| value == 0));
         assert!(relation.squared_l2_numerator().is_zero());
         assert_eq!(relation.squared_l2_denominator_power(), 136);
-        assert_eq!(relation.witness().to_binary64(), vec![1.0; 17]);
+        assert!(
+            relation
+                .witness()
+                .as_slice()
+                .iter()
+                .all(|&value| value == 1_i128 << 64)
+        );
     }
 
     #[test]

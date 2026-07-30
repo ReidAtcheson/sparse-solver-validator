@@ -2,7 +2,7 @@
 
 Status: research proposal; non-normative.
 
-Scope: a possible successor to `fast-binary64-unit-circle-v4` and diagnostic
+Scope: a possible successor to `fast-binary64-unit-circle-v5` and diagnostic
 policy 3. Nothing in this document upgrades the guarantees of the current
 profile, `fast-binary64-diagnostics-v1` score, or
 `sparse-solve/validation-certificate/v4` certificate.
@@ -37,14 +37,14 @@ with a robust numerical unit-circle proximity argument.
 
 The central engineering conclusion is:
 
-> The current provenance is close to the input of a global theorem, but the
-> current single MLE consistency point and signed aggregate fold summaries are
-> not yet sufficient for a useful distribution-free residual interval.
+> The current verifier evidence is close to the input of a global theorem, but
+> the current single MLE consistency point and signed aggregate fold summaries
+> are not yet sufficient for a useful distribution-free residual interval.
 
 ## 2. Current fast-path statement and evidence
 
-The current fast profile constructs a once-quantized Q63.64 witness, converts
-it to the frozen binary64 representation, computes a candidate residual, and
+The current fast profile preserves the submitted canonical binary64 solution,
+computes a candidate residual under its frozen floating-point contract, and
 packs
 
 ```text
@@ -95,24 +95,23 @@ existence and required uniqueness/stability of that real packed message
 `W = [X || R]`. The present Merkle root directly commits a complex evaluation
 oracle, not an already decoded real message.
 
-The honest current prover constructs `X` from the once-quantized Q63.64
-witness. A global theorem must not infer that fact merely from the source
-digest: the digest is linkage metadata, while the root and opening bind the
-proof to the packed oracle. A theorem specifically about the Q63.64 witness
-therefore needs an additional quantization/range binding, or it must state that
-the committed binary64 `X` is its target.
+The authenticated root and opening bind the proof to the packed binary64 oracle.
+There is intentionally no claimed Q63.64 source digest or cross-profile witness
+identity. A theorem specifically about an exact-profile Q63.64 witness would
+therefore need a separate, explicit linkage mechanism; it must not infer one
+from a shared public problem or challenge.
 
 This target separates three effects that should not be conflated:
 
 - transcript consistency between `Q`, `R`, `X`, `A`, and `b`;
 - binary64 roundoff in the prover and verifier; and
-- quantization distance between the original solver output and the
-  once-quantized witness used by the honest prover.
+- any canonicalization distance introduced at the documented solver-input
+  boundary.
 
 An alternative theorem may target the frozen rowwise binary64 computation
 `r_fl = fl(A X - b)`. That version needs a deterministic row-computation
 roundoff term connecting `r_fl` to `r_real`. A theorem about the original,
-pre-quantization solver vector additionally needs an explicit quantization
+pre-canonicalization solver output additionally needs an explicit input-error
 term. Neither extension should be implicit.
 
 ## 4. Candidate end-to-end theorem

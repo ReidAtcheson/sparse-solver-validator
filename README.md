@@ -17,9 +17,9 @@ numerical audit.
 
 > `direct-reference-v1` is not succinct and does not hide `x`.
 > `whir-field192-l2-v4` proves an exact integer statement about once-quantized
-> Q63.64 `x`. `fast-binary64-unit-circle-v4` is an experimental metric
-> certificate with no completed global numerical soundness theorem. None of the
-> profiles claims zero knowledge.
+> Q63.64 `x`. `fast-binary64-unit-circle-v5` operates on canonical binary64
+> `x` and is an experimental metric certificate with no completed global
+> numerical soundness theorem. None of the profiles claims zero knowledge.
 
 ## Workspace
 
@@ -27,7 +27,7 @@ numerical audit.
 - `ssv-problem`: templates, seed finalization, generators, certificates, and the
   generator-owned succinct matrix/RHS MLE evaluator
 - `ssv-solution`: strict binary64 solution-vector input
-- `ssv-relation`: shared Q63.64 conversion and exact integer residual relation
+- `ssv-relation`: exact-profile Q63.64 conversion and integer residual relation
 - `ssv-service-protocol`: manifests, signed problem challenges, and typed
   certificates
 - `ssv-validation`: common statements, restricted succinct-verifier view,
@@ -278,7 +278,10 @@ curl --fail --silent --show-error \
 
 The shared signed header fixes the same public `A,b`; the fast and exact
 manifests, proofs, and certificates remain distinct. Fast is intended as the
-provisional check-in, with exact validation as the assurance follow-up.
+provisional check-in, with exact validation as the assurance follow-up. Even
+when both proofs start from the same solver file, their certificates do not
+claim the same private witness: fast uses canonical binary64 values and exact
+uses the once-quantized Q63.64 witness.
 
 For Cloud Run, leave the host as `0.0.0.0` and let the platform set `PORT`.
 Clients connect to the service URL, never to `0.0.0.0`. This repository provides

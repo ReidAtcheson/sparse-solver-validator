@@ -45,11 +45,12 @@ is not a production security audit.
 3. Provers may scan generated sparse rows. Succinct validators may not scan rows
    or enumerate RHS entries; they receive only the generator-owned public-MLE
    capability.
-4. Exact and fast profiles share statements, generators, framing, Q63.64 witness
-   conversion, and selected algebraic primitives. The exact profile constructs
-   an integer residual; the fast profile recomputes its residual in binary64.
-   They do not share a misleading lowest-common-denominator arithmetic or
-   soundness claim.
+4. Exact and fast profiles share statements, generators, framing, and selected
+   algebraic primitives, but not private-witness semantics. The exact profile
+   quantizes to Q63.64 and constructs an integer residual; the fast profile
+   preserves canonical binary64 input and computes its residual in binary64.
+   They do not share a misleading lowest-common-denominator arithmetic,
+   witness-identity, or soundness claim.
 5. Every backend is an immutable, versioned verifier schedule. There is no
    prover-selected proof program.
 6. Network transport does not define proof semantics. Offline and hosted paths
@@ -220,7 +221,7 @@ the relation after receiving all of `x`.
 | `ssv-canonical` | Canonical big-endian encoding, bounded decoding, typed digests, and domain-separated BLAKE3 |
 | `ssv-problem` | Templates, seed derivation, generator compilation, sparse rows, certificates, and the shared succinct public-MLE plan |
 | `ssv-solution` | Strict solver-facing binary64 vector input and contiguous validated storage |
-| `ssv-relation` | Proof-independent Q63.64 witness conversion, exact integer residual relation, and no-wrap bounds; fast reuses the witness conversion but computes its own binary64 residual |
+| `ssv-relation` | Exact-profile Q63.64 witness conversion, integer residual relation, and no-wrap bounds |
 | `ssv-service-protocol` | Backend IDs, manifests, signed problem challenges, typed certificate scores, and Ed25519 verification |
 | `ssv-validation` | Backend-neutral public statements, restricted verifier statements, strict outer artifact framing, and backend lifecycle traits |
 | `ssv-direct` | Non-succinct artifact carrying `x` and independent streaming relation checker |
@@ -280,11 +281,11 @@ no-wrap metadata without row scans. The result is an exact residual numerator an
 dyadic denominator for Q63.64 `x`; it is not a proof about unrounded solver
 arithmetic and it does not claim zero knowledge.
 
-### 6.3 `fast-binary64-unit-circle-v4`
+### 6.3 `fast-binary64-unit-circle-v5`
 
-The fast profile converts the same Q63.64 witness back to a frozen binary64
-representation and computes `R = Ax-b` under its binary64 contract. It packs
-`W = [x || R]`, bit-reverses it into
+The fast profile preserves the solver's canonical binary64 `x` and computes
+`R = Ax-b` under its frozen binary64 contract. Q63.64 range and grid constraints
+are not part of this profile. It packs `W = [x || R]`, bit-reverses it into
 monomial-coefficient order, evaluates a rate-one-half complex unit-circle code,
 and commits its codeword with BLAKE3 Merkle trees.
 
@@ -409,9 +410,10 @@ The repository should maintain four complementary layers:
    float policy, Merkle frontiers, sumcheck rounds, and WHIR wrappers.
 2. **Generator equivalence:** public MLE evaluators match complete materialized
    scans at Boolean and non-Boolean points in exact and binary64 arithmetic.
-3. **Backend relations:** exact and fast honest proofs match the direct relation
-   on deterministic solutions; statement, message, root, opening, and trailing
-   byte mutations are rejected or, for allowed metric perturbations, scored.
+3. **Backend relations:** fast honest proofs match the direct frozen-binary64
+   relation, while exact fixtures match the independently computed Q63.64
+   relation; statement, message, root, opening, and trailing-byte mutations are
+   rejected or, for allowed metric perturbations, scored.
 4. **Succinctness regressions:** exact and fast verifier row-query and private
    materialization counters remain zero while public-evaluator work follows the
    registered period/logarithmic bound.

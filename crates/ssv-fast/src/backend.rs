@@ -21,7 +21,6 @@ use ssv_problem::{
     BooleanCoordinateOrder, F64RoundoffDiagnostics, GeneratedProblem, MleEvaluationError,
     PublicEvaluationMetadata, SuccinctPublicEvaluator,
 };
-use ssv_relation::{FixedWitness, RelationError};
 use ssv_service_protocol::ProofProtocol;
 use ssv_solution::Solution;
 use ssv_validation::{
@@ -31,7 +30,7 @@ use thiserror::Error;
 
 use crate::float_contract::{
     FloatContractError, canonical_bits, canonicalize_arithmetic, canonicalize_source,
-    decode_canonical_bits, i128_vector_digest, vector_digest,
+    decode_canonical_bits,
 };
 use crate::merkle::{
     ComplexMultiProof, MerkleError, MerkleRoot, streaming_complex_root,
@@ -50,37 +49,25 @@ use crate::transcript::{Transcript, TranscriptError};
 use crate::unit_circle::{ComplexValue, UnitCircleCodeword, UnitCircleError, fold_pair_at_index};
 
 const PRECOMMIT_MAGIC: &[u8; 8] = b"SSVFCM\0\0";
-const PRECOMMIT_VERSION: u16 = 5;
+const PRECOMMIT_VERSION: u16 = 6;
 const PAYLOAD_MAGIC: &[u8; 8] = b"SSVFST\0\0";
-const PAYLOAD_VERSION: u16 = 5;
-const PROOF_VERSION: u16 = 5;
+const PAYLOAD_VERSION: u16 = 6;
+const PROOF_VERSION: u16 = 6;
 const FINAL_FRAME: u16 = u16::MAX;
-const PRECOMMIT_DIGEST_DOMAIN: &[u8] = b"sparse-solve/fast-precommitment/v5";
-const PAYLOAD_DIGEST_DOMAIN: &[u8] = b"sparse-solve/fast-backend-payload/v5";
-const PROTOCOL_LABEL: &[u8] = b"sparse-solve/fast/coefficient-unit-circle-linear-opening/v5";
-const PUBLIC_EVALUATOR_ID: &[u8] = b"ssv-problem/succinct-public-evaluator/msb-mle/v1";
+const PRECOMMIT_DIGEST_DOMAIN: &[u8] = b"sparse-solve/fast-precommitment/v6";
+const PAYLOAD_DIGEST_DOMAIN: &[u8] = b"sparse-solve/fast-backend-payload/v6";
+const PROTOCOL_LABEL: &[u8] = b"sparse-solve/fast/coefficient-unit-circle-linear-opening/v6";
 const FLOAT_CONTRACT: &[u8] =
     b"binary64/rne/no-fma/reject-nan-inf-negzero-subnormal/unit-circle-coeff/v2";
 const CODE_BASIS: &[u8] =
     b"packed-[x||R]/msb-mle/bit-reversed-monomial-coefficients/unit-circle-rate-1/2";
-const ORACLE_TREE_LABEL: &[u8] = b"ssv-fast/v5/packed-unit-circle-oracle";
+const ORACLE_TREE_LABEL: &[u8] = b"ssv-fast/v6/packed-unit-circle-oracle";
 const MAX_PRECOMMITMENT_BYTES: usize = 4096;
 const MAX_PROOF_BYTES: usize = ssv_validation::MAX_SUCCINCT_PAYLOAD_BYTES;
 
-/// Digests of the exact and binary64 sources used to create the packed oracle.
-///
-/// They are statement/linkage metadata. Soundness of the query-only verifier
-/// comes from the packed root and the linear opening, not from trusting these
-/// digest labels.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FastSourceDigests {
-    pub exact_witness: [u8; 32],
-    pub binary64_solution: [u8; 32],
-    pub binary64_residual: [u8; 32],
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EvaluatorBinding {
+    evaluator_version: u16,
     logical_dimension: usize,
     padded_dimension: usize,
     variables: usize,
@@ -94,10 +81,13 @@ struct EvaluatorBinding {
 
 impl EvaluatorBinding {
     fn from_metadata(metadata: PublicEvaluationMetadata) -> Result<Self, FastError> {
-        if metadata.domain.coordinate_order != BooleanCoordinateOrder::MostSignificantFirst {
+        if metadata.evaluator_version == 0
+            || metadata.domain.coordinate_order != BooleanCoordinateOrder::MostSignificantFirst
+        {
             return Err(FastError::TranscriptShape);
         }
         Ok(Self {
+            evaluator_version: metadata.evaluator_version,
             logical_dimension: metadata.domain.logical_dimension,
             padded_dimension: metadata.domain.padded_dimension,
             variables: metadata.domain.variables,
@@ -113,6 +103,7 @@ impl EvaluatorBinding {
     }
 
     fn encode(&self, output: &mut Encoder) -> Result<(), FastError> {
+        output.write_u16(self.evaluator_version);
         write_usize(output, self.logical_dimension)?;
         write_usize(output, self.padded_dimension)?;
         write_usize(output, self.variables)?;
@@ -128,6 +119,7 @@ impl EvaluatorBinding {
 
     fn decode(input: &mut Reader<'_>) -> Result<Self, FastError> {
         let result = Self {
+            evaluator_version: input.read_u16().map_err(framing)?,
             logical_dimension: read_usize(input)?,
             padded_dimension: read_usize(input)?,
             variables: read_usize(input)?,
@@ -143,7 +135,8 @@ impl EvaluatorBinding {
             maximum_absolute_row_sum_mantissa: input.read_u64().map_err(framing)?,
             maximum_absolute_rhs_mantissa: input.read_u64().map_err(framing)?,
         };
-        if result.logical_dimension < 2
+        if result.evaluator_version == 0
+            || result.logical_dimension < 2
             || result.logical_dimension.checked_next_power_of_two() != Some(result.padded_dimension)
             || result.variables != result.padded_dimension.ilog2() as usize
             || result.matrix_period_terms == 0
@@ -165,7 +158,6 @@ pub struct FastPrecommitment {
     packed_source_len: usize,
     polynomial_degree: usize,
     codeword_len: usize,
-    sources: FastSourceDigests,
     packed_codeword_root: MerkleRoot,
 }
 
@@ -178,11 +170,6 @@ impl FastPrecommitment {
     #[must_use]
     pub const fn codeword_len(&self) -> usize {
         self.codeword_len
-    }
-
-    #[must_use]
-    pub const fn source_digests(&self) -> FastSourceDigests {
-        self.sources
     }
 
     #[must_use]
@@ -206,7 +193,7 @@ impl FastPrecommitment {
         let mut output = Encoder::with_capacity(384);
         output.write_fixed_bytes(PRECOMMIT_MAGIC);
         output.write_u16(PRECOMMIT_VERSION);
-        output.write_u16(ProofProtocol::FastBinary64UnitCircleV4.wire_id());
+        output.write_u16(ProofProtocol::FastBinary64UnitCircleV5.wire_id());
         output.write_u16(policy.policy_id);
         output.write_u64(policy.norm_zero_scale_bits);
         output.write_u64(policy.matvec_zero_scale_bits);
@@ -216,16 +203,12 @@ impl FastPrecommitment {
         output.write_digest(&self.statement_digest);
         output.write_digest(&self.problem_digest);
         output.write_digest(&self.manifest_digest);
-        output.write_bytes(PUBLIC_EVALUATOR_ID);
         output.write_bytes(CODE_BASIS);
         output.write_bytes(FLOAT_CONTRACT);
         self.evaluator.encode(&mut output)?;
         write_usize(&mut output, self.packed_source_len)?;
         write_usize(&mut output, self.polynomial_degree)?;
         write_usize(&mut output, self.codeword_len)?;
-        output.write_fixed_bytes(&self.sources.exact_witness);
-        output.write_fixed_bytes(&self.sources.binary64_solution);
-        output.write_fixed_bytes(&self.sources.binary64_residual);
         output.write_fixed_bytes(&self.packed_codeword_root);
         output.write_u16(FINAL_FRAME);
         output.write_u16(PRECOMMIT_VERSION);
@@ -244,7 +227,7 @@ impl FastPrecommitment {
         }
         if input.read_u16().map_err(framing)? != PRECOMMIT_VERSION
             || input.read_u16().map_err(framing)?
-                != ProofProtocol::FastBinary64UnitCircleV4.wire_id()
+                != ProofProtocol::FastBinary64UnitCircleV5.wire_id()
         {
             return Err(FastError::UnsupportedVersion);
         }
@@ -272,9 +255,6 @@ impl FastPrecommitment {
         let statement_digest = input.read_digest().map_err(framing)?;
         let problem_digest = input.read_digest().map_err(framing)?;
         let manifest_digest = input.read_digest().map_err(framing)?;
-        if input.read_bytes().map_err(framing)? != PUBLIC_EVALUATOR_ID {
-            return Err(FastError::EvaluatorMismatch);
-        }
         if input.read_bytes().map_err(framing)? != CODE_BASIS
             || input.read_bytes().map_err(framing)? != FLOAT_CONTRACT
         {
@@ -284,11 +264,6 @@ impl FastPrecommitment {
         let packed_source_len = read_usize(&mut input)?;
         let polynomial_degree = read_usize(&mut input)?;
         let codeword_len = read_usize(&mut input)?;
-        let sources = FastSourceDigests {
-            exact_witness: input.read_array().map_err(framing)?,
-            binary64_solution: input.read_array().map_err(framing)?,
-            binary64_residual: input.read_array().map_err(framing)?,
-        };
         let packed_codeword_root = input.read_array().map_err(framing)?;
         if input.read_u16().map_err(framing)? != FINAL_FRAME
             || input.read_u16().map_err(framing)? != PRECOMMIT_VERSION
@@ -317,7 +292,6 @@ impl FastPrecommitment {
             packed_source_len,
             polynomial_degree,
             codeword_len,
-            sources,
             packed_codeword_root,
         })
     }
@@ -354,7 +328,6 @@ impl From<FastPrecommitment> for FastProverContext {
 #[derive(Clone, Debug)]
 pub struct FastCommitmentReport {
     pub precommitment_digest: Digest,
-    pub sources: FastSourceDigests,
     pub packed_codeword_root: MerkleRoot,
     pub logical_len: usize,
     pub codeword_len: usize,
@@ -364,7 +337,6 @@ pub struct FastCommitmentReport {
 pub struct FastProverReport {
     pub payload_digest: Digest,
     pub precommitment_digest: Digest,
-    pub sources: FastSourceDigests,
     pub packed_codeword_root: MerkleRoot,
     pub logical_len: usize,
     pub codeword_len: usize,
@@ -454,7 +426,6 @@ pub struct FastPublicEvaluationDiagnostics {
 pub struct FastVerifierReport {
     pub payload_digest: Digest,
     pub precommitment_digest: Digest,
-    pub sources: FastSourceDigests,
     pub packed_codeword_root: MerkleRoot,
     pub score: FastValidationScore,
     pub diagnostics: FastVerifierDiagnostics,
@@ -464,7 +435,7 @@ pub struct FastVerifierReport {
 
 #[derive(Debug, Error)]
 pub enum FastError {
-    #[error("fast backend requires fast-binary64-unit-circle-v4")]
+    #[error("fast backend requires fast-binary64-unit-circle-v5")]
     WrongProtocol,
     #[error("fast artifact has an unrecognized magic value")]
     BadMagic,
@@ -488,8 +459,6 @@ pub enum FastError {
     TranscriptShape,
     #[error("fast transcript contains an unexpected Merkle opening index")]
     UnexpectedOpeningIndex,
-    #[error("fixed relation failed: {0}")]
-    Relation(#[from] RelationError),
     #[error("binary64 contract failed: {0}")]
     Float(#[from] FloatContractError),
     #[error("unit-circle encoding failed: {0}")]
@@ -518,7 +487,6 @@ struct PreparedMaterial {
     packed: Vec<f64>,
     codeword: UnitCircleCodeword,
     root: MerkleRoot,
-    sources: FastSourceDigests,
 }
 
 struct MatVecTables {
@@ -603,7 +571,7 @@ impl ValidationBackend for FastBackend {
     type VerifierReport = FastVerifierReport;
     type Error = FastError;
 
-    const PROTOCOL: ProofProtocol = ProofProtocol::FastBinary64UnitCircleV4;
+    const PROTOCOL: ProofProtocol = ProofProtocol::FastBinary64UnitCircleV5;
 
     fn prove(
         statement: &PublicStatement,
@@ -651,7 +619,6 @@ fn commit_backend(
     )?;
     let report = FastCommitmentReport {
         precommitment_digest: commitment.digest(),
-        sources: commitment.sources,
         packed_codeword_root: commitment.packed_codeword_root,
         logical_len: commitment.logical_len(),
         codeword_len: commitment.codeword_len,
@@ -839,7 +806,7 @@ fn prove_backend(
         return Err(FastError::ResourceLimit);
     }
     // Proof construction scans rows once for binary64 R and once for the
-    // compressed matvec table. Q63.64 witness construction is row-free.
+    // compressed matvec table.
     let rows_scanned = u64::try_from(material.logical_len)
         .map_err(|_| FastError::ResourceLimit)?
         .checked_mul(2)
@@ -851,7 +818,6 @@ fn prove_backend(
     let report = FastProverReport {
         payload_digest: domain_separated_digest(PAYLOAD_DIGEST_DOMAIN, &payload),
         precommitment_digest: commitment.digest(),
-        sources: commitment.sources,
         packed_codeword_root: commitment.packed_codeword_root,
         logical_len: material.logical_len,
         codeword_len,
@@ -1117,7 +1083,6 @@ fn verify_backend(
     Ok(FastVerifierReport {
         payload_digest: preflight.report.payload_digest,
         precommitment_digest: preflight.report.precommitment_digest,
-        sources: commitment.sources,
         packed_codeword_root: commitment.packed_codeword_root,
         score,
         diagnostics,
@@ -1130,7 +1095,7 @@ fn preflight_backend<'a>(
     statement: &VerifierStatement<'_>,
     payload_bytes: &'a [u8],
 ) -> Result<DecodedPreflight<'a>, FastError> {
-    if statement.protocol() != ProofProtocol::FastBinary64UnitCircleV4 {
+    if statement.protocol() != ProofProtocol::FastBinary64UnitCircleV5 {
         return Err(FastError::WrongProtocol);
     }
     if payload_bytes.len() > MAX_PROOF_BYTES {
@@ -1158,7 +1123,7 @@ fn preflight_backend<'a>(
 }
 
 fn validate_prover_statement(statement: &PublicStatement) -> Result<(), FastError> {
-    if statement.manifest().protocol != ProofProtocol::FastBinary64UnitCircleV4 {
+    if statement.manifest().protocol != ProofProtocol::FastBinary64UnitCircleV5 {
         return Err(FastError::WrongProtocol);
     }
     validate_length(statement.generated().dimension())
@@ -1200,7 +1165,6 @@ fn make_precommitment(
         packed_source_len,
         polynomial_degree,
         codeword_len,
-        sources: material.sources,
         packed_codeword_root: material.root,
     };
     if commitment.try_to_bytes()?.len() > MAX_PRECOMMITMENT_BYTES {
@@ -1219,20 +1183,21 @@ fn prepare_material(
         .checked_next_power_of_two()
         .ok_or(FastError::ResourceLimit)?;
 
-    // Quantization is shared with the exact path, but residual semantics are
-    // deliberately not: the provisional backend computes R in binary64 and
-    // must not inherit the exact backend's signed-69-bit residual range.
-    let witness = FixedWitness::from_solution(solution, problem.dimension())?;
-    let exact_witness = i128_vector_digest(b"q63.64-witness-x", witness.as_slice());
-    let solution = witness
-        .to_binary64()
-        .into_iter()
-        .map(canonicalize_source)
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(witness);
+    if solution.as_slice().len() != logical_len {
+        return Err(FastError::TranscriptShape);
+    }
+    // The fast profile proves against the caller's canonical binary64 values.
+    // Q63.64 conversion belongs exclusively to the exact profile and is not a
+    // hidden admission requirement for this provisional floating-point path.
+    let mut binary64_solution = Vec::new();
+    binary64_solution
+        .try_reserve_exact(logical_len)
+        .map_err(|_| FastError::ResourceLimit)?;
+    for &value in solution.as_slice() {
+        binary64_solution.push(canonicalize_source(value)?);
+    }
+    let solution = binary64_solution;
     let residual = compute_residual(problem, &solution)?;
-    let binary64_solution = vector_digest(b"solution-x", &solution)?;
-    let binary64_residual = vector_digest(b"residual-r", &residual)?;
     let packed_len = padded_len.checked_mul(2).ok_or(FastError::ResourceLimit)?;
     let mut packed = Vec::new();
     packed
@@ -1255,11 +1220,6 @@ fn prepare_material(
         packed,
         codeword,
         root,
-        sources: FastSourceDigests {
-            exact_witness,
-            binary64_solution,
-            binary64_residual,
-        },
     })
 }
 
@@ -1992,7 +1952,7 @@ mod tests {
         let statement = PublicStatement::new(
             problem,
             ValidationManifest {
-                protocol: ProofProtocol::FastBinary64UnitCircleV4,
+                protocol: ProofProtocol::FastBinary64UnitCircleV5,
                 max_solution_elements: dimension as u64,
                 max_public_matrix_terms: 1024,
                 max_public_rhs_terms: 1024,
@@ -2041,7 +2001,7 @@ mod tests {
         PublicStatement::new(
             problem,
             ValidationManifest {
-                protocol: ProofProtocol::FastBinary64UnitCircleV4,
+                protocol: ProofProtocol::FastBinary64UnitCircleV5,
                 max_solution_elements: 16,
                 max_public_matrix_terms: 1024,
                 max_public_rhs_terms: 1024,
@@ -2181,11 +2141,6 @@ mod tests {
             packed,
             codeword,
             root,
-            sources: FastSourceDigests {
-                exact_witness: [0; 32],
-                binary64_solution: [0; 32],
-                binary64_residual: [0; 32],
-            },
         };
         let evaluator = EvaluatorBinding::from_metadata(
             statement.generated().public_evaluation_plan().metadata(),
@@ -2348,12 +2303,12 @@ mod tests {
     }
 
     #[test]
-    fn fast_witness_does_not_inherit_the_exact_residual_range() {
+    fn fast_solution_does_not_inherit_the_exact_residual_range() {
         let (statement, _) = fixture(8, 2);
         let solution = Solution::new(vec![8.0; 8], 8).unwrap();
         assert!(matches!(
             ssv_relation::ExactRelation::from_solution(statement.generated(), &solution),
-            Err(RelationError::ResidualOutOfRange { .. })
+            Err(ssv_relation::RelationError::ResidualOutOfRange { .. })
         ));
 
         let (commitment, _) = FastBackend::commit(&statement, &solution).unwrap();
@@ -2361,6 +2316,56 @@ mod tests {
         let (payload, _) = FastBackend::prove(&statement, &solution, &context).unwrap();
         let report = FastBackend::verify(&statement.verifier_statement(), &payload).unwrap();
         assert!(report.score.squared_l2_claim > 8.0);
+    }
+
+    #[test]
+    fn fast_solution_accepts_binary64_values_outside_q63_64() {
+        let (statement, _) = fixture(8, 2);
+        let value = 2.0_f64.powi(70);
+        let solution = Solution::new(vec![value; 8], 8).unwrap();
+        assert!(matches!(
+            ssv_relation::FixedWitness::from_solution(&solution, 8),
+            Err(ssv_relation::RelationError::WitnessOutOfRange { index: 0 })
+        ));
+
+        let material = prepare_material(statement.generated(), &solution).unwrap();
+        assert!(
+            material
+                .solution
+                .iter()
+                .all(|candidate| candidate.to_bits() == value.to_bits())
+        );
+        let (commitment, _) = FastBackend::commit(&statement, &solution).unwrap();
+        let context = FastProverContext::new(commitment);
+        let (payload, _) = FastBackend::prove(&statement, &solution, &context).unwrap();
+        let report = FastBackend::verify(&statement.verifier_statement(), &payload).unwrap();
+        assert!(report.score.squared_l2_claim.is_finite());
+    }
+
+    #[test]
+    fn fast_solution_preserves_values_below_the_q63_64_grid() {
+        let (statement, _) = fixture(8, 2);
+        let value = 2.0_f64.powi(-66);
+        let solution = Solution::new(vec![value; 8], 8).unwrap();
+        let fixed = ssv_relation::FixedWitness::from_solution(&solution, 8).unwrap();
+        assert!(fixed.as_slice().iter().all(|&candidate| candidate == 0));
+
+        let material = prepare_material(statement.generated(), &solution).unwrap();
+        assert!(
+            material
+                .solution
+                .iter()
+                .all(|candidate| candidate.to_bits() == value.to_bits())
+        );
+        assert!(
+            material.packed[..8]
+                .iter()
+                .all(|candidate| candidate.to_bits() == value.to_bits())
+        );
+        let (commitment, _) = FastBackend::commit(&statement, &solution).unwrap();
+        let context = FastProverContext::new(commitment);
+        let (payload, _) = FastBackend::prove(&statement, &solution, &context).unwrap();
+        FastBackend::verify(&statement.verifier_statement(), &payload).unwrap();
     }
 
     #[test]
@@ -2406,6 +2411,21 @@ mod tests {
             .unwrap();
         assert_ne!(first_challenge, changed_commitment_first_challenge);
 
+        let mut changed_evaluator = commitment.clone();
+        changed_evaluator.evaluator.evaluator_version += 1;
+        let changed_evaluator_challenge = initialize_transcript(&changed_evaluator)
+            .unwrap()
+            .challenge_dyadic_f64(b"binding-test")
+            .unwrap();
+        assert_ne!(first_challenge, changed_evaluator_challenge);
+        let (_, proof_bytes) = decode_backend_payload(&payload).unwrap();
+        let changed_evaluator_payload =
+            encode_backend_payload(&changed_evaluator, proof_bytes).unwrap();
+        assert!(matches!(
+            FastBackend::preflight(&statement.verifier_statement(), &changed_evaluator_payload),
+            Err(FastError::StatementMismatch)
+        ));
+
         let mut changed_statement = commitment;
         changed_statement.statement_digest = Digest::from_bytes([0x5a; 32]);
         let changed_statement_challenge = initialize_transcript(&changed_statement)
@@ -2421,11 +2441,11 @@ mod tests {
         let (commitment, _) = FastBackend::commit(&statement, &solution).unwrap();
         let encoded = commitment.to_bytes();
         assert_eq!(FastPrecommitment::from_bytes(&encoded).unwrap(), commitment);
-        let mut legacy_mode_bearing = encoded.clone();
-        legacy_mode_bearing[PRECOMMIT_MAGIC.len()..PRECOMMIT_MAGIC.len() + 2]
-            .copy_from_slice(&3_u16.to_be_bytes());
+        let mut retired_v5 = encoded.clone();
+        retired_v5[PRECOMMIT_MAGIC.len()..PRECOMMIT_MAGIC.len() + 2]
+            .copy_from_slice(&5_u16.to_be_bytes());
         assert!(matches!(
-            FastPrecommitment::from_bytes(&legacy_mode_bearing),
+            FastPrecommitment::from_bytes(&retired_v5),
             Err(FastError::UnsupportedVersion)
         ));
         let mut trailing = encoded.clone();

@@ -155,7 +155,7 @@ fn inspect_common(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(challenge) = prelude.statement().challenge() {
         print_problem_challenge(challenge);
     }
-    if summary.protocol == ssv_service_protocol::ProofProtocol::FastBinary64UnitCircleV4 {
+    if summary.protocol == ssv_service_protocol::ProofProtocol::FastBinary64UnitCircleV5 {
         let preflight =
             FastBackend::preflight(&prelude.statement().verifier_statement(), prelude.payload())
                 .context("fast payload preflight failed")?;
@@ -277,7 +277,7 @@ fn print_backend_report(report: &BackendVerifierReport) {
             );
         }
         BackendVerifierReport::Fast(report) => {
-            println!("proof_kind=fast-binary64-unit-circle-v4");
+            println!("proof_kind=fast-binary64-unit-circle-v5");
             print_live_fast_validation_semantics();
             println!(
                 "residual_squared_l2_claim={:.17e}",

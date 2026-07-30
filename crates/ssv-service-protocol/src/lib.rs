@@ -137,8 +137,8 @@ pub enum ProofProtocol {
     #[serde(rename = "whir-field192-l2-v4")]
     WhirField192L2V4,
     /// Experimental binary64 diagnostics with unit-circle openings.
-    #[serde(rename = "fast-binary64-unit-circle-v4")]
-    FastBinary64UnitCircleV4,
+    #[serde(rename = "fast-binary64-unit-circle-v5")]
+    FastBinary64UnitCircleV5,
 }
 
 /// Immutable numerical parameters for fast diagnostic policy 3.
@@ -161,7 +161,7 @@ impl ProofProtocol {
         match self {
             Self::DirectReferenceV1 => 1,
             Self::WhirField192L2V4 => 2,
-            Self::FastBinary64UnitCircleV4 => 5,
+            Self::FastBinary64UnitCircleV5 => 6,
         }
     }
 
@@ -171,7 +171,7 @@ impl ProofProtocol {
         match value {
             1 => Some(Self::DirectReferenceV1),
             2 => Some(Self::WhirField192L2V4),
-            5 => Some(Self::FastBinary64UnitCircleV4),
+            6 => Some(Self::FastBinary64UnitCircleV5),
             _ => None,
         }
     }
@@ -760,7 +760,7 @@ impl CertifiedScore {
                 }
             }
             (
-                ProofProtocol::FastBinary64UnitCircleV4,
+                ProofProtocol::FastBinary64UnitCircleV5,
                 Self::FastBinary64DiagnosticsV1 {
                     squared_l2_claim,
                     consistency,
@@ -951,13 +951,18 @@ mod tests {
     }
 
     #[test]
-    fn fast_v4_has_a_fresh_wire_id() {
-        assert_eq!(ProofProtocol::FastBinary64UnitCircleV4.wire_id(), 5);
+    fn fast_v5_has_a_fresh_wire_id_and_v4_stays_retired() {
+        assert_eq!(ProofProtocol::FastBinary64UnitCircleV5.wire_id(), 6);
         assert_eq!(
-            ProofProtocol::from_wire_id(5),
-            Some(ProofProtocol::FastBinary64UnitCircleV4)
+            ProofProtocol::from_wire_id(6),
+            Some(ProofProtocol::FastBinary64UnitCircleV5)
         );
-        assert_eq!(ProofProtocol::from_wire_id(4), None);
+        assert_eq!(ProofProtocol::from_wire_id(5), None);
+        assert_eq!(
+            serde_json::to_string(&ProofProtocol::FastBinary64UnitCircleV5).unwrap(),
+            "\"fast-binary64-unit-circle-v5\""
+        );
+        assert!(serde_json::from_str::<ProofProtocol>("\"fast-binary64-unit-circle-v4\"").is_err());
     }
 
     #[test]
@@ -1074,7 +1079,7 @@ mod tests {
                 problem_digest: Digest::from_bytes([2; 32]),
                 validation_manifest_digest: Digest::from_bytes([3; 32]),
                 proof_digest: Digest::from_bytes([4; 32]),
-                protocol: ProofProtocol::FastBinary64UnitCircleV4,
+                protocol: ProofProtocol::FastBinary64UnitCircleV5,
                 score: CertifiedScore::FastBinary64DiagnosticsV1 {
                     squared_l2_claim: 0.0,
                     consistency: Box::new(FastConsistencyMetrics {
