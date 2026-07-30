@@ -221,9 +221,9 @@ the relation after receiving all of `x`.
 | `ssv-canonical` | Canonical big-endian encoding, bounded decoding, typed digests, and domain-separated BLAKE3 |
 | `ssv-problem` | Templates, seed derivation, generator compilation, sparse rows, certificates, and the shared succinct public-MLE plan |
 | `ssv-solution` | Strict solver-facing binary64 vector input and contiguous validated storage |
-| `ssv-relation` | Exact-profile Q63.64 witness conversion, integer residual relation, and no-wrap bounds |
+| `ssv-relation` | Versioned exact-profile plan, Q63.64 witness conversion, integer residual relation, conservative feasibility admission, and no-wrap bounds |
 | `ssv-service-protocol` | Backend IDs, manifests, signed problem challenges, typed certificate scores, and Ed25519 verification |
-| `ssv-validation` | Backend-neutral public statements, restricted verifier statements, strict outer artifact framing, and backend lifecycle traits |
+| `ssv-validation` | Common public statements, protocol compatibility admission, restricted verifier statements, strict outer artifact framing, and backend lifecycle traits |
 | `ssv-direct` | Non-succinct artifact carrying `x` and independent streaming relation checker |
 | `ssv-field-sumcheck` | Reusable flat-table finite-field sumcheck with fixed coordinate and transcript conventions |
 | `ssv-whir-pcs` | Pinned Field192/WHIR commitment profile, opening composition, strict inner certificate framing, and work metrics |
@@ -235,14 +235,14 @@ the relation after receiving all of `x`.
 The dependency direction is intentional:
 
 ```text
-canonical
-  |-- problem -- relation
-  |-- solution -----|
-  |-- service-protocol
-  `-- validation(statement + artifact lifecycle)
-          |-- exact ---- field-sumcheck + whir-pcs
-          |-- fast ----- metric primitives
-          `-- direct --- independent full relation
+canonical -> problem
+problem + solution -> relation
+problem + relation + service-protocol + solution
+    -> validation (statement + artifact lifecycle)
+validation + relation
+    |-- exact ---- field-sumcheck + whir-pcs
+    |-- fast ----- metric primitives
+    `-- direct --- independent full relation
 
 ssv-backends -> exhaustive direct + exact + fast dispatch
 service -> ssv-backends + validation + service-protocol
@@ -275,11 +275,17 @@ Field192/WHIR profile, and composes three finite-field sumchecks:
 2. compressed sparse matrix-vector consistency; and
 3. the exact squared residual norm.
 
+The immutable exact-relation plan derives scale alignment, the residual-norm
+denominator, conservative feasibility, and Field192 no-wrap bounds from the
+generator-owned exact public bounds. Exact statement construction rejects a
+public numeric envelope that no Q63.64 witness and signed-69-bit residual can
+satisfy. This is a cheap representability check, not a linear solve.
+
 WHIR authenticates every private endpoint used by those reductions. The
-generator-owned exact MLE evaluator supplies public matrix and RHS endpoints and
-no-wrap metadata without row scans. The result is an exact residual numerator and
-dyadic denominator for Q63.64 `x`; it is not a proof about unrounded solver
-arithmetic and it does not claim zero knowledge.
+generator-owned exact MLE evaluator supplies public matrix and RHS endpoints
+without row scans. The result is an exact residual numerator and dyadic
+denominator for Q63.64 `x`; it is not a proof about unrounded solver arithmetic
+and it does not claim zero knowledge.
 
 ### 6.3 `fast-binary64-unit-circle-v5`
 

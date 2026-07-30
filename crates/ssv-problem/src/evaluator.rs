@@ -49,94 +49,6 @@ pub struct ExactArithmeticBounds {
     pub maximum_absolute_rhs_mantissa: u64,
 }
 
-/// Conservative powers-of-two bounds for an exact integer relation.
-///
-/// A field modulus at least `2^minimum_safe_modulus_bits` is sufficient for
-/// the row-identity and residual-norm differences described here not to wrap.
-/// The backend must still enforce the witness and residual ranges used as
-/// inputs to [`ExactArithmeticBounds::no_wrap_diagnostics`].
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ExactNoWrapDiagnostics {
-    pub relation_fractional_bits: u32,
-    pub matrix_term_alignment_shift: u32,
-    pub rhs_alignment_shift: u32,
-    pub matrix_vector_absolute_value_strict_bound_bits: u32,
-    pub rhs_absolute_value_strict_bound_bits: u32,
-    pub row_identity_difference_strict_bound_bits: u32,
-    pub residual_norm_strict_bound_bits: u32,
-    pub norm_identity_difference_strict_bound_bits: u32,
-    pub minimum_safe_modulus_bits: u32,
-}
-
-impl ExactArithmeticBounds {
-    /// Derives conservative no-wrap requirements for a fixed-point backend.
-    ///
-    /// `witness_magnitude_bits` means every witness integer has absolute value
-    /// strictly below `2^witness_magnitude_bits`.  `residual_magnitude_bits`
-    /// has the analogous meaning for the backend-constrained residual integer.
-    /// The residual is represented at the returned relation scale.
-    pub fn no_wrap_diagnostics(
-        self,
-        witness_magnitude_bits: u16,
-        witness_fractional_bits: u8,
-        residual_magnitude_bits: u16,
-    ) -> Result<ExactNoWrapDiagnostics, MleEvaluationError> {
-        let matrix_scale = u32::from(self.matrix_fractional_bits)
-            .checked_add(u32::from(witness_fractional_bits))
-            .ok_or(MleEvaluationError::ArithmeticBoundsOverflow)?;
-        let rhs_scale = u32::from(self.rhs_fractional_bits);
-        let relation_fractional_bits = matrix_scale.max(rhs_scale);
-        let matrix_term_alignment_shift = relation_fractional_bits - matrix_scale;
-        let rhs_alignment_shift = relation_fractional_bits - rhs_scale;
-
-        let matrix_vector_absolute_value_strict_bound_bits =
-            strict_u64_bound_bits(self.maximum_absolute_row_sum_mantissa)
-                .checked_add(u32::from(witness_magnitude_bits))
-                .and_then(|bits| bits.checked_add(matrix_term_alignment_shift))
-                .ok_or(MleEvaluationError::ArithmeticBoundsOverflow)?;
-        let rhs_absolute_value_strict_bound_bits =
-            strict_u64_bound_bits(self.maximum_absolute_rhs_mantissa)
-                .checked_add(rhs_alignment_shift)
-                .ok_or(MleEvaluationError::ArithmeticBoundsOverflow)?;
-        let residual_bits = u32::from(residual_magnitude_bits);
-
-        // |Ax - b - R| is a sum of three quantities, each strictly below
-        // 2^max_bits.  Two additional bits are a simple conservative bound.
-        let row_identity_difference_strict_bound_bits =
-            matrix_vector_absolute_value_strict_bound_bits
-                .max(rhs_absolute_value_strict_bound_bits)
-                .max(residual_bits)
-                .checked_add(2)
-                .ok_or(MleEvaluationError::ArithmeticBoundsOverflow)?;
-
-        let residual_norm_strict_bound_bits = residual_bits
-            .checked_mul(2)
-            .and_then(|bits| bits.checked_add(ceil_log2(self.logical_dimension)))
-            .ok_or(MleEvaluationError::ArithmeticBoundsOverflow)?;
-        // Both the recomputed norm and the claimed, range-checked norm are
-        // below the preceding bound.
-        let norm_identity_difference_strict_bound_bits = residual_norm_strict_bound_bits
-            .checked_add(1)
-            .ok_or(MleEvaluationError::ArithmeticBoundsOverflow)?;
-        let minimum_safe_modulus_bits = row_identity_difference_strict_bound_bits
-            .max(norm_identity_difference_strict_bound_bits)
-            .checked_add(1)
-            .ok_or(MleEvaluationError::ArithmeticBoundsOverflow)?;
-
-        Ok(ExactNoWrapDiagnostics {
-            relation_fractional_bits,
-            matrix_term_alignment_shift,
-            rhs_alignment_shift,
-            matrix_vector_absolute_value_strict_bound_bits,
-            rhs_absolute_value_strict_bound_bits,
-            row_identity_difference_strict_bound_bits,
-            residual_norm_strict_bound_bits,
-            norm_identity_difference_strict_bound_bits,
-            minimum_safe_modulus_bits,
-        })
-    }
-}
-
 /// Public structure and cost bounds shared by all succinct backends.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PublicEvaluationMetadata {
@@ -226,8 +138,21 @@ pub enum MleEvaluationError {
     InvalidBinary64Coordinate { point: &'static str, index: usize },
     #[error("public binary64 MLE evaluation produced a non-finite value or error bound")]
     NonFiniteBinary64Evaluation,
-    #[error("integer overflow while deriving exact no-wrap bounds")]
-    ArithmeticBoundsOverflow,
+}
+
+impl GeneratedProblem {
+    /// Exact public bounds shared by evaluator metadata and relation profiles.
+    #[must_use]
+    pub fn exact_arithmetic_bounds(&self) -> ExactArithmeticBounds {
+        let certificate = self.certificate();
+        ExactArithmeticBounds {
+            logical_dimension: self.dimension(),
+            matrix_fractional_bits: certificate.coefficient_fractional_bits,
+            rhs_fractional_bits: certificate.rhs_fractional_bits,
+            maximum_absolute_row_sum_mantissa: certificate.maximum_absolute_row_sum_mantissa_bound,
+            maximum_absolute_rhs_mantissa: certificate.maximum_absolute_rhs_mantissa,
+        }
+    }
 }
 
 /// Borrowed, allocation-free view of a compiled registered generator.
@@ -352,14 +277,7 @@ impl SuccinctPublicEvaluator for PublicEvaluationPlan<'_> {
             },
             matrix_period_terms: certificate.matrix_period.min(padded_dimension),
             rhs_period_terms: certificate.rhs_period.min(padded_dimension),
-            exact_bounds: ExactArithmeticBounds {
-                logical_dimension: self.problem.dimension(),
-                matrix_fractional_bits: certificate.coefficient_fractional_bits,
-                rhs_fractional_bits: certificate.rhs_fractional_bits,
-                maximum_absolute_row_sum_mantissa: certificate
-                    .maximum_absolute_row_sum_mantissa_bound,
-                maximum_absolute_rhs_mantissa: certificate.maximum_absolute_rhs_mantissa,
-            },
+            exact_bounds: self.problem.exact_arithmetic_bounds(),
         }
     }
 
@@ -746,18 +664,6 @@ fn validate_f64_point(
         }
     }
     Ok(())
-}
-
-fn strict_u64_bound_bits(value: u64) -> u32 {
-    u64::BITS - value.leading_zeros()
-}
-
-fn ceil_log2(value: usize) -> u32 {
-    if value <= 1 {
-        0
-    } else {
-        usize::BITS - (value - 1).leading_zeros()
-    }
 }
 
 struct Arithmetic<'a, I> {
@@ -1321,21 +1227,6 @@ mod tests {
         assert!(rhs.work.arithmetic_operations() < 2_000);
         assert_eq!(metadata.matrix_period_terms, 8);
         assert_eq!(metadata.rhs_period_terms, 4);
-    }
-
-    #[test]
-    fn exact_bounds_align_rhs_and_report_norm_growth() {
-        let problem = generated(19, seeded_rhs());
-        let bounds = problem.public_evaluation_plan().metadata().exact_bounds;
-        let diagnostics = bounds.no_wrap_diagnostics(128, 64, 69).unwrap();
-        assert_eq!(diagnostics.relation_fractional_bits, 72);
-        assert_eq!(diagnostics.matrix_term_alignment_shift, 0);
-        assert_eq!(diagnostics.rhs_alignment_shift, 66);
-        assert_eq!(diagnostics.residual_norm_strict_bound_bits, 143);
-        assert!(
-            diagnostics.minimum_safe_modulus_bits
-                > diagnostics.row_identity_difference_strict_bound_bits
-        );
     }
 
     #[test]
