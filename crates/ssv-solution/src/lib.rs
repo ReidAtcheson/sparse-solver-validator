@@ -38,6 +38,8 @@ pub enum SolutionError {
     Write(#[from] io::Error),
     #[error("solution JSON is invalid: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("solution JSON exceeds its resource limit")]
+    ResourceLimit,
     #[error("unsupported solution schema")]
     UnsupportedSchema,
     #[error("solution has {actual} values but the problem requires {expected}")]
@@ -83,10 +85,28 @@ impl Solution {
     }
 
     /// Parses directly from a reader without retaining the complete JSON file.
+    ///
+    /// Parsing consumes at most [`Self::maximum_json_bytes`] bytes plus a
+    /// one-byte probe that distinguishes an input exactly at the limit from a
+    /// larger input. A size-limit calculation that overflows is rejected
+    /// before the reader is accessed.
     pub fn from_json_reader(reader: impl Read, expected_len: usize) -> Result<Self, SolutionError> {
-        let mut deserializer = serde_json::Deserializer::from_reader(reader);
-        let document = SolutionDocumentSeed { expected_len }.deserialize(&mut deserializer)?;
-        deserializer.end()?;
+        let maximum_bytes =
+            checked_maximum_json_bytes(expected_len).ok_or(SolutionError::ResourceLimit)?;
+        let mut reader = JsonLimitReader::new(reader, maximum_bytes);
+        let parsed = {
+            let mut deserializer = serde_json::Deserializer::from_reader(&mut reader);
+            let document = SolutionDocumentSeed { expected_len }.deserialize(&mut deserializer);
+            document.and_then(|document| {
+                deserializer.end()?;
+                Ok(document)
+            })
+        };
+        let document = match parsed {
+            Ok(document) => document,
+            Err(_) if reader.limit_exceeded() => return Err(SolutionError::ResourceLimit),
+            Err(error) => return Err(error.into()),
+        };
         Ok(Self {
             values: document.values.into_boxed_slice(),
         })
@@ -98,9 +118,16 @@ impl Solution {
     }
 
     /// Conservative input-file cap for a solution of the expected length.
+    ///
+    /// Returns `usize::MAX` if the calculation overflows. Expected lengths
+    /// whose limits cannot be represented are rejected by
+    /// [`Self::from_json_reader`] before reading.
     #[must_use]
     pub const fn maximum_json_bytes(expected_len: usize) -> usize {
-        JSON_FIXED_ALLOWANCE.saturating_add(expected_len.saturating_mul(JSON_BYTES_PER_VALUE))
+        match checked_maximum_json_bytes(expected_len) {
+            Some(maximum) => maximum,
+            None => usize::MAX,
+        }
     }
 
     /// Streams canonical human-readable JSON without allocating one string per value.
@@ -134,6 +161,66 @@ impl Solution {
     pub fn into_boxed_slice(self) -> Box<[f64]> {
         self.values
     }
+}
+
+const fn checked_maximum_json_bytes(expected_len: usize) -> Option<usize> {
+    match expected_len.checked_mul(JSON_BYTES_PER_VALUE) {
+        Some(value_bytes) => JSON_FIXED_ALLOWANCE.checked_add(value_bytes),
+        None => None,
+    }
+}
+
+struct JsonLimitReader<R> {
+    inner: R,
+    remaining: usize,
+    limit_exceeded: bool,
+}
+
+impl<R> JsonLimitReader<R> {
+    fn new(inner: R, maximum_bytes: usize) -> Self {
+        Self {
+            inner,
+            remaining: maximum_bytes,
+            limit_exceeded: false,
+        }
+    }
+
+    fn limit_exceeded(&self) -> bool {
+        self.limit_exceeded
+    }
+}
+
+impl<R: Read> Read for JsonLimitReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.limit_exceeded {
+            return Err(json_limit_error());
+        }
+        if self.remaining != 0 {
+            let maximum = output.len().min(self.remaining);
+            let read = self.inner.read(&mut output[..maximum])?;
+            self.remaining -= read;
+            return Ok(read);
+        }
+
+        let mut extra = [0_u8; 1];
+        match self.inner.read(&mut extra)? {
+            0 => Ok(0),
+            _ => {
+                self.limit_exceeded = true;
+                Err(json_limit_error())
+            }
+        }
+    }
+}
+
+fn json_limit_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "solution JSON exceeded its resource limit",
+    )
 }
 
 fn write_json_values(
@@ -421,7 +508,25 @@ fn validate_value(index: usize, value: f64) -> Result<(), SolutionError> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use super::*;
+
+    struct CountingChunkedReader<R> {
+        inner: R,
+        maximum_chunk: usize,
+        bytes_read: Rc<Cell<usize>>,
+    }
+
+    impl<R: Read> Read for CountingChunkedReader<R> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let maximum = output.len().min(self.maximum_chunk);
+            let read = self.inner.read(&mut output[..maximum])?;
+            self.bytes_read.set(self.bytes_read.get() + read);
+            Ok(read)
+        }
+    }
 
     #[test]
     fn json_round_trip() {
@@ -470,6 +575,58 @@ mod tests {
         );
         assert!(Solution::from_json(oversized_decimal.as_bytes(), 1).is_err());
         assert!(Solution::maximum_json_bytes(2) < Solution::maximum_json_bytes(3));
+    }
+
+    #[test]
+    fn reader_stops_one_byte_beyond_its_limit_during_a_large_token() {
+        let maximum = Solution::maximum_json_bytes(1);
+        let prefix = format!("{{\"schema\":\"{SCHEMA}\",\"values\":[\"").into_bytes();
+        let bytes_read = Rc::new(Cell::new(0));
+        let reader = CountingChunkedReader {
+            inner: io::Cursor::new(prefix).chain(io::repeat(b'1')),
+            maximum_chunk: 7,
+            bytes_read: Rc::clone(&bytes_read),
+        };
+
+        assert!(matches!(
+            Solution::from_json_reader(reader, 1),
+            Err(SolutionError::ResourceLimit)
+        ));
+        assert_eq!(bytes_read.get(), maximum + 1);
+    }
+
+    #[test]
+    fn reader_accepts_its_exact_limit_and_rejects_one_more_byte() {
+        let maximum = Solution::maximum_json_bytes(1);
+        let mut encoded = Solution::new(vec![1.0], 1)
+            .unwrap()
+            .to_pretty_json()
+            .unwrap();
+        assert!(encoded.len() < maximum);
+        encoded.resize(maximum, b' ');
+
+        assert!(Solution::from_json_reader(encoded.as_slice(), 1).is_ok());
+        encoded.push(b' ');
+        assert!(matches!(
+            Solution::from_json_reader(encoded.as_slice(), 1),
+            Err(SolutionError::ResourceLimit)
+        ));
+    }
+
+    #[test]
+    fn reader_rejects_limit_overflow_before_reading() {
+        let bytes_read = Rc::new(Cell::new(0));
+        let reader = CountingChunkedReader {
+            inner: io::empty(),
+            maximum_chunk: 7,
+            bytes_read: Rc::clone(&bytes_read),
+        };
+
+        assert!(matches!(
+            Solution::from_json_reader(reader, usize::MAX),
+            Err(SolutionError::ResourceLimit)
+        ));
+        assert_eq!(bytes_read.get(), 0);
     }
 
     #[test]
