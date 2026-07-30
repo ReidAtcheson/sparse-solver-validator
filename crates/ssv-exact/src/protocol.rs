@@ -11,7 +11,7 @@ use ssv_problem::{
     MleEvaluationError, MleInterpreter, PublicEvaluationMetadata, PublicEvaluationWork,
     SuccinctPublicEvaluator,
 };
-use ssv_relation::{ExactRelation, RESIDUAL_MAGNITUDE_BITS, RelationError, audit_field_modulus};
+use ssv_relation::{ExactRelation, ExactRelationPlan, RelationError};
 use ssv_service_protocol::ProofProtocol;
 use ssv_solution::Solution;
 use ssv_validation::{
@@ -37,6 +37,9 @@ const PRODUCT_DEGREE: usize = 2;
 const DIGIT_WIDTH: u64 = 4;
 const MINIMUM_ROW_DOMAIN: usize = 64;
 const MAX_EXACT_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+// The immutable v4 protocol tag selects exact-relation profile version 1.
+// Changing this selector or the profile requires a new exact protocol version.
+const EXACT_RELATION_PROFILE_VERSION: u16 = 1;
 const PROTOCOL_TAG: &[u8] = b"sparse-solve/whir-field192-l2-v4/nibble-range/ssv-v1";
 const FIELD_BYTES: usize = size_of::<PcsField>();
 
@@ -107,8 +110,6 @@ pub enum ExactError {
     WrongProtocol,
     #[error("public statement dimensions or exact profile header are inconsistent")]
     ProtocolHeader,
-    #[error("the generator-derived integer bounds are unsafe for Field192")]
-    UnsafeIntegerBounds,
     #[error("exact transcript is malformed, truncated, or inconsistent")]
     Transcript,
     #[error("sumcheck failed: {0}")]
@@ -208,7 +209,8 @@ pub fn prove_payload(
         return Err(ExactError::WrongProtocol);
     }
     let generated = statement.generated();
-    audit_field_modulus(generated, &field_modulus())?;
+    let relation_plan = ExactRelationPlan::from_problem(generated)?;
+    relation_plan.audit_field_modulus(&field_modulus())?;
     let relation = ExactRelation::from_solution(generated, solution)?;
     let padded_len = padded_len(generated.dimension())?;
     let witness_digits = WitnessDigitTables::from_i128(relation.witness().as_slice(), padded_len)?;
@@ -227,6 +229,7 @@ pub fn prove_payload(
             let hook = prove_hook(
                 transcript,
                 statement,
+                &relation_plan,
                 &relation,
                 &witness_digits,
                 &residual_digits,
@@ -287,7 +290,8 @@ fn verify_payload_with_cancellation(
         return Err(ExactError::PayloadLimit);
     }
     let metadata = statement.public_evaluator().metadata();
-    ensure_no_wrap_metadata(metadata)?;
+    let relation_plan = ExactRelationPlan::from_metadata(metadata)?;
+    relation_plan.audit_field_modulus(&field_modulus())?;
     let padded_len = padded_len(statement.dimension())?;
     let vector_len = SELECTOR_SLOTS
         .checked_mul(padded_len)
@@ -299,7 +303,14 @@ fn verify_payload_with_cancellation(
     let hook_output = RefCell::new(None);
     let hook_slot = &hook_output;
     let pcs_metrics = pcs.verify_with_transcript(&statement_digest, &certificate, |transcript| {
-        let hook = verify_hook(transcript, statement, metadata, payload.len(), cancellation)?;
+        let hook = verify_hook(
+            transcript,
+            statement,
+            metadata,
+            &relation_plan,
+            payload.len(),
+            cancellation,
+        )?;
         let claims = hook.claims.clone();
         *hook_slot.borrow_mut() = Some(hook);
         Ok::<_, ExactError>(claims)
@@ -320,17 +331,24 @@ fn verify_payload_with_cancellation(
 fn prove_hook(
     transcript: &mut ProverTranscript,
     statement: &PublicStatement,
+    relation_plan: &ExactRelationPlan,
     relation: &ExactRelation,
     witness_digits: &WitnessDigitTables,
     residual_digits: &ResidualDigitTables,
     rho: PcsField,
 ) -> Result<(OpeningClaims, ProverHookOutput), ExactError> {
     let generated = statement.generated();
-    let plan = generated.public_evaluation_plan();
-    let metadata = plan.metadata();
+    let evaluator = generated.public_evaluation_plan();
+    let metadata = evaluator.metadata();
     let padded_len = witness_digits.padded_len();
     let variables = padded_len.ilog2() as usize;
-    send_protocol_header(transcript, generated.dimension(), padded_len, metadata)?;
+    send_protocol_header(
+        transcript,
+        generated.dimension(),
+        padded_len,
+        metadata,
+        relation_plan,
+    )?;
     transcript.prover_message(&rho);
 
     let alpha: PcsField = VerifierMessage::verifier_message(transcript);
@@ -367,8 +385,8 @@ fn prove_hook(
     send_fields_prover(transcript, &residual_at_row);
     claims.push_digit_block(&row_point, WITNESS_TABLE_COLUMNS, &residual_at_row)?;
     let residual_row_value = reconstruct_residual(&residual_at_row)?;
-    let rhs = plan.evaluate_rhs_mle_zero_padded(&FieldInterpreter, &row_point)?;
-    let initial_matvec_claim = scale_rhs(rhs.value, metadata)? + residual_row_value;
+    let rhs = evaluator.evaluate_rhs_mle_zero_padded(&FieldInterpreter, &row_point)?;
+    let initial_matvec_claim = scale_rhs(rhs.value, relation_plan)? + residual_row_value;
     let (matrix_rows, matvec_visits) = compress_matrix_rows(generated, &row_point, padded_len)?;
     let witness_values = witness_digits.reconstructed_table();
     let matvec_statement =
@@ -462,13 +480,20 @@ fn verify_hook(
     transcript: &mut VerifierTranscript<'_>,
     statement: &VerifierStatement<'_>,
     metadata: PublicEvaluationMetadata,
+    relation_plan: &ExactRelationPlan,
     certificate_bytes: usize,
     cancellation: &ValidationCancellation,
 ) -> Result<VerifierHookOutput, ExactError> {
     require_not_cancelled(cancellation)?;
     let padded_len = padded_len(statement.dimension())?;
     let variables = padded_len.ilog2() as usize;
-    receive_protocol_header(transcript, statement.dimension(), padded_len, metadata)?;
+    receive_protocol_header(
+        transcript,
+        statement.dimension(),
+        padded_len,
+        metadata,
+        relation_plan,
+    )?;
     let rho: PcsField = transcript
         .prover_message()
         .map_err(|_| ExactError::Transcript)?;
@@ -505,10 +530,10 @@ fn verify_hook(
     let residual_at_row = read_fields(transcript, RESIDUAL_TABLE_COLUMNS)?;
     claims.push_digit_block(&row_point, WITNESS_TABLE_COLUMNS, &residual_at_row)?;
     let residual_row_value = reconstruct_residual(&residual_at_row)?;
-    let plan = statement.public_evaluator();
-    let rhs = plan.evaluate_rhs_mle_zero_padded(&FieldInterpreter, &row_point)?;
+    let evaluator = statement.public_evaluator();
+    let rhs = evaluator.evaluate_rhs_mle_zero_padded(&FieldInterpreter, &row_point)?;
     require_not_cancelled(cancellation)?;
-    let initial_matvec_claim = scale_rhs(rhs.value, metadata)? + residual_row_value;
+    let initial_matvec_claim = scale_rhs(rhs.value, relation_plan)? + residual_row_value;
     let matvec_statement =
         SumcheckStatement::new(b"matvec", PRODUCT_DEGREE, variables, initial_matvec_claim)
             .map_err(|error| ExactError::Sumcheck(error.to_string()))?;
@@ -518,7 +543,7 @@ fn verify_hook(
     let witness_at_column = read_fields(transcript, WITNESS_TABLE_COLUMNS)?;
     claims.push_digit_block(&matvec_endpoint.point, 0, &witness_at_column)?;
     let witness_value = reconstruct_witness(&witness_at_column)?;
-    let matrix = plan.evaluate_matrix_mle_zero_padded(
+    let matrix = evaluator.evaluate_matrix_mle_zero_padded(
         &FieldInterpreter,
         &row_point,
         &matvec_endpoint.point,
@@ -574,7 +599,7 @@ fn verify_hook(
         claims,
         residual: SquaredResidualReport {
             numerator: rho_integer,
-            denominator_power: denominator_power(metadata)?,
+            denominator_power: relation_plan.squared_l2_denominator_power(),
         },
         work: AlgebraicVerifierWork {
             sumcheck_rounds,
@@ -672,42 +697,13 @@ fn padded_len(logical_len: usize) -> Result<usize, ExactError> {
         .ok_or(ExactError::SizeOverflow)
 }
 
-fn denominator_power(metadata: PublicEvaluationMetadata) -> Result<u32, ExactError> {
-    64_u32
-        .checked_add(u32::from(metadata.exact_bounds.matrix_fractional_bits))
-        .and_then(|value| value.checked_mul(2))
-        .ok_or(ExactError::SizeOverflow)
-}
-
 fn scale_rhs(
     rhs_mantissa_mle: PcsField,
-    metadata: PublicEvaluationMetadata,
+    relation_plan: &ExactRelationPlan,
 ) -> Result<PcsField, ExactError> {
-    let relation_fractional_bits = 64_u32
-        .checked_add(u32::from(metadata.exact_bounds.matrix_fractional_bits))
-        .ok_or(ExactError::SizeOverflow)?;
-    let shift = relation_fractional_bits
-        .checked_sub(u32::from(metadata.exact_bounds.rhs_fractional_bits))
-        .ok_or(ExactError::ProtocolHeader)?;
-    Ok(pow2_field(shift as usize) * rhs_mantissa_mle)
-}
-
-fn ensure_no_wrap_metadata(metadata: PublicEvaluationMetadata) -> Result<(), ExactError> {
-    let matrix_term = BigUint::from(metadata.exact_bounds.maximum_absolute_row_sum_mantissa) << 127;
-    let shift = 64_u32
-        .checked_add(u32::from(metadata.exact_bounds.matrix_fractional_bits))
-        .and_then(|value| value.checked_sub(u32::from(metadata.exact_bounds.rhs_fractional_bits)))
-        .ok_or(ExactError::ProtocolHeader)?;
-    let rhs_term =
-        BigUint::from(metadata.exact_bounds.maximum_absolute_rhs_mantissa) << (shift as usize);
-    let row_bound = matrix_term + rhs_term + (BigUint::from(1_u8) << RESIDUAL_MAGNITUDE_BITS);
-    let rho_bound =
-        BigUint::from(metadata.domain.logical_dimension) << (2 * RESIDUAL_MAGNITUDE_BITS);
-    let modulus = field_modulus();
-    if row_bound >= modulus || rho_bound >= modulus {
-        return Err(ExactError::UnsafeIntegerBounds);
-    }
-    Ok(())
+    let shift = usize::try_from(relation_plan.rhs_alignment_shift())
+        .map_err(|_| ExactError::SizeOverflow)?;
+    Ok(pow2_field(shift) * rhs_mantissa_mle)
 }
 
 fn compress_matrix_rows(
@@ -833,20 +829,28 @@ fn protocol_header_values(
     dimension: usize,
     padded_len: usize,
     metadata: PublicEvaluationMetadata,
+    relation_plan: &ExactRelationPlan,
 ) -> Result<[u64; 14], ExactError> {
+    let public_bounds = relation_plan.public_bounds();
+    if public_bounds.logical_dimension != dimension
+        || metadata.exact_bounds != public_bounds
+        || relation_plan.profile().version() != EXACT_RELATION_PROFILE_VERSION
+    {
+        return Err(ExactError::ProtocolHeader);
+    }
     Ok([
         u64::try_from(dimension).map_err(|_| ExactError::SizeOverflow)?,
-        u64::try_from(dimension).map_err(|_| ExactError::SizeOverflow)?,
+        u64::try_from(public_bounds.logical_dimension).map_err(|_| ExactError::SizeOverflow)?,
         u64::try_from(padded_len).map_err(|_| ExactError::SizeOverflow)?,
         SELECTOR_VARIABLES as u64,
         COMMITTED_DIGIT_COLUMNS as u64,
         WITNESS_TABLE_COLUMNS as u64,
         RESIDUAL_TABLE_COLUMNS as u64,
         DIGIT_WIDTH,
-        u64::from(RESIDUAL_MAGNITUDE_BITS),
-        u64::from(denominator_power(metadata)?),
-        u64::from(metadata.exact_bounds.matrix_fractional_bits),
-        u64::from(metadata.exact_bounds.rhs_fractional_bits),
+        u64::from(relation_plan.profile().residual_magnitude_bits()),
+        u64::from(relation_plan.squared_l2_denominator_power()),
+        u64::from(public_bounds.matrix_fractional_bits),
+        u64::from(public_bounds.rhs_fractional_bits),
         u64::from(metadata.evaluator_version),
         1, // MSB-first coordinate-order discriminator.
     ])
@@ -857,9 +861,10 @@ fn send_protocol_header(
     dimension: usize,
     padded_len: usize,
     metadata: PublicEvaluationMetadata,
+    relation_plan: &ExactRelationPlan,
 ) -> Result<(), ExactError> {
     transcript.prover_message(blake3::hash(PROTOCOL_TAG).as_bytes());
-    for value in protocol_header_values(dimension, padded_len, metadata)? {
+    for value in protocol_header_values(dimension, padded_len, metadata, relation_plan)? {
         transcript.prover_message(&value.to_le_bytes());
     }
     Ok(())
@@ -870,6 +875,7 @@ fn receive_protocol_header(
     dimension: usize,
     padded_len: usize,
     metadata: PublicEvaluationMetadata,
+    relation_plan: &ExactRelationPlan,
 ) -> Result<(), ExactError> {
     let received: [u8; 32] = transcript
         .prover_message()
@@ -877,7 +883,7 @@ fn receive_protocol_header(
     if received != *blake3::hash(PROTOCOL_TAG).as_bytes() {
         return Err(ExactError::ProtocolHeader);
     }
-    for expected in protocol_header_values(dimension, padded_len, metadata)? {
+    for expected in protocol_header_values(dimension, padded_len, metadata, relation_plan)? {
         let encoded: [u8; 8] = transcript
             .prover_message()
             .map_err(|_| ExactError::Transcript)?;
@@ -963,6 +969,17 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn relation_plan_preserves_the_v4_protocol_header() {
+        let statement = fixture_statement(8);
+        let metadata = statement.generated().public_evaluation_plan().metadata();
+        let relation_plan = ExactRelationPlan::from_problem(statement.generated()).unwrap();
+        assert_eq!(
+            protocol_header_values(8, 64, metadata, &relation_plan).unwrap(),
+            [8, 8, 64, 6, 51, 33, 18, 4, 68, 136, 4, 4, 1, 1]
+        );
     }
 
     #[test]

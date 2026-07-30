@@ -27,7 +27,8 @@ numerical audit.
 - `ssv-problem`: templates, seed finalization, generators, certificates, and the
   generator-owned succinct matrix/RHS MLE evaluator
 - `ssv-solution`: strict binary64 solution-vector input
-- `ssv-relation`: exact-profile Q63.64 conversion and integer residual relation
+- `ssv-relation`: versioned exact-profile plan, Q63.64 conversion, integer
+  residual relation, feasibility admission, and no-wrap bounds
 - `ssv-service-protocol`: manifests, signed problem challenges, and typed
   certificates
 - `ssv-validation`: common statements, restricted succinct-verifier view,

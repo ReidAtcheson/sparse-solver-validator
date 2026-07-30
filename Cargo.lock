@@ -1552,6 +1552,7 @@ dependencies = [
  "serde_json",
  "ssv-canonical",
  "ssv-problem",
+ "ssv-relation",
  "ssv-service-protocol",
  "ssv-solution",
  "thiserror",

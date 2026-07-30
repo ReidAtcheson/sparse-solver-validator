@@ -3,8 +3,9 @@
 //! Exact, fast, and future proof systems share this layer. A backend receives a
 //! validated [`PublicStatement`] and only its own opaque payload. It does not
 //! reparse application provenance, select a matrix family, or invent resource
-//! policy. This keeps protocol-specific algebra out of transport and statement
-//! handling while avoiding a lowest-common-denominator commitment abstraction.
+//! policy. Statement construction invokes typed protocol-compatibility plans,
+//! but their arithmetic remains in the owning relation crates. This avoids a
+//! lowest-common-denominator commitment abstraction.
 
 #![forbid(unsafe_code)]
 
@@ -16,6 +17,7 @@ use ssv_problem::{
     FinalizedProblem, FinalizedRandomness, GeneratedProblem, ProblemError, PublicEvaluationPlan,
     SuccinctPublicEvaluator,
 };
+use ssv_relation::{ExactRelationPlan, RelationError};
 use ssv_service_protocol::{
     MAX_CHALLENGE_BYTES, MAX_PUBLIC_EVALUATION_TERMS_LIMIT, MAX_SOLUTION_ELEMENTS_LIMIT,
     ProofProtocol, ProtocolError, SignedChallenge, ValidationManifest,
@@ -195,6 +197,8 @@ pub enum ValidationError {
     DimensionLimit,
     #[error("compiled public evaluator exceeds the validation manifest's term budget")]
     PublicEvaluationLimit,
+    #[error("public problem is incompatible with the exact relation profile: {0}")]
+    ExactRelation(#[from] RelationError),
 }
 
 /// A parsed artifact was dispatched to a backend for a different protocol.
@@ -337,6 +341,9 @@ impl PublicStatement {
             return Err(ValidationError::PublicEvaluationLimit);
         }
         let generated = problem.compile()?;
+        if manifest.protocol == ProofProtocol::WhirField192L2V4 {
+            ExactRelationPlan::from_problem(&generated)?;
+        }
         debug_assert_eq!(
             generated
                 .public_evaluation_plan()
@@ -852,6 +859,63 @@ mod tests {
             ValidationManifest::default().max_public_matrix_terms,
             ValidationManifest::default().max_public_rhs_terms,
         )
+    }
+
+    fn exact_incompatible_problem() -> FinalizedProblem {
+        ProblemTemplate {
+            schema: TemplateSchema::V1,
+            randomness: TemplateRandomness::LiteralV1 {
+                seed: InstanceSeed::from_bytes([11; 32]),
+            },
+            matrix: MatrixSpec::SeededSymmetricTridiagonalV1 {
+                dimension: 2,
+                boundary: BoundaryRule::TruncateV1,
+                off_diagonal: OffDiagonalValues::SeededPeriodicNegativeDyadicV1 {
+                    period_bits: 0,
+                    fractional_bits: 52,
+                    minimum_magnitude_mantissa: 1,
+                    maximum_magnitude_mantissa: 1,
+                },
+                diagonal: DiagonalConstruction::AbsoluteRowSumPlusMarginV1 { margin_mantissa: 1 },
+            },
+            rhs: RhsSpec::SeededPeriodicDyadicV1 {
+                period_bits: 0,
+                fractional_bits: 0,
+                minimum_mantissa: 9_007_199_254_740_991,
+                maximum_mantissa: 9_007_199_254_740_991,
+            },
+            requested_outputs: vec![RequestedOutput::SquaredL2ResidualV1],
+        }
+        .finalize_literal()
+        .unwrap()
+    }
+
+    #[test]
+    fn exact_statement_rejects_a_problem_outside_its_numeric_envelope() {
+        let problem = exact_incompatible_problem();
+        let manifest = ValidationManifest {
+            protocol: ProofProtocol::WhirField192L2V4,
+            max_solution_elements: 2,
+            ..ValidationManifest::default()
+        };
+        assert!(matches!(
+            PublicStatement::new(problem.clone(), manifest, None),
+            Err(ValidationError::ExactRelation(
+                RelationError::InfeasiblePublicMagnitude
+            ))
+        ));
+
+        for protocol in [
+            ProofProtocol::DirectReferenceV1,
+            ProofProtocol::FastBinary64UnitCircleV5,
+        ] {
+            let manifest = ValidationManifest {
+                protocol,
+                max_solution_elements: 2,
+                ..ValidationManifest::default()
+            };
+            assert!(PublicStatement::new(problem.clone(), manifest, None).is_ok());
+        }
     }
 
     #[test]

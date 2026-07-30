@@ -16,9 +16,9 @@ mod spec;
 
 pub use digest::{ProblemDigest, ProblemTemplateDigest};
 pub use evaluator::{
-    BooleanCoordinateOrder, ExactArithmeticBounds, ExactNoWrapDiagnostics, F64MleEvaluation,
-    F64RoundoffDiagnostics, MleDomain, MleEvaluation, MleEvaluationError, MleInterpreter,
-    PublicEvaluationMetadata, PublicEvaluationPlan, PublicEvaluationWork, SuccinctPublicEvaluator,
+    BooleanCoordinateOrder, ExactArithmeticBounds, F64MleEvaluation, F64RoundoffDiagnostics,
+    MleDomain, MleEvaluation, MleEvaluationError, MleInterpreter, PublicEvaluationMetadata,
+    PublicEvaluationPlan, PublicEvaluationWork, SuccinctPublicEvaluator,
 };
 pub use generator::{
     GeneratedProblem, GeneratorCertificate, MatrixEntry, MatrixRow, MatrixRows, SparseMatrix,

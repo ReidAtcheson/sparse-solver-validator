@@ -110,10 +110,12 @@ b_tilde(u)   = sum_i     eq_i(u) b_i.
 
 The generator-owned `PublicEvaluationPlan` evaluates these endpoints without
 enumerating rows or RHS entries. It exposes the same reviewed operation plan to
-Field192 and binary64 interpreters, reports exact coefficient/no-wrap metadata,
-and returns deterministic work and binary64 roundoff diagnostics. Validation
-manifests cap matrix and RHS periodic terms before proving or verification;
-hosted deployments impose independent ceilings that a manifest cannot raise.
+Field192 and binary64 interpreters, reports exact public coefficient bounds, and
+returns deterministic work and binary64 roundoff diagnostics. The exact
+relation plan derives its alignment and no-wrap bounds from that metadata.
+Validation manifests cap matrix and RHS periodic terms before proving or
+verification; hosted deployments impose independent ceilings that a manifest
+cannot raise.
 
 For the current family, endpoint work depends on the registered periods and
 `log2(n)`, not on `n` or `nnz(A)`. A family without such a capability is not
@@ -309,20 +311,43 @@ profile's once-quantized Q63.64 statement for every possible input.
 
 `whir-field192-l2-v4` converts the solver's validated binary64 output once to a
 signed Q63.64 integer vector `X`. For a matrix mantissa scale `2^-f`, RHS scale
-`2^-g`, and the generator-derived alignment shift, it constructs an exact integer
-residual `R`. In the common `f=4`, `g=64` case:
+`2^-g`, and integer matrix/RHS mantissas `m_ij` and `B_i`, exact-relation profile
+1 constructs:
 
 ```text
-R_i = sum_j m_ij X_j - 2^f B_i
+R_i = sum_j m_ij X_j - 2^(64+f-g) B_i
 (Ax-b)_i = R_i * 2^-(64+f)
 rho = sum_i R_i^2
 ||Ax-b||_2^2 = rho * 2^(-2(64+f)).
 ```
 
 `X` spans signed 128-bit Q63.64. The profile constrains each residual to the
-signed 69-bit representation `[-2^68, 2^68-1]`. Generator-derived row, RHS, and
-norm bounds are checked against the Field192 modulus before a field identity is
-interpreted as an integer identity.
+signed 69-bit representation `[-2^68, 2^68-1]`. One typed plan supplies the
+alignment shift, denominator, digit ranges, and these exact no-wrap bounds to
+statement admission, relation construction, the prover, verifier, and protocol
+header:
+
+```text
+M_A 2^127 + M_b_bound 2^(64+f-g) + 2^68 < Field192 modulus
+n 2^136                                         < Field192 modulus,
+```
+
+where `M_A` is the generator-derived absolute row-sum mantissa bound and
+`M_b_bound` is the conservative RHS metadata bound.
+
+Before accepting an exact statement, the same plan also rejects the sufficient
+impossibility condition
+
+```text
+M_b_logical 2^(64+f-g) > M_A 2^127 + 2^68.
+```
+
+Here `M_b_logical` is the exact maximum over RHS entries used by logical rows,
+not a possibly looser bound over unused periodic entries. This conservative
+check only detects a public magnitude envelope outside the profile; it does not
+solve `Ax=b` or promise that a private witness exists. Profile 1 remains
+selected and transcript-bound by immutable exact protocol v4, so this refactor
+does not reinterpret or change v4 proof bytes.
 
 “Exact” means exact for this quantized witness and dyadic public problem. It does
 not mean the original floating-point solver executed exact arithmetic.

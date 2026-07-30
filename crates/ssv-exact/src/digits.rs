@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 
 use ark_ff::{AdditiveGroup, BigInteger, Field, PrimeField};
 use num_bigint::BigUint;
-use ssv_relation::RESIDUAL_MAGNITUDE_BITS;
+use ssv_relation::{RESIDUAL_MAGNITUDE_BITS, WITNESS_MAGNITUDE_BITS};
 use ssv_whir_pcs::PcsField;
 use thiserror::Error;
 
@@ -65,8 +65,9 @@ impl WitnessDigitTables {
             for (column, table) in nibbles.iter_mut().enumerate() {
                 table[row] = PcsField::from(((encoded >> (4 * column)) & 0x0f) as u64);
             }
-            top_three[row] = PcsField::from(((encoded >> 124) & 0x07) as u64);
-            sign[row] = PcsField::from(((encoded >> 127) & 1) as u64);
+            top_three[row] =
+                PcsField::from(((encoded >> (WITNESS_MAGNITUDE_BITS - 3)) & 0x07) as u64);
+            sign[row] = PcsField::from(((encoded >> WITNESS_MAGNITUDE_BITS) & 1) as u64);
         }
         Ok(Self {
             nibbles,
@@ -319,8 +320,8 @@ fn witness_reconstruction_weights() -> &'static [PcsField; WITNESS_TABLE_COLUMNS
         for (column, weight) in weights[..WITNESS_NIBBLE_COLUMNS].iter_mut().enumerate() {
             *weight = pow2_field(4 * column);
         }
-        weights[WITNESS_NIBBLE_COLUMNS] = pow2_field(124);
-        weights[WITNESS_TABLE_COLUMNS - 1] = -pow2_field(127);
+        weights[WITNESS_NIBBLE_COLUMNS] = pow2_field((WITNESS_MAGNITUDE_BITS - 3) as usize);
+        weights[WITNESS_TABLE_COLUMNS - 1] = -pow2_field(WITNESS_MAGNITUDE_BITS as usize);
         weights
     })
 }
@@ -331,7 +332,7 @@ fn residual_reconstruction_weights() -> &'static [PcsField; RESIDUAL_TABLE_COLUM
         for (column, weight) in weights[..RESIDUAL_NIBBLE_COLUMNS].iter_mut().enumerate() {
             *weight = pow2_field(4 * column);
         }
-        weights[RESIDUAL_TABLE_COLUMNS - 1] = -pow2_field(68);
+        weights[RESIDUAL_TABLE_COLUMNS - 1] = -pow2_field(RESIDUAL_MAGNITUDE_BITS as usize);
         weights
     })
 }
