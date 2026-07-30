@@ -210,6 +210,15 @@ pub struct FinalizedProblem {
     pub requested_outputs: Vec<RequestedOutput>,
 }
 
+/// Maximum periodic patterns examined by one public matrix and RHS evaluation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PublicEvaluationTerms {
+    /// Conservative periodic-pattern bound for one matrix-MLE evaluation.
+    pub matrix_period_terms: u64,
+    /// Conservative periodic-pattern bound for one RHS-MLE evaluation.
+    pub rhs_period_terms: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum ProblemError {
     #[error("problem JSON is invalid: {0}")]
@@ -286,6 +295,14 @@ impl ProblemTemplate {
 
     pub fn validate(&self) -> Result<(), ProblemError> {
         validate_common(self.matrix, self.rhs, &self.requested_outputs)
+    }
+
+    /// Computes public-evaluator term counts without generating periodic tables.
+    ///
+    /// This operation is constant-time and does not allocate.
+    pub fn public_evaluation_terms(&self) -> Result<PublicEvaluationTerms, ProblemError> {
+        self.validate()?;
+        Ok(public_evaluation_terms(self.matrix, self.rhs))
     }
 
     pub fn digest(&self) -> Result<ProblemTemplateDigest, ProblemError> {
@@ -427,6 +444,14 @@ impl FinalizedProblem {
             }
         }
         Ok(())
+    }
+
+    /// Computes public-evaluator term counts without generating periodic tables.
+    ///
+    /// This operation is constant-time and does not allocate.
+    pub fn public_evaluation_terms(&self) -> Result<PublicEvaluationTerms, ProblemError> {
+        self.validate()?;
+        Ok(public_evaluation_terms(self.matrix, self.rhs))
     }
 
     /// Application-layer check used before accepting a service-issued context.
@@ -642,6 +667,21 @@ fn validate_common(
     Ok(())
 }
 
+fn public_evaluation_terms(matrix: MatrixSpec, rhs: RhsSpec) -> PublicEvaluationTerms {
+    let padded_dimension = matrix.dimension().next_power_of_two();
+    let (_, _, off_diagonal, _) = matrix.components();
+    let (matrix_period_bits, _, _, _) = off_diagonal.parameters();
+    let matrix_period = 1_u64 << matrix_period_bits;
+    let rhs_period = match rhs {
+        RhsSpec::ManufacturedOnesV1 => 1,
+        RhsSpec::SeededPeriodicDyadicV1 { period_bits, .. } => 1_u64 << period_bits,
+    };
+    PublicEvaluationTerms {
+        matrix_period_terms: matrix_period.min(padded_dimension),
+        rhs_period_terms: rhs_period.min(padded_dimension),
+    }
+}
+
 fn validate_period_and_scale(period_bits: u8, fractional_bits: u8) -> Result<(), ProblemError> {
     if period_bits > MAX_PERIOD_BITS {
         return Err(ProblemError::PeriodTooLarge {
@@ -727,7 +767,7 @@ mod decimal_i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{InstanceSeed, SeedDerivation};
+    use crate::{InstanceSeed, SeedDerivation, SuccinctPublicEvaluator};
 
     #[test]
     fn dyadic_scale_conversion_has_frozen_exact_bits() {
@@ -785,6 +825,33 @@ mod tests {
             FinalizedProblem::from_json_slice(json.as_bytes()).unwrap(),
             finalized
         );
+    }
+
+    #[test]
+    fn public_evaluation_terms_are_known_before_compilation() {
+        let mut template = template();
+        template.matrix = matrix(6);
+        template.rhs = RhsSpec::SeededPeriodicDyadicV1 {
+            period_bits: 2,
+            fractional_bits: 8,
+            minimum_mantissa: -4,
+            maximum_mantissa: 7,
+        };
+        let expected = PublicEvaluationTerms {
+            matrix_period_terms: 8,
+            rhs_period_terms: 4,
+        };
+        assert_eq!(template.public_evaluation_terms().unwrap(), expected);
+
+        let finalized = template.finalize_literal().unwrap();
+        assert_eq!(finalized.public_evaluation_terms().unwrap(), expected);
+        let generated = finalized.compile().unwrap();
+        let metadata = generated.public_evaluation_plan().metadata();
+        assert_eq!(
+            metadata.matrix_period_terms as u64,
+            expected.matrix_period_terms
+        );
+        assert_eq!(metadata.rhs_period_terms as u64, expected.rhs_period_terms);
     }
 
     #[test]

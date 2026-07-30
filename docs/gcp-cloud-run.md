@@ -171,7 +171,7 @@ gcloud run deploy "${SERVICE}" \
   --source . \
   --build-service-account "${BUILD_SA_RESOURCE}" \
   --service-account "${RUNTIME_SA_EMAIL}" \
-  --set-env-vars "SSV_SIGNING_KEY_FILE=/var/run/secrets/ssv/signing.key,SSV_ISSUER=${ISSUER},SSV_KEY_ID=${KEY_ID},RAYON_NUM_THREADS=1" \
+  --set-env-vars "SSV_SIGNING_KEY_FILE=/var/run/secrets/ssv/signing.key,SSV_ISSUER=${ISSUER},SSV_KEY_ID=${KEY_ID},SSV_MAXIMUM_PUBLIC_MATRIX_TERMS=${MAXIMUM_PUBLIC_MATRIX_TERMS},SSV_MAXIMUM_PUBLIC_RHS_TERMS=${MAXIMUM_PUBLIC_RHS_TERMS},RAYON_NUM_THREADS=1" \
   --set-secrets "/var/run/secrets/ssv/signing.key=${SIGNING_SECRET}:${SIGNING_SECRET_VERSION}" \
   --timeout 300s \
   --cpu "${CPU}" \
@@ -179,7 +179,7 @@ gcloud run deploy "${SERVICE}" \
   --concurrency "${CONCURRENCY}" \
   --max "${MAX_INSTANCES}" \
   --max-instances "${MAX_INSTANCES}" \
-  --args "serve,--challenge-lifetime-seconds=${CHALLENGE_LIFETIME_SECONDS},--max-concurrent-validations=1,--request-timeout-seconds=${REQUEST_TIMEOUT_SECONDS}" \
+  --args "serve,--challenge-lifetime-seconds=${CHALLENGE_LIFETIME_SECONDS},--maximum-solution-elements=${MAXIMUM_SOLUTION_ELEMENTS},--allowed-protocol=direct-reference-v1,--allowed-protocol=whir-field192-l2-v4,--allowed-protocol=fast-binary64-unit-circle-v4,--max-concurrent-validations=1,--request-timeout-seconds=${REQUEST_TIMEOUT_SECONDS}" \
   --invoker-iam-check \
   --no-allow-unauthenticated
 ```
@@ -189,6 +189,13 @@ invoker check is enabled, while `--no-allow-unauthenticated` avoids or removes a
 `allUsers` invoker grant. The deployment remains reachable at its HTTPS URL, but
 only callers with `run.routes.invoke` can pass the Cloud Run authentication
 layer.
+
+The two public-term variables and repeated `--allowed-protocol` arguments are
+deployment-owned admission policy. Edit the repeated arguments to disable
+profiles the revision should not serve. The defaults shown in
+`deploy/gcp.env.example` permit at most 4,096 matrix patterns and 4,096 RHS
+patterns per succinct public evaluation. Templates are checked before challenge
+signing, and artifacts are checked again independently of their manifests.
 
 Cloud Run injects `PORT` and requires the ingress container to listen on that
 port on `0.0.0.0`, not `127.0.0.1`. TLS terminates at Cloud Run. See the
@@ -390,6 +397,14 @@ of 32 MiB and the server's own proof-body limit. An oversized request can be
 rejected by Cloud Run before Axum sees it. Cloud Run also limits a non-streamed
 HTTP/1 response to 32 MiB. See [Cloud Run quotas and
 limits](https://cloud.google.com/run/quotas).
+
+The application work budget is also bounded independently of Cloud Run's
+transport limits. `MAXIMUM_SOLUTION_ELEMENTS` bounds the direct verifier's
+solution allocation and linear sparse scan; the matrix/RHS term variables bound
+the periodic work in each succinct public-MLE evaluation; and the protocol
+allowlist can remove the direct linear path entirely. See
+[protocol.md](protocol.md#11-stateless-service-semantics) for the complete
+verifier-work envelope.
 
 The Cloud Run request timeout defaults to 300 seconds and can be configured from
 1 to 3600 seconds. On expiry, Cloud Run closes the connection and returns 504;

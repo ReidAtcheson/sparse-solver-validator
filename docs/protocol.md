@@ -112,7 +112,8 @@ The generator-owned `PublicEvaluationPlan` evaluates these endpoints without
 enumerating rows or RHS entries. It exposes the same reviewed operation plan to
 Field192 and binary64 interpreters, reports exact coefficient/no-wrap metadata,
 and returns deterministic work and binary64 roundoff diagnostics. Validation
-manifests cap matrix and RHS periodic terms before proving or verification.
+manifests cap matrix and RHS periodic terms before proving or verification;
+hosted deployments impose independent ceilings that a manifest cannot raise.
 
 For the current family, endpoint work depends on the registered periods and
 `log2(n)`, not on `n` or `nnz(A)`. A family without such a capability is not
@@ -212,8 +213,8 @@ manifest, statement digest, backend dispatch, and certificate all bind the same
 protocol ID.
 
 The common statement constructor validates problem/challenge consistency,
-compiles the generator, checks dimension and public-evaluator term limits, and
-derives:
+computes the public-evaluator term bounds before generator compilation, checks
+the dimension and term limits, compiles the generator, and derives:
 
 ```text
 transcript_digest = H(
@@ -594,6 +595,35 @@ The service captures validation start time before proof work and completion time
 after it. It refuses certification when the challenge expires during validation
 or the clock moves behind required events. CPU work runs on a blocking pool behind
 body, concurrency, and deadline controls.
+
+The service process owns four admission-policy inputs: maximum solution
+elements, maximum public matrix terms, maximum public RHS terms, and an allowed
+protocol set. They are immutable after startup. A challenge request has no
+protocol choice because the signed problem header is intentionally reusable by
+the direct, exact, and fast profiles. Challenge issuance nevertheless rejects a
+template whose statically computed matrix or RHS term bound exceeds deployment
+policy. Artifact admission first rejects a disabled protocol from the fixed
+container header, then rejects manifest ceilings or recomputed problem terms
+above deployment policy before constructing periodic tables or dispatching a
+backend. A submitter can lower its manifest ceilings but cannot raise these
+deployment ceilings.
+
+For a configured solution bound `N`, matrix-term bound `M`, and RHS-term bound
+`R`, the current verifier work envelope is:
+
+- each v4 succinct verifier performs one public matrix MLE and one public RHS
+  MLE evaluation, visiting at most `M` and `R` periodic patterns respectively;
+  their supporting index arithmetic is `O((M + R) log2(N))`;
+- the remaining exact and fast verification schedule is fixed by the registered
+  protocol profile and logarithmic domain size, and each succinct payload is
+  capped at 64 MiB; and
+- if `direct-reference-v1` is enabled, it may materialize at most `N` binary64
+  solution elements and scan at most `N` rows and `3N - 2` structural
+  nonzeros. Disabling that protocol removes this linear reference path.
+
+Thus the allowlist selects which work envelopes exist, while `N`, `M`, `R`,
+the proof-body limit, concurrency, and request deadline provide their
+deployment-owned bounds. These checks do not add durable request state.
 
 For Cloud Run, the listener binds `0.0.0.0:$PORT`. `0.0.0.0` is not a client URL;
 local clients use `127.0.0.1:$PORT` and deployed clients use the service URL.

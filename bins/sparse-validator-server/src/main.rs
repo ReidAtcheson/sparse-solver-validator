@@ -21,12 +21,15 @@ use serde::Serialize;
 use ssv_canonical::Digest;
 use ssv_problem::ProblemTemplate;
 use ssv_service::{ServiceConfig, StatelessValidatorService, maximum_submission_bytes};
-use ssv_service_protocol::{SignedCertificate, SignedChallenge};
+use ssv_service_protocol::{ProofProtocol, SignedCertificate, SignedChallenge};
 use tokio::sync::Semaphore;
 use tower::limit::ConcurrencyLimitLayer;
 use zeroize::Zeroizing;
 
 const MAX_TEMPLATE_JSON_BYTES: usize = 1024 * 1024;
+const DEFAULT_MAXIMUM_PUBLIC_EVALUATION_TERMS: u64 = 4096;
+const DEFAULT_ALLOWED_PROTOCOLS: &str =
+    "direct-reference-v1,whir-field192-l2-v4,fast-binary64-unit-circle-v4";
 const PACKAGE_VALIDATOR_BUILD: &str =
     concat!("sparse-validator-server/", env!("CARGO_PKG_VERSION"));
 
@@ -69,6 +72,26 @@ enum Command {
         maximum_future_skew_seconds: i64,
         #[arg(long, default_value_t = 16 * 1024 * 1024)]
         maximum_solution_elements: u64,
+        #[arg(
+            long,
+            env = "SSV_MAXIMUM_PUBLIC_MATRIX_TERMS",
+            default_value_t = DEFAULT_MAXIMUM_PUBLIC_EVALUATION_TERMS
+        )]
+        maximum_public_matrix_terms: u64,
+        #[arg(
+            long,
+            env = "SSV_MAXIMUM_PUBLIC_RHS_TERMS",
+            default_value_t = DEFAULT_MAXIMUM_PUBLIC_EVALUATION_TERMS
+        )]
+        maximum_public_rhs_terms: u64,
+        #[arg(
+            long = "allowed-protocol",
+            env = "SSV_ALLOWED_PROTOCOLS",
+            value_delimiter = ',',
+            value_parser = parse_proof_protocol,
+            default_value = DEFAULT_ALLOWED_PROTOCOLS
+        )]
+        allowed_protocols: Vec<ProofProtocol>,
         #[arg(long, default_value_t = 1)]
         max_concurrent_validations: usize,
         #[arg(long, default_value_t = 120)]
@@ -147,6 +170,9 @@ async fn main() -> Result<()> {
             challenge_lifetime_seconds,
             maximum_future_skew_seconds,
             maximum_solution_elements,
+            maximum_public_matrix_terms,
+            maximum_public_rhs_terms,
+            allowed_protocols,
             max_concurrent_validations,
             request_timeout_seconds,
         } => {
@@ -170,6 +196,9 @@ async fn main() -> Result<()> {
                     challenge_lifetime_seconds,
                     maximum_future_skew_seconds,
                     maximum_solution_elements,
+                    maximum_public_matrix_terms,
+                    maximum_public_rhs_terms,
+                    allowed_protocols,
                     validator_build,
                 },
                 signing_key,
@@ -326,6 +355,11 @@ fn select_validator_build(configured: Option<&str>, cloud_run_revision: Option<&
         .to_owned()
 }
 
+fn parse_proof_protocol(value: &str) -> Result<ProofProtocol, String> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned()))
+        .map_err(|error| error.to_string())
+}
+
 fn keygen(signing_key_path: &Path, public_key_path: &Path) -> Result<()> {
     let signing_key = SigningKey::generate(&mut OsRng);
     let signing_key_bytes = Zeroizing::new(signing_key.to_bytes());
@@ -410,7 +444,10 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{PACKAGE_VALIDATOR_BUILD, keygen, load_signing_key, select_validator_build};
+    use super::{
+        PACKAGE_VALIDATOR_BUILD, ProofProtocol, keygen, load_signing_key, parse_proof_protocol,
+        select_validator_build,
+    };
 
     struct KeygenFiles {
         directory: PathBuf,
@@ -470,6 +507,23 @@ mod tests {
     #[test]
     fn empty_explicit_validator_build_is_not_silently_replaced() {
         assert_eq!(select_validator_build(Some(""), Some("revision")), "");
+    }
+
+    #[test]
+    fn configured_protocols_use_the_signed_protocol_names() {
+        assert_eq!(
+            parse_proof_protocol("direct-reference-v1").unwrap(),
+            ProofProtocol::DirectReferenceV1
+        );
+        assert_eq!(
+            parse_proof_protocol("whir-field192-l2-v4").unwrap(),
+            ProofProtocol::WhirField192L2V4
+        );
+        assert_eq!(
+            parse_proof_protocol("fast-binary64-unit-circle-v4").unwrap(),
+            ProofProtocol::FastBinary64UnitCircleV4
+        );
+        assert!(parse_proof_protocol("unknown").is_err());
     }
 
     #[test]

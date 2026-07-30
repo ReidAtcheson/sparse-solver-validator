@@ -30,5 +30,6 @@ pub use randomness::{
 pub use spec::{
     BoundaryRule, DiagonalConstruction, Dyadic, FinalizedProblem, MAX_CHALLENGE_CONTEXT_BYTES,
     MAX_DIMENSION, MAX_FRACTIONAL_BITS, MAX_PERIOD_BITS, MatrixSpec, OffDiagonalValues,
-    ProblemError, ProblemSchema, ProblemTemplate, RequestedOutput, RhsSpec, TemplateSchema,
+    ProblemError, ProblemSchema, ProblemTemplate, PublicEvaluationTerms, RequestedOutput, RhsSpec,
+    TemplateSchema,
 };
