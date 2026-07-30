@@ -14,7 +14,9 @@ use ssv_problem::{
 use ssv_relation::{ExactRelation, RESIDUAL_MAGNITUDE_BITS, RelationError, audit_field_modulus};
 use ssv_service_protocol::ProofProtocol;
 use ssv_solution::Solution;
-use ssv_validation::{PublicStatement, ValidationBackend, VerifierStatement};
+use ssv_validation::{
+    PublicStatement, ValidationBackend, ValidationCancellation, VerifierStatement,
+};
 use ssv_whir_pcs::transcript::VerifierMessage;
 use ssv_whir_pcs::{
     Certificate, OpeningClaims, PcsError, PcsField, PcsProtocol, ProverMetrics, ProverTranscript,
@@ -117,6 +119,8 @@ pub enum ExactError {
     ProverInconsistent,
     #[error("exact payload exceeds its fixed resource limit")]
     PayloadLimit,
+    #[error("exact verification was cancelled")]
+    Cancelled,
     #[error("size or work accounting overflow")]
     SizeOverflow,
     #[error(transparent)]
@@ -150,8 +154,9 @@ impl ValidationBackend for ExactBackend {
     fn verify(
         statement: &VerifierStatement<'_>,
         payload: &[u8],
+        cancellation: &ValidationCancellation,
     ) -> Result<Self::VerifierReport, Self::Error> {
-        verify_payload(statement, payload)
+        verify_payload_with_cancellation(statement, payload, cancellation)
     }
 }
 
@@ -261,10 +266,20 @@ pub fn prove_payload(
     ))
 }
 
-pub fn verify_payload(
+#[cfg(test)]
+fn verify_payload(
     statement: &VerifierStatement<'_>,
     payload: &[u8],
 ) -> Result<ExactVerifierReport, ExactError> {
+    verify_payload_with_cancellation(statement, payload, &ValidationCancellation::never())
+}
+
+fn verify_payload_with_cancellation(
+    statement: &VerifierStatement<'_>,
+    payload: &[u8],
+    cancellation: &ValidationCancellation,
+) -> Result<ExactVerifierReport, ExactError> {
+    require_not_cancelled(cancellation)?;
     if statement.protocol() != ProofProtocol::WhirField192L2V4 {
         return Err(ExactError::WrongProtocol);
     }
@@ -279,16 +294,21 @@ pub fn verify_payload(
         .ok_or(ExactError::SizeOverflow)?;
     let pcs = PcsProtocol::new(vector_len, 1)?;
     let certificate = Certificate::decode(payload, MAX_EXACT_PAYLOAD_BYTES)?;
+    require_not_cancelled(cancellation)?;
     let statement_digest = statement.transcript_digest().into_bytes();
     let hook_output = RefCell::new(None);
     let hook_slot = &hook_output;
-    let pcs_metrics =
-        pcs.verify_with_transcript(&statement_digest, &certificate, |transcript| {
-            let hook = verify_hook(transcript, statement, metadata, payload.len())?;
-            let claims = hook.claims.clone();
-            *hook_slot.borrow_mut() = Some(hook);
-            Ok::<_, ExactError>(claims)
-        })?;
+    let pcs_metrics = pcs.verify_with_transcript(&statement_digest, &certificate, |transcript| {
+        let hook = verify_hook(transcript, statement, metadata, payload.len(), cancellation)?;
+        let claims = hook.claims.clone();
+        *hook_slot.borrow_mut() = Some(hook);
+        Ok::<_, ExactError>(claims)
+    });
+    let pcs_metrics = match pcs_metrics {
+        Err(_) if cancellation.is_cancelled() => return Err(ExactError::Cancelled),
+        result => result?,
+    };
+    require_not_cancelled(cancellation)?;
     let hook = hook_output.into_inner().ok_or(ExactError::Transcript)?;
     Ok(ExactVerifierReport {
         residual: hook.residual,
@@ -443,7 +463,9 @@ fn verify_hook(
     statement: &VerifierStatement<'_>,
     metadata: PublicEvaluationMetadata,
     certificate_bytes: usize,
+    cancellation: &ValidationCancellation,
 ) -> Result<VerifierHookOutput, ExactError> {
+    require_not_cancelled(cancellation)?;
     let padded_len = padded_len(statement.dimension())?;
     let variables = padded_len.ilog2() as usize;
     receive_protocol_header(transcript, statement.dimension(), padded_len, metadata)?;
@@ -461,6 +483,7 @@ fn verify_hook(
         .map_err(|error| ExactError::Sumcheck(error.to_string()))?;
     let range_endpoint = verify_sumcheck(transcript, range_statement)
         .map_err(|error| ExactError::Sumcheck(error.to_string()))?;
+    require_not_cancelled(cancellation)?;
     let range_digit_values = read_fields(transcript, COMMITTED_DIGIT_COLUMNS)?;
     let mut claims = ClaimAccumulator::default();
     claims.push_digit_block(&range_endpoint.point, 0, &range_digit_values)?;
@@ -484,12 +507,14 @@ fn verify_hook(
     let residual_row_value = reconstruct_residual(&residual_at_row)?;
     let plan = statement.public_evaluator();
     let rhs = plan.evaluate_rhs_mle_zero_padded(&FieldInterpreter, &row_point)?;
+    require_not_cancelled(cancellation)?;
     let initial_matvec_claim = scale_rhs(rhs.value, metadata)? + residual_row_value;
     let matvec_statement =
         SumcheckStatement::new(b"matvec", PRODUCT_DEGREE, variables, initial_matvec_claim)
             .map_err(|error| ExactError::Sumcheck(error.to_string()))?;
     let matvec_endpoint = verify_sumcheck(transcript, matvec_statement)
         .map_err(|error| ExactError::Sumcheck(error.to_string()))?;
+    require_not_cancelled(cancellation)?;
     let witness_at_column = read_fields(transcript, WITNESS_TABLE_COLUMNS)?;
     claims.push_digit_block(&matvec_endpoint.point, 0, &witness_at_column)?;
     let witness_value = reconstruct_witness(&witness_at_column)?;
@@ -498,6 +523,7 @@ fn verify_hook(
         &row_point,
         &matvec_endpoint.point,
     )?;
+    require_not_cancelled(cancellation)?;
     if matvec_endpoint.claim != matrix.value * witness_value {
         return Err(ExactError::SumcheckEndpoint("matvec"));
     }
@@ -506,6 +532,7 @@ fn verify_hook(
         .map_err(|error| ExactError::Sumcheck(error.to_string()))?;
     let norm_endpoint = verify_sumcheck(transcript, norm_statement)
         .map_err(|error| ExactError::Sumcheck(error.to_string()))?;
+    require_not_cancelled(cancellation)?;
     let residual_at_norm = read_fields(transcript, RESIDUAL_TABLE_COLUMNS)?;
     claims.push_digit_block(
         &norm_endpoint.point,
@@ -561,6 +588,13 @@ fn verify_hook(
             accounted_high_watermark_bytes,
         },
     })
+}
+
+fn require_not_cancelled(cancellation: &ValidationCancellation) -> Result<(), ExactError> {
+    if cancellation.is_cancelled() {
+        return Err(ExactError::Cancelled);
+    }
+    Ok(())
 }
 
 struct FieldInterpreter;
@@ -936,6 +970,16 @@ mod tests {
         let statement = fixture_statement(8);
         let solution = Solution::new(vec![1.0; 8], 8).unwrap();
         let (payload, prover) = prove_payload(&statement, &solution).unwrap();
+        let cancellation = ValidationCancellation::new();
+        cancellation.cancel();
+        assert!(matches!(
+            verify_payload_with_cancellation(
+                &statement.verifier_statement(),
+                &payload,
+                &cancellation
+            ),
+            Err(ExactError::Cancelled)
+        ));
         let verifier = verify_payload(&statement.verifier_statement(), &payload).unwrap();
         assert_eq!(prover.residual.numerator, BigUint::from(0_u8));
         assert_eq!(verifier.residual, prover.residual);

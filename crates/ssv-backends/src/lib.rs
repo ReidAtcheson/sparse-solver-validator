@@ -19,7 +19,7 @@ use ssv_service_protocol::{
 use ssv_solution::Solution;
 use ssv_validation::{
     ArtifactPrelude, BackendProtocolMismatch, BackendVerificationError, PublicStatement,
-    ReferenceValidationBackend, ValidationBackend,
+    ReferenceValidationBackend, ValidationBackend, ValidationCancellation,
 };
 use thiserror::Error;
 
@@ -101,15 +101,23 @@ pub fn prove_single_stage(
 
 /// Exhaustively dispatches a strictly framed common artifact.
 pub fn verify(prelude: &ArtifactPrelude<'_>) -> Result<BackendVerifierReport, BackendError> {
+    verify_with_cancellation(prelude, &ValidationCancellation::never())
+}
+
+/// Exhaustively dispatches an artifact with cooperative cancellation.
+pub fn verify_with_cancellation(
+    prelude: &ArtifactPrelude<'_>,
+    cancellation: &ValidationCancellation,
+) -> Result<BackendVerifierReport, BackendError> {
     match prelude.statement().manifest().protocol {
         ProofProtocol::DirectReferenceV1 => Ok(BackendVerifierReport::Direct(
-            prelude.verify_reference_with::<DirectBackend>()?,
+            prelude.verify_reference_with_cancellation::<DirectBackend>(cancellation)?,
         )),
         ProofProtocol::WhirField192L2V4 => Ok(BackendVerifierReport::Exact(
-            prelude.verify_with::<ExactBackend>()?,
+            prelude.verify_with_cancellation::<ExactBackend>(cancellation)?,
         )),
         ProofProtocol::FastBinary64UnitCircleV4 => Ok(BackendVerifierReport::Fast(Box::new(
-            prelude.verify_with::<FastBackend>()?,
+            prelude.verify_with_cancellation::<FastBackend>(cancellation)?,
         ))),
     }
 }

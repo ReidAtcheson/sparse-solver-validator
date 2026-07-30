@@ -8,6 +8,9 @@
 
 #![forbid(unsafe_code)]
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use ssv_canonical::{DecodeLimits, Digest, Encoder, Reader, domain_separated_digest};
 use ssv_problem::{
     FinalizedProblem, FinalizedRandomness, GeneratedProblem, ProblemError, PublicEvaluationPlan,
@@ -43,6 +46,54 @@ pub const MAX_SUCCINCT_ARTIFACT_BYTES: usize =
     MAX_CHALLENGE_BYTES + MAX_PUBLIC_STATEMENT_BYTES + MAX_SUCCINCT_PAYLOAD_BYTES + 128;
 pub const MAX_ARTIFACT_BYTES: usize =
     MAX_CHALLENGE_BYTES + MAX_PUBLIC_STATEMENT_BYTES + MAX_BACKEND_PAYLOAD_BYTES + 128;
+
+/// Shared cooperative-cancellation signal for one validation operation.
+///
+/// Clones observe the same state. Registered backends poll this token at
+/// bounded phase or loop checkpoints; cancellation does not create a thread,
+/// timer, or durable service state.
+#[derive(Clone, Debug)]
+pub struct ValidationCancellation {
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+impl ValidationCancellation {
+    /// Creates an active signal that can be cancelled from another thread.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            cancelled: Some(Arc::new(AtomicBool::new(false))),
+        }
+    }
+
+    /// Creates an allocation-free signal that never becomes cancelled.
+    #[must_use]
+    pub const fn never() -> Self {
+        Self { cancelled: None }
+    }
+
+    /// Requests cooperative cancellation. Calling this on [`Self::never`] is
+    /// intentionally a no-op.
+    pub fn cancel(&self) {
+        if let Some(cancelled) = self.cancelled.as_ref() {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    /// Reports whether cancellation has been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+    }
+}
+
+impl Default for ValidationCancellation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Caller-owned ceilings applied while admitting an untrusted proof artifact.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -174,6 +225,9 @@ pub enum BackendVerificationError<E> {
 /// commitment as a separate local computation stage is useful. Whether that
 /// commitment is followed by Fiat--Shamir or interaction is a property of the
 /// concrete backend, not this common statement/framing layer.
+///
+/// Verifiers must poll the supplied cancellation signal at bounded checkpoints
+/// in work that scales with untrusted input or configured resource ceilings.
 pub trait ValidationBackend {
     type ProverContext;
     type ProverReport;
@@ -191,6 +245,7 @@ pub trait ValidationBackend {
     fn verify(
         statement: &VerifierStatement<'_>,
         payload: &[u8],
+        cancellation: &ValidationCancellation,
     ) -> Result<Self::VerifierReport, Self::Error>;
 }
 
@@ -201,6 +256,9 @@ pub trait ValidationBackend {
 /// backends must implement [`ValidationBackend`] instead; its restricted
 /// [`VerifierStatement`] makes an accidental `O(nnz(A))` verifier scan
 /// impossible at the API boundary.
+///
+/// Verifiers must poll the supplied cancellation signal at bounded checkpoints
+/// in size-dependent decoding and relation scans.
 pub trait ReferenceValidationBackend {
     type ProverContext;
     type ProverReport;
@@ -218,6 +276,7 @@ pub trait ReferenceValidationBackend {
     fn verify(
         statement: &PublicStatement,
         payload: &[u8],
+        cancellation: &ValidationCancellation,
     ) -> Result<Self::VerifierReport, Self::Error>;
 }
 
@@ -559,24 +618,14 @@ impl<'a> ArtifactPrelude<'a> {
     pub fn verify_with<B: ValidationBackend>(
         &self,
     ) -> Result<B::VerifierReport, BackendVerificationError<B::Error>> {
-        let artifact_protocol = self.statement.manifest.protocol;
-        if artifact_protocol != B::PROTOCOL {
-            return Err(BackendVerificationError::ProtocolMismatch(
-                BackendProtocolMismatch {
-                    artifact_protocol,
-                    backend_protocol: B::PROTOCOL,
-                },
-            ));
-        }
-        B::verify(&self.statement.verifier_statement(), self.payload)
-            .map_err(BackendVerificationError::Backend)
+        self.verify_with_cancellation::<B>(&ValidationCancellation::never())
     }
 
-    /// Dispatches a non-succinct oracle backend with explicit full-problem
-    /// access. Keeping this separate from [`Self::verify_with`] prevents a
-    /// future succinct backend from silently growing a row-scanning path.
-    pub fn verify_reference_with<B: ReferenceValidationBackend>(
+    /// Dispatches a succinct backend with a shared cooperative-cancellation
+    /// signal.
+    pub fn verify_with_cancellation<B: ValidationBackend>(
         &self,
+        cancellation: &ValidationCancellation,
     ) -> Result<B::VerifierReport, BackendVerificationError<B::Error>> {
         let artifact_protocol = self.statement.manifest.protocol;
         if artifact_protocol != B::PROTOCOL {
@@ -587,7 +636,39 @@ impl<'a> ArtifactPrelude<'a> {
                 },
             ));
         }
-        B::verify(&self.statement, self.payload).map_err(BackendVerificationError::Backend)
+        B::verify(
+            &self.statement.verifier_statement(),
+            self.payload,
+            cancellation,
+        )
+        .map_err(BackendVerificationError::Backend)
+    }
+
+    /// Dispatches a non-succinct oracle backend with explicit full-problem
+    /// access. Keeping this separate from [`Self::verify_with`] prevents a
+    /// future succinct backend from silently growing a row-scanning path.
+    pub fn verify_reference_with<B: ReferenceValidationBackend>(
+        &self,
+    ) -> Result<B::VerifierReport, BackendVerificationError<B::Error>> {
+        self.verify_reference_with_cancellation::<B>(&ValidationCancellation::never())
+    }
+
+    /// Dispatches a non-succinct oracle backend with cooperative cancellation.
+    pub fn verify_reference_with_cancellation<B: ReferenceValidationBackend>(
+        &self,
+        cancellation: &ValidationCancellation,
+    ) -> Result<B::VerifierReport, BackendVerificationError<B::Error>> {
+        let artifact_protocol = self.statement.manifest.protocol;
+        if artifact_protocol != B::PROTOCOL {
+            return Err(BackendVerificationError::ProtocolMismatch(
+                BackendProtocolMismatch {
+                    artifact_protocol,
+                    backend_protocol: B::PROTOCOL,
+                },
+            ));
+        }
+        B::verify(&self.statement, self.payload, cancellation)
+            .map_err(BackendVerificationError::Backend)
     }
 }
 
@@ -692,6 +773,7 @@ mod tests {
         fn verify(
             _statement: &VerifierStatement<'_>,
             _payload: &[u8],
+            _cancellation: &ValidationCancellation,
         ) -> Result<Self::VerifierReport, Self::Error> {
             panic!("wrong-protocol backend must not be invoked")
         }
@@ -718,6 +800,7 @@ mod tests {
         fn verify(
             _statement: &PublicStatement,
             _payload: &[u8],
+            _cancellation: &ValidationCancellation,
         ) -> Result<Self::VerifierReport, Self::Error> {
             panic!("wrong-protocol backend must not be invoked")
         }
@@ -769,6 +852,19 @@ mod tests {
             ValidationManifest::default().max_public_matrix_terms,
             ValidationManifest::default().max_public_rhs_terms,
         )
+    }
+
+    #[test]
+    fn cancellation_clones_share_state_while_never_signal_stays_inert() {
+        let cancellation = ValidationCancellation::new();
+        let observer = cancellation.clone();
+        assert!(!observer.is_cancelled());
+        cancellation.cancel();
+        assert!(observer.is_cancelled());
+
+        let never = ValidationCancellation::never();
+        never.cancel();
+        assert!(!never.is_cancelled());
     }
 
     #[test]

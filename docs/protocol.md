@@ -593,8 +593,25 @@ problems, which require the explicit local-validator flag.
 
 The service captures validation start time before proof work and completion time
 after it. It refuses certification when the challenge expires during validation
-or the clock moves behind required events. CPU work runs on a blocking pool behind
-body, concurrency, and deadline controls.
+or the clock moves behind required events. CPU work runs on a blocking pool
+behind body, concurrency, and deadline controls. The application deadline
+starts once the bounded proof body reaches the validation handler and includes
+both worker-capacity wait and validation/certification work.
+
+When that deadline expires, the handler signals a per-request cooperative
+cancellation token and waits for the blocking worker to exit before returning
+`408`. The worker retains its internal capacity permit during this cleanup, so
+a timed-out validation cannot release capacity while it still consumes CPU.
+Registered backends poll cancellation in size-dependent loops and between
+bounded phases. Fixed-profile library calls that cannot be interrupted are
+bounded by the protocol and deployment ceilings; a response can therefore lag
+the nominal deadline until the current bounded phase returns.
+
+Graceful shutdown stops accepting new connections and waits for admitted
+requests. An in-flight validation normally completes or reaches its configured
+deadline. If its request future is dropped, a guard signals cancellation; its
+worker still owns capacity until it exits. A forced process termination relies
+on the operating system to stop all remaining threads.
 
 The service process owns four admission-policy inputs: maximum solution
 elements, maximum public matrix terms, maximum public RHS terms, and an allowed

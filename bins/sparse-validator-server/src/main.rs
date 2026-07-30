@@ -20,9 +20,14 @@ use rand_core::{OsRng, RngCore};
 use serde::Serialize;
 use ssv_canonical::Digest;
 use ssv_problem::ProblemTemplate;
-use ssv_service::{ServiceConfig, StatelessValidatorService, maximum_submission_bytes};
+use ssv_service::{
+    ServiceConfig, ServiceError, StatelessValidatorService, ValidationCancellation,
+    maximum_submission_bytes,
+};
 use ssv_service_protocol::{ProofProtocol, SignedCertificate, SignedChallenge};
 use tokio::sync::Semaphore;
+use tokio::task::JoinError;
+use tokio::time::Instant;
 use tower::limit::ConcurrencyLimitLayer;
 use zeroize::Zeroizing;
 
@@ -94,6 +99,8 @@ enum Command {
         allowed_protocols: Vec<ProofProtocol>,
         #[arg(long, default_value_t = 1)]
         max_concurrent_validations: usize,
+        /// Request timeout. For validation, the deadline starts after body
+        /// admission and includes capacity wait and cooperative cancellation.
         #[arg(long, default_value_t = 120)]
         request_timeout_seconds: u64,
     },
@@ -103,6 +110,7 @@ enum Command {
 struct AppState {
     service: Arc<StatelessValidatorService>,
     validation_slots: Arc<Semaphore>,
+    validation_timeout: Duration,
 }
 
 #[derive(Debug, Serialize)]
@@ -136,6 +144,14 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             kind: "internal-error",
             message: error.to_string(),
+        }
+    }
+
+    fn timeout() -> Self {
+        Self {
+            status: StatusCode::REQUEST_TIMEOUT,
+            kind: "request-timeout",
+            message: "validation exceeded the configured deadline".to_owned(),
         }
     }
 }
@@ -222,42 +238,48 @@ async fn serve(
     max_proof_bytes: usize,
     request_timeout_seconds: u64,
 ) -> Result<()> {
+    let validation_timeout = Duration::from_secs(request_timeout_seconds);
+    let challenge_timeout = validation_timeout;
+    let challenge_timeout_layer =
+        middleware::from_fn(move |request: Request, next: Next| async move {
+            match tokio::time::timeout(challenge_timeout, next.run(request)).await {
+                Ok(response) => response,
+                Err(_) => (
+                    StatusCode::REQUEST_TIMEOUT,
+                    Json(ApiErrorBody {
+                        error: "request-timeout",
+                        message: "request exceeded the configured deadline".to_owned(),
+                    }),
+                )
+                    .into_response(),
+            }
+        });
     let state = AppState {
         service: Arc::new(service),
         validation_slots: Arc::new(Semaphore::new(max_concurrent_validations)),
+        validation_timeout,
     };
-    let request_timeout = Duration::from_secs(request_timeout_seconds);
-    let timeout_layer = middleware::from_fn(move |request: Request, next: Next| async move {
-        match tokio::time::timeout(request_timeout, next.run(request)).await {
-            Ok(response) => response,
-            Err(_) => (
-                StatusCode::REQUEST_TIMEOUT,
-                Json(ApiErrorBody {
-                    error: "request-timeout",
-                    message: "request exceeded the configured deadline".to_owned(),
-                }),
-            )
-                .into_response(),
-        }
-    });
     let app = Router::new()
         // Cloud Run reserves some paths ending in `z`; keep this endpoint on
         // an ordinary application path so requests reach the container.
         .route("/health", get(health))
         .route(
             "/v1/challenges",
-            post(issue_challenge).layer(DefaultBodyLimit::max(MAX_TEMPLATE_JSON_BYTES)),
+            post(issue_challenge)
+                .layer(DefaultBodyLimit::max(MAX_TEMPLATE_JSON_BYTES))
+                .layer(challenge_timeout_layer),
         )
         .route(
             "/v1/validate",
             post(validate)
                 .layer::<_, std::convert::Infallible>(DefaultBodyLimit::max(max_proof_bytes))
+                // Bound admitted bodies and handlers. The separate semaphore
+                // remains owned by a blocking worker until that worker exits.
                 .layer::<_, std::convert::Infallible>(ConcurrencyLimitLayer::new(
                     max_concurrent_validations,
                 )),
         )
-        .with_state(state)
-        .layer(timeout_layer);
+        .with_state(state);
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .with_context(|| format!("could not bind HTTP listener to {address}"))?;
@@ -293,31 +315,127 @@ async fn issue_challenge(
         .map_err(|error| ApiError::invalid("invalid-problem-template", error))
 }
 
+enum ValidationTaskError {
+    Clock(anyhow::Error),
+    Submission(ServiceError),
+    Certificate(ServiceError),
+}
+
+#[derive(Debug)]
+enum ValidationRun<T, E> {
+    Completed(Result<T, E>),
+    TimedOut,
+    CapacityClosed,
+    WorkerFailed(JoinError),
+}
+
+struct CancelOnDrop {
+    cancellation: Option<ValidationCancellation>,
+}
+
+impl CancelOnDrop {
+    fn new(cancellation: ValidationCancellation) -> Self {
+        Self {
+            cancellation: Some(cancellation),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.cancellation = None;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(cancellation) = self.cancellation.as_ref() {
+            cancellation.cancel();
+        }
+    }
+}
+
+async fn run_validation_until<T, E, F>(
+    validation_slots: Arc<Semaphore>,
+    deadline: Instant,
+    operation: F,
+) -> ValidationRun<T, E>
+where
+    T: Send + 'static,
+    E: Send + 'static,
+    F: FnOnce(ValidationCancellation) -> Result<T, E> + Send + 'static,
+{
+    let permit = match tokio::time::timeout_at(deadline, validation_slots.acquire_owned()).await {
+        Err(_) => return ValidationRun::TimedOut,
+        Ok(Err(_)) => return ValidationRun::CapacityClosed,
+        Ok(Ok(permit)) => permit,
+    };
+    let cancellation = ValidationCancellation::new();
+    let worker_cancellation = cancellation.clone();
+    let mut cancel_on_drop = CancelOnDrop::new(cancellation.clone());
+    let mut worker = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation(worker_cancellation)
+    });
+    let outcome = match tokio::time::timeout_at(deadline, &mut worker).await {
+        Ok(Ok(result)) => ValidationRun::Completed(result),
+        Ok(Err(error)) => ValidationRun::WorkerFailed(error),
+        Err(_) => {
+            cancellation.cancel();
+            let _ = worker.await;
+            ValidationRun::TimedOut
+        }
+    };
+    cancel_on_drop.disarm();
+    outcome
+}
+
 async fn validate(
     State(state): State<AppState>,
     proof: Bytes,
 ) -> Result<Json<SignedCertificate>, ApiError> {
+    let deadline = Instant::now()
+        .checked_add(state.validation_timeout)
+        .ok_or_else(|| ApiError::internal("validation deadline exceeds the platform clock"))?;
     let service = state.service.clone();
-    let permit = state
-        .validation_slots
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(ApiError::internal)?;
-    let validation_started_at = now_unix_seconds().map_err(ApiError::internal)?;
-    let validated = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        service.validate_owned_submission(proof, validation_started_at)
-    })
-    .await
-    .map_err(ApiError::internal)?
-    .map_err(|error| ApiError::invalid("invalid-validation-submission", error))?;
-    let certificate_issued_at = now_unix_seconds().map_err(ApiError::internal)?;
-    let certified = state
-        .service
-        .certify(validated, certificate_issued_at)
-        .map_err(|error| ApiError::invalid("certificate-policy-rejected", error))?;
-    Ok(Json(certified.certificate))
+    let outcome = run_validation_until(
+        state.validation_slots.clone(),
+        deadline,
+        move |cancellation| {
+            let validation_started_at = now_unix_seconds().map_err(ValidationTaskError::Clock)?;
+            let validated = service
+                .validate_owned_submission_with_cancellation(
+                    proof,
+                    validation_started_at,
+                    &cancellation,
+                )
+                .map_err(ValidationTaskError::Submission)?;
+            if cancellation.is_cancelled() {
+                return Err(ValidationTaskError::Submission(
+                    ServiceError::ValidationCancelled,
+                ));
+            }
+            let certificate_issued_at = now_unix_seconds().map_err(ValidationTaskError::Clock)?;
+            service
+                .certify(validated, certificate_issued_at)
+                .map(|certified| certified.certificate)
+                .map_err(ValidationTaskError::Certificate)
+        },
+    )
+    .await;
+    match outcome {
+        ValidationRun::Completed(Ok(certificate)) => Ok(Json(certificate)),
+        ValidationRun::Completed(Err(ValidationTaskError::Clock(error))) => {
+            Err(ApiError::internal(error))
+        }
+        ValidationRun::Completed(Err(ValidationTaskError::Submission(error))) => {
+            Err(ApiError::invalid("invalid-validation-submission", error))
+        }
+        ValidationRun::Completed(Err(ValidationTaskError::Certificate(error))) => {
+            Err(ApiError::invalid("certificate-policy-rejected", error))
+        }
+        ValidationRun::TimedOut => Err(ApiError::timeout()),
+        ValidationRun::CapacityClosed => Err(ApiError::internal("validation capacity is closed")),
+        ValidationRun::WorkerFailed(error) => Err(ApiError::internal(error)),
+    }
 }
 
 async fn shutdown_signal() {
@@ -442,12 +560,17 @@ fn now_unix_seconds() -> Result<i64> {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        PACKAGE_VALIDATOR_BUILD, ProofProtocol, keygen, load_signing_key, parse_proof_protocol,
-        select_validator_build,
+        PACKAGE_VALIDATOR_BUILD, ProofProtocol, ValidationRun, keygen, load_signing_key,
+        parse_proof_protocol, run_validation_until, select_validator_build,
     };
+    use tokio::sync::Semaphore;
+    use tokio::time::Instant;
 
     struct KeygenFiles {
         directory: PathBuf,
@@ -524,6 +647,78 @@ mod tests {
             ProofProtocol::FastBinary64UnitCircleV4
         );
         assert!(parse_proof_protocol("unknown").is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_out_validation_stops_before_capacity_is_reused() {
+        let slots = Arc::new(Semaphore::new(1));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = stopped.clone();
+        let first = run_validation_until(
+            slots.clone(),
+            Instant::now() + Duration::from_millis(20),
+            move |cancellation| {
+                while !cancellation.is_cancelled() {
+                    std::thread::yield_now();
+                }
+                worker_stopped.store(true, Ordering::Release);
+                Ok::<(), ()>(())
+            },
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ValidationRun::TimedOut));
+        assert!(stopped.load(Ordering::Acquire));
+        assert_eq!(slots.available_permits(), 1);
+
+        let second = run_validation_until(slots, Instant::now() + Duration::from_secs(1), |_| {
+            Ok::<u8, ()>(17)
+        })
+        .await;
+        assert!(matches!(second, ValidationRun::Completed(Ok(17))));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_validation_waiter_cancels_its_worker() {
+        let slots = Arc::new(Semaphore::new(1));
+        let started = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_started = started.clone();
+        let worker_stopped = stopped.clone();
+        let task = tokio::spawn(run_validation_until(
+            slots.clone(),
+            Instant::now() + Duration::from_secs(10),
+            move |cancellation| {
+                worker_started.store(true, Ordering::Release);
+                while !cancellation.is_cancelled() {
+                    std::thread::yield_now();
+                }
+                worker_stopped.store(true, Ordering::Release);
+                Ok::<(), ()>(())
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !stopped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let permit = tokio::time::timeout(Duration::from_secs(1), slots.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
     }
 
     #[test]

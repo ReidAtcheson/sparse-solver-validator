@@ -14,7 +14,9 @@ use ssv_service_protocol::{
     MAX_CHALLENGE_BYTES, ProofProtocol, ResidualMetrics, SignedChallenge, ValidationManifest,
 };
 use ssv_solution::{Solution, SolutionError};
-use ssv_validation::{MAX_BACKEND_PAYLOAD_BYTES, PublicStatement, ReferenceValidationBackend};
+use ssv_validation::{
+    MAX_BACKEND_PAYLOAD_BYTES, PublicStatement, ReferenceValidationBackend, ValidationCancellation,
+};
 use thiserror::Error;
 
 const MAGIC: &[u8; 8] = b"SSVPRF\0\0";
@@ -41,6 +43,7 @@ const BACKEND_FIXED_BYTES: usize = 8 // magic
     + 2 + 2 + 8 // solution frame tag, version, and byte length
     + 8 // solution element count
     + 2 + 2 + 8; // final frame tag, version, and zero length
+const CANCELLATION_CHECK_INTERVAL: usize = 1024;
 
 pub const MAX_APPLICATION_HEADER_BYTES: usize = MAX_CHALLENGE_BYTES;
 pub const MAX_PUBLIC_CONTEXT_BYTES: usize = 1024 * 1024;
@@ -98,6 +101,8 @@ pub enum DirectError {
     WrongProtocol,
     #[error("problem dimension exceeds the manifest's solution-element limit")]
     ResourceLimit,
+    #[error("direct verification was cancelled")]
+    Cancelled,
     #[error("signed-challenge flag and application-header presence disagree")]
     HeaderFlagMismatch,
     #[error("application header is not a canonical signed challenge: {0}")]
@@ -152,8 +157,9 @@ impl ReferenceValidationBackend for DirectBackend {
     fn verify(
         statement: &PublicStatement,
         payload: &[u8],
+        cancellation: &ValidationCancellation,
     ) -> Result<Self::VerifierReport, Self::Error> {
-        verify_backend_payload(statement, payload)
+        verify_backend_payload(statement, payload, cancellation)
     }
 }
 
@@ -277,7 +283,9 @@ fn prove_backend_payload(
 fn verify_backend_payload(
     statement: &PublicStatement,
     payload: &[u8],
+    cancellation: &ValidationCancellation,
 ) -> Result<DirectVerifierReport, DirectError> {
+    require_not_cancelled(cancellation)?;
     validate_backend_statement(statement)?;
     let dimension = statement.generated().dimension();
     let expected_payload =
@@ -336,7 +344,10 @@ fn verify_backend_payload(
     values
         .try_reserve_exact(count)
         .map_err(|_| DirectError::ResourceLimit)?;
-    for _ in 0..count {
+    for index in 0..count {
+        if index.is_multiple_of(CANCELLATION_CHECK_INTERVAL) {
+            require_not_cancelled(cancellation)?;
+        }
         values.push(f64::from_bits(input.read_u64().map_err(framing)?));
     }
     if input.read_u16().map_err(framing)? != BACKEND_FINAL_FRAME
@@ -348,8 +359,13 @@ fn verify_backend_payload(
         ));
     }
     input.finish().map_err(framing)?;
-    let solution = Solution::new(values, dimension)?;
-    let relation = evaluate_relation(statement.generated(), solution.as_slice())?;
+    let solution =
+        Solution::new_with_cancellation(values, dimension, || cancellation.is_cancelled())
+            .map_err(|error| match error {
+                SolutionError::Cancelled => DirectError::Cancelled,
+                other => DirectError::Solution(other),
+            })?;
+    let relation = evaluate_relation(statement.generated(), solution.as_slice(), cancellation)?;
     Ok(DirectVerifierReport {
         residual: relation.residual,
         rows_visited: relation.rows_visited,
@@ -389,6 +405,7 @@ fn validate_solution_values(values: &[f64]) -> Result<(), DirectError> {
 fn evaluate_relation(
     generated: &GeneratedProblem,
     solution: &[f64],
+    cancellation: &ValidationCancellation,
 ) -> Result<RelationEvaluation, DirectError> {
     if solution.len() != generated.dimension() {
         return Err(SolutionError::WrongLength {
@@ -402,6 +419,9 @@ fn evaluate_relation(
     let mut nonzeros_visited = 0_u64;
 
     for row_index in 0..generated.dimension() {
+        if row_index.is_multiple_of(CANCELLATION_CHECK_INTERVAL) {
+            require_not_cancelled(cancellation)?;
+        }
         let mut ax = 0.0_f64;
         let row = generated
             .row(row_index)
@@ -452,6 +472,13 @@ fn evaluate_relation(
         rows_visited: generated.dimension() as u64,
         nonzeros_visited,
     })
+}
+
+fn require_not_cancelled(cancellation: &ValidationCancellation) -> Result<(), DirectError> {
+    if cancellation.is_cancelled() {
+        return Err(DirectError::Cancelled);
+    }
+    Ok(())
 }
 
 impl DirectArtifact {
@@ -598,7 +625,11 @@ impl DirectArtifact {
 
     /// Recomputes `Ax-b` in the generator's canonical row/column order.
     pub fn verify_relation(&self) -> Result<ValidatedDirectOutput, DirectError> {
-        let relation = evaluate_relation(&self.generated, self.solution.as_slice())?;
+        let relation = evaluate_relation(
+            &self.generated,
+            self.solution.as_slice(),
+            &ValidationCancellation::never(),
+        )?;
         Ok(ValidatedDirectOutput {
             problem_digest: self.problem_digest,
             validation_manifest_digest: self.validation_manifest_digest,
@@ -930,6 +961,14 @@ mod tests {
 
         let artifact = encode_artifact(&statement, &payload).unwrap();
         let prelude = ArtifactPrelude::parse(&artifact).unwrap();
+        let cancellation = ValidationCancellation::new();
+        cancellation.cancel();
+        assert!(matches!(
+            prelude.verify_reference_with_cancellation::<DirectBackend>(&cancellation),
+            Err(ssv_validation::BackendVerificationError::Backend(
+                DirectError::Cancelled
+            ))
+        ));
         let report = prelude.verify_reference_with::<DirectBackend>().unwrap();
         let legacy = DirectArtifact::from_bytes(
             &DirectArtifact::create(&problem, &manifest, None, &solution).unwrap(),
@@ -990,44 +1029,45 @@ mod tests {
         let (payload, _) =
             <DirectBackend as ReferenceValidationBackend>::prove(&statement, &solution, &())
                 .unwrap();
+        let cancellation = ValidationCancellation::never();
 
         for end in 0..payload.len() {
-            assert!(verify_backend_payload(&statement, &payload[..end]).is_err());
+            assert!(verify_backend_payload(&statement, &payload[..end], &cancellation).is_err());
         }
 
         let mut bad_magic = payload.clone();
         bad_magic[0] ^= 1;
-        assert!(verify_backend_payload(&statement, &bad_magic).is_err());
+        assert!(verify_backend_payload(&statement, &bad_magic, &cancellation).is_err());
 
         let mut bad_version = payload.clone();
         bad_version[9] ^= 1;
         assert!(matches!(
-            verify_backend_payload(&statement, &bad_version),
+            verify_backend_payload(&statement, &bad_version, &cancellation),
             Err(DirectError::UnsupportedVersion)
         ));
 
         let mut bad_count = payload.clone();
         bad_count[22..30].copy_from_slice(&3_u64.to_be_bytes());
         assert!(matches!(
-            verify_backend_payload(&statement, &bad_count),
+            verify_backend_payload(&statement, &bad_count, &cancellation),
             Err(DirectError::Solution(SolutionError::WrongLength { .. }))
         ));
 
         let mut non_finite = payload.clone();
         non_finite[30..38].copy_from_slice(&f64::NAN.to_bits().to_be_bytes());
         assert!(matches!(
-            verify_backend_payload(&statement, &non_finite),
+            verify_backend_payload(&statement, &non_finite, &cancellation),
             Err(DirectError::Solution(SolutionError::NonFinite { index: 0 }))
         ));
 
         let mut bad_final = payload.clone();
         let final_offset = payload.len() - 12;
         bad_final[final_offset] ^= 1;
-        assert!(verify_backend_payload(&statement, &bad_final).is_err());
+        assert!(verify_backend_payload(&statement, &bad_final, &cancellation).is_err());
 
         let mut trailing = payload;
         trailing.push(0);
-        assert!(verify_backend_payload(&statement, &trailing).is_err());
+        assert!(verify_backend_payload(&statement, &trailing, &cancellation).is_err());
 
         let maximum_count = (MAX_BACKEND_PAYLOAD_BYTES - BACKEND_FIXED_BYTES) / 8;
         assert!(maximum_backend_payload_bytes(maximum_count).is_some());
