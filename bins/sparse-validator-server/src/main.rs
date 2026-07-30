@@ -328,10 +328,9 @@ fn select_validator_build(configured: Option<&str>, cloud_run_revision: Option<&
 
 fn keygen(signing_key_path: &Path, public_key_path: &Path) -> Result<()> {
     let signing_key = SigningKey::generate(&mut OsRng);
-    write_new_secret(
-        signing_key_path,
-        hex::encode(signing_key.to_bytes()).as_bytes(),
-    )?;
+    let signing_key_bytes = Zeroizing::new(signing_key.to_bytes());
+    let encoded_signing_key = Zeroizing::new(hex::encode(&signing_key_bytes[..]));
+    write_new_secret(signing_key_path, encoded_signing_key.as_bytes())?;
     write_new_file(
         public_key_path,
         hex::encode(signing_key.verifying_key().to_bytes()).as_bytes(),
@@ -407,7 +406,45 @@ fn now_unix_seconds() -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PACKAGE_VALIDATOR_BUILD, select_validator_build};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{PACKAGE_VALIDATOR_BUILD, keygen, load_signing_key, select_validator_build};
+
+    struct KeygenFiles {
+        directory: PathBuf,
+        signing_key: PathBuf,
+        public_key: PathBuf,
+    }
+
+    impl KeygenFiles {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let stem = format!(
+                "sparse-validator-keygen-test-{}-{nonce}",
+                std::process::id()
+            );
+            let directory = std::env::temp_dir().join(stem);
+            fs::create_dir(&directory).unwrap();
+            Self {
+                signing_key: directory.join("signing-key.hex"),
+                public_key: directory.join("public-key.hex"),
+                directory,
+            }
+        }
+    }
+
+    impl Drop for KeygenFiles {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.signing_key);
+            let _ = fs::remove_file(&self.public_key);
+            let _ = fs::remove_dir(&self.directory);
+        }
+    }
 
     #[test]
     fn validator_build_prefers_explicit_configuration() {
@@ -433,5 +470,33 @@ mod tests {
     #[test]
     fn empty_explicit_validator_build_is_not_silently_replaced() {
         assert_eq!(select_validator_build(Some(""), Some("revision")), "");
+    }
+
+    #[test]
+    fn keygen_writes_a_loadable_secret_and_matching_public_key() {
+        let files = KeygenFiles::new();
+        keygen(&files.signing_key, &files.public_key).unwrap();
+
+        let signing_key = load_signing_key(&files.signing_key).unwrap();
+        let encoded_public_key = fs::read_to_string(&files.public_key).unwrap();
+        assert_eq!(
+            encoded_public_key.trim(),
+            hex::encode(signing_key.verifying_key().to_bytes())
+        );
+        assert_eq!(fs::metadata(&files.signing_key).unwrap().len(), 65);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(&files.signing_key)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0
+            );
+        }
     }
 }

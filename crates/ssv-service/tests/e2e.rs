@@ -3,23 +3,25 @@ use ssv_backends::{BackendProverReport, BackendVerifierReport, prove_single_stag
 use ssv_canonical::Digest;
 use ssv_problem::ProblemTemplate;
 use ssv_service::{ServiceConfig, ServiceError, StatelessValidatorService};
-use ssv_service_protocol::{CertifiedScore, ProofProtocol, SignedChallenge, ValidationManifest};
+use ssv_service_protocol::{
+    CertifiedScore, MAX_ID_BYTES, ProofProtocol, ProtocolError, SignedChallenge, ValidationManifest,
+};
 use ssv_solution::Solution;
 use ssv_validation::{ArtifactPrelude, PublicStatement, encode_artifact};
 
+fn service_config() -> ServiceConfig {
+    ServiceConfig {
+        issuer: "integration-test".to_owned(),
+        key_id: "integration-key-v1".to_owned(),
+        challenge_lifetime_seconds: 900,
+        maximum_future_skew_seconds: 5,
+        maximum_solution_elements: 1024,
+        validator_build: "integration-test-build".to_owned(),
+    }
+}
+
 fn service() -> StatelessValidatorService {
-    StatelessValidatorService::new(
-        ServiceConfig {
-            issuer: "integration-test".to_owned(),
-            key_id: "integration-key-v1".to_owned(),
-            challenge_lifetime_seconds: 900,
-            maximum_future_skew_seconds: 5,
-            maximum_solution_elements: 1024,
-            validator_build: "integration-test-build".to_owned(),
-        },
-        SigningKey::from_bytes(&[7; 32]),
-    )
-    .unwrap()
+    StatelessValidatorService::new(service_config(), SigningKey::from_bytes(&[7; 32])).unwrap()
 }
 
 fn challenge_template() -> ProblemTemplate {
@@ -50,6 +52,39 @@ fn statement(
 fn single_stage_proof(statement: &PublicStatement, solution: &Solution) -> Vec<u8> {
     let (payload, _) = prove_single_stage(statement, solution).unwrap();
     encode_artifact(statement, &payload).unwrap()
+}
+
+#[test]
+fn service_rejects_validator_builds_that_are_invalid_in_certificates() {
+    for invalid in [
+        "",
+        "contains space",
+        "line\nbreak",
+        "\u{7f}",
+        "non-ascii-\u{e9}",
+    ] {
+        let mut config = service_config();
+        config.validator_build = invalid.to_owned();
+        assert!(matches!(
+            StatelessValidatorService::new(config, SigningKey::from_bytes(&[7; 32])),
+            Err(ServiceError::Protocol(ProtocolError::InvalidIdentifier {
+                field: "validator_build"
+            }))
+        ));
+    }
+
+    let mut oversized = service_config();
+    oversized.validator_build = "x".repeat(MAX_ID_BYTES + 1);
+    assert!(matches!(
+        StatelessValidatorService::new(oversized, SigningKey::from_bytes(&[7; 32])),
+        Err(ServiceError::Protocol(ProtocolError::InvalidIdentifier {
+            field: "validator_build"
+        }))
+    ));
+
+    let mut maximum = service_config();
+    maximum.validator_build = "x".repeat(MAX_ID_BYTES);
+    assert!(StatelessValidatorService::new(maximum, SigningKey::from_bytes(&[7; 32])).is_ok());
 }
 
 #[test]
