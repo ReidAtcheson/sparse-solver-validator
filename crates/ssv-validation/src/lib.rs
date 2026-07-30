@@ -112,6 +112,28 @@ pub enum ValidationError {
     PublicEvaluationLimit,
 }
 
+/// A parsed artifact was dispatched to a backend for a different protocol.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error(
+    "proof artifact protocol {artifact_protocol:?} does not match verifier backend protocol \
+     {backend_protocol:?}"
+)]
+pub struct BackendProtocolMismatch {
+    /// Protocol selected by the parsed artifact.
+    pub artifact_protocol: ProofProtocol,
+    /// Protocol implemented by the chosen verifier backend.
+    pub backend_protocol: ProofProtocol,
+}
+
+/// Failure to dispatch an artifact to and verify it with a concrete backend.
+#[derive(Debug, Error)]
+pub enum BackendVerificationError<E> {
+    #[error(transparent)]
+    ProtocolMismatch(BackendProtocolMismatch),
+    #[error("backend verification failed: {0}")]
+    Backend(#[source] E),
+}
+
 /// Common proving/verification contract for a complete backend.
 ///
 /// Commitment-first protocols may add [`PrecommitBackend`] when exposing the
@@ -424,13 +446,20 @@ impl<'a> ArtifactPrelude<'a> {
         }
     }
 
-    pub fn verify_with<B: ValidationBackend>(&self) -> Result<B::VerifierReport, B::Error> {
-        assert_eq!(
-            self.statement.manifest.protocol,
-            B::PROTOCOL,
-            "backend dispatch must follow the already validated manifest"
-        );
+    pub fn verify_with<B: ValidationBackend>(
+        &self,
+    ) -> Result<B::VerifierReport, BackendVerificationError<B::Error>> {
+        let artifact_protocol = self.statement.manifest.protocol;
+        if artifact_protocol != B::PROTOCOL {
+            return Err(BackendVerificationError::ProtocolMismatch(
+                BackendProtocolMismatch {
+                    artifact_protocol,
+                    backend_protocol: B::PROTOCOL,
+                },
+            ));
+        }
         B::verify(&self.statement.verifier_statement(), self.payload)
+            .map_err(BackendVerificationError::Backend)
     }
 
     /// Dispatches a non-succinct oracle backend with explicit full-problem
@@ -438,13 +467,17 @@ impl<'a> ArtifactPrelude<'a> {
     /// future succinct backend from silently growing a row-scanning path.
     pub fn verify_reference_with<B: ReferenceValidationBackend>(
         &self,
-    ) -> Result<B::VerifierReport, B::Error> {
-        assert_eq!(
-            self.statement.manifest.protocol,
-            B::PROTOCOL,
-            "backend dispatch must follow the already validated manifest"
-        );
-        B::verify(&self.statement, self.payload)
+    ) -> Result<B::VerifierReport, BackendVerificationError<B::Error>> {
+        let artifact_protocol = self.statement.manifest.protocol;
+        if artifact_protocol != B::PROTOCOL {
+            return Err(BackendVerificationError::ProtocolMismatch(
+                BackendProtocolMismatch {
+                    artifact_protocol,
+                    backend_protocol: B::PROTOCOL,
+                },
+            ));
+        }
+        B::verify(&self.statement, self.payload).map_err(BackendVerificationError::Backend)
     }
 }
 
@@ -520,11 +553,65 @@ fn framing(error: impl std::fmt::Display) -> ValidationError {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+
     use super::*;
     use ssv_problem::{
         BoundaryRule, DiagonalConstruction, InstanceSeed, MatrixSpec, OffDiagonalValues,
         ProblemTemplate, RequestedOutput, RhsSpec, TemplateRandomness, TemplateSchema,
     };
+
+    struct WrongSuccinctBackend;
+
+    impl ValidationBackend for WrongSuccinctBackend {
+        type ProverContext = ();
+        type ProverReport = ();
+        type VerifierReport = ();
+        type Error = Infallible;
+
+        const PROTOCOL: ProofProtocol = ProofProtocol::FastBinary64UnitCircleV4;
+
+        fn prove(
+            _statement: &PublicStatement,
+            _solution: &Solution,
+            _context: &Self::ProverContext,
+        ) -> Result<(Vec<u8>, Self::ProverReport), Self::Error> {
+            panic!("wrong-protocol backend must not be invoked")
+        }
+
+        fn verify(
+            _statement: &VerifierStatement<'_>,
+            _payload: &[u8],
+        ) -> Result<Self::VerifierReport, Self::Error> {
+            panic!("wrong-protocol backend must not be invoked")
+        }
+    }
+
+    struct WrongReferenceBackend;
+
+    impl ReferenceValidationBackend for WrongReferenceBackend {
+        type ProverContext = ();
+        type ProverReport = ();
+        type VerifierReport = ();
+        type Error = Infallible;
+
+        const PROTOCOL: ProofProtocol = ProofProtocol::DirectReferenceV1;
+
+        fn prove(
+            _statement: &PublicStatement,
+            _solution: &Solution,
+            _context: &Self::ProverContext,
+        ) -> Result<(Vec<u8>, Self::ProverReport), Self::Error> {
+            panic!("wrong-protocol backend must not be invoked")
+        }
+
+        fn verify(
+            _statement: &PublicStatement,
+            _payload: &[u8],
+        ) -> Result<Self::VerifierReport, Self::Error> {
+            panic!("wrong-protocol backend must not be invoked")
+        }
+    }
 
     fn statement(protocol: ProofProtocol) -> PublicStatement {
         let problem = ProblemTemplate {
@@ -588,6 +675,40 @@ mod tests {
         assert!(matches!(
             ArtifactPrelude::parse(&encoded),
             Err(ValidationError::ProtocolMismatch)
+        ));
+    }
+
+    #[test]
+    fn wrong_succinct_backend_returns_a_typed_error() {
+        let statement = statement(ProofProtocol::WhirField192L2V4);
+        let encoded = encode_artifact(&statement, &[]).unwrap();
+        let prelude = ArtifactPrelude::parse(&encoded).unwrap();
+
+        assert!(matches!(
+            prelude.verify_with::<WrongSuccinctBackend>(),
+            Err(BackendVerificationError::ProtocolMismatch(
+                BackendProtocolMismatch {
+                    artifact_protocol: ProofProtocol::WhirField192L2V4,
+                    backend_protocol: ProofProtocol::FastBinary64UnitCircleV4,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn wrong_reference_backend_returns_a_typed_error() {
+        let statement = statement(ProofProtocol::WhirField192L2V4);
+        let encoded = encode_artifact(&statement, &[]).unwrap();
+        let prelude = ArtifactPrelude::parse(&encoded).unwrap();
+
+        assert!(matches!(
+            prelude.verify_reference_with::<WrongReferenceBackend>(),
+            Err(BackendVerificationError::ProtocolMismatch(
+                BackendProtocolMismatch {
+                    artifact_protocol: ProofProtocol::WhirField192L2V4,
+                    backend_protocol: ProofProtocol::DirectReferenceV1,
+                }
+            ))
         ));
     }
 }
