@@ -29,7 +29,7 @@ pub use randomness::{
 };
 pub use spec::{
     BoundaryRule, DiagonalConstruction, Dyadic, FinalizedProblem, MAX_CHALLENGE_CONTEXT_BYTES,
-    MAX_DIA_EDGE_DIAGONALS, MAX_DIMENSION, MAX_FRACTIONAL_BITS, MAX_PERIOD_BITS, MatrixSpec,
-    OffDiagonalValues, ProblemError, ProblemSchema, ProblemTemplate, PublicEvaluationTerms,
-    RequestedOutput, RhsSpec, SymmetricDiaEdge, TemplateSchema,
+    MAX_DIA_EDGE_DIAGONALS, MAX_DIMENSION, MAX_FRACTIONAL_BITS, MAX_NONSYMMETRIC_ROW_NONZEROS,
+    MAX_PERIOD_BITS, MatrixSpec, OffDiagonalValues, ProblemError, ProblemSchema, ProblemTemplate,
+    PublicEvaluationTerms, RequestedOutput, RhsSpec, SymmetricDiaEdge, TemplateSchema,
 };

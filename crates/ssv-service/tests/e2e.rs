@@ -86,6 +86,27 @@ fn dia_seeded_rhs_local_template() -> ProblemTemplate {
     template
 }
 
+fn nonsymmetric_seeded_rhs_local_template() -> ProblemTemplate {
+    let mut template = local_template();
+    template.matrix = MatrixSpec::SeededNonsymmetricRowSparseV1 {
+        dimension: 12,
+        boundary: BoundaryRule::TruncateV1,
+        row_pattern_bits: 3,
+        maximum_half_bandwidth: 5,
+        maximum_nonzeros_per_row: 7,
+        fractional_bits: 12,
+        minimum_mantissa: -4096,
+        maximum_mantissa: 4096,
+    };
+    template.rhs = RhsSpec::SeededPeriodicDyadicV1 {
+        period_bits: 3,
+        fractional_bits: 12,
+        minimum_mantissa: -2048,
+        maximum_mantissa: 2047,
+    };
+    template
+}
+
 fn conjugate_gradient_solution(problem: &GeneratedProblem) -> Solution {
     fn dot(left: &[f64], right: &[f64]) -> f64 {
         left.iter()
@@ -140,6 +161,62 @@ fn conjugate_gradient_solution(problem: &GeneratedProblem) -> Solution {
         squared_norm = next_squared_norm;
     }
     panic!("conjugate gradient did not converge on the shifted DIA system");
+}
+
+fn pivoted_dense_solution(problem: &GeneratedProblem) -> Solution {
+    let dimension = problem.dimension();
+    let mut matrix = vec![0.0; dimension * dimension];
+    for (row_index, row) in problem.rows().enumerate() {
+        for entry in row {
+            matrix[row_index * dimension + entry.column] = entry.value.to_f64();
+        }
+    }
+    let mut rhs = (0..dimension)
+        .map(|row| problem.rhs_f64(row).unwrap())
+        .collect::<Vec<_>>();
+
+    for column in 0..dimension {
+        let pivot = (column..dimension)
+            .max_by(|&left, &right| {
+                matrix[left * dimension + column]
+                    .abs()
+                    .total_cmp(&matrix[right * dimension + column].abs())
+            })
+            .unwrap();
+        let pivot_magnitude = matrix[pivot * dimension + column].abs();
+        assert!(
+            pivot_magnitude > 1.0e-12,
+            "fixed generated test matrix is singular"
+        );
+        if pivot != column {
+            for entry_column in 0..dimension {
+                matrix.swap(
+                    column * dimension + entry_column,
+                    pivot * dimension + entry_column,
+                );
+            }
+            rhs.swap(column, pivot);
+        }
+        let diagonal = matrix[column * dimension + column];
+        for row in column + 1..dimension {
+            let factor = matrix[row * dimension + column] / diagonal;
+            matrix[row * dimension + column] = 0.0;
+            for entry_column in column + 1..dimension {
+                matrix[row * dimension + entry_column] -=
+                    factor * matrix[column * dimension + entry_column];
+            }
+            rhs[row] -= factor * rhs[column];
+        }
+    }
+
+    let mut solution = vec![0.0; dimension];
+    for row in (0..dimension).rev() {
+        let known = (row + 1..dimension)
+            .map(|column| matrix[row * dimension + column] * solution[column])
+            .sum::<f64>();
+        solution[row] = (rhs[row] - known) / matrix[row * dimension + row];
+    }
+    Solution::new(solution, dimension).unwrap()
 }
 
 fn manifest() -> ValidationManifest {
@@ -773,6 +850,66 @@ fn dia_family_with_seeded_rhs_round_trips_every_backend_without_a_manufactured_s
                 assert_eq!(protocol, ProofProtocol::FastBinary64UnitCircleV5);
                 assert!(report.score.squared_l2_claim < 1.0e-20);
                 assert_eq!(report.work.public_matrix_period_terms, 6);
+                assert_eq!(report.work.generator_row_queries, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn nonsymmetric_generated_pattern_family_round_trips_every_backend() {
+    let problem = nonsymmetric_seeded_rhs_local_template()
+        .finalize_literal()
+        .unwrap();
+    assert!(matches!(
+        problem.rhs,
+        RhsSpec::SeededPeriodicDyadicV1 { .. }
+    ));
+    let generated = problem.compile().unwrap();
+    assert!(!generated.certificate().symmetric);
+    assert!(!generated.certificate().strictly_row_diagonally_dominant);
+    assert_eq!(generated.certificate().maximum_half_bandwidth, 5);
+    assert_eq!(generated.certificate().maximum_nonzeros_per_row, 7);
+    let solution = pivoted_dense_solution(&generated);
+
+    for protocol in [
+        ProofProtocol::DirectReferenceV1,
+        ProofProtocol::WhirField192L2V4,
+        ProofProtocol::FastBinary64UnitCircleV5,
+    ] {
+        let statement = statement(
+            problem.clone(),
+            ValidationManifest {
+                protocol,
+                max_solution_elements: 12,
+                max_public_matrix_terms: 64,
+                max_public_rhs_terms: 64,
+                ..ValidationManifest::default()
+            },
+            None,
+        );
+        let artifact = single_stage_proof(&statement, &solution);
+        let prelude = ArtifactPrelude::parse(&artifact).unwrap();
+        match verify(&prelude).unwrap() {
+            BackendVerifierReport::Direct(report) => {
+                assert_eq!(protocol, ProofProtocol::DirectReferenceV1);
+                assert!(report.residual.l2 < 1.0e-10);
+                assert_eq!(report.rows_visited, 12);
+                assert_eq!(
+                    report.nonzeros_visited,
+                    u64::try_from(generated.structural_nonzeros())
+                        .expect("test nonzero count fits u64")
+                );
+            }
+            BackendVerifierReport::Exact(report) => {
+                assert_eq!(protocol, ProofProtocol::WhirField192L2V4);
+                assert!(report.residual.l2_approx().unwrap() < 1.0e-10);
+                assert_eq!(report.algebra.generator_row_queries, 0);
+            }
+            BackendVerifierReport::Fast(report) => {
+                assert_eq!(protocol, ProofProtocol::FastBinary64UnitCircleV5);
+                assert!(report.score.squared_l2_claim < 1.0e-18);
+                assert_eq!(report.work.public_matrix_period_terms, 56);
                 assert_eq!(report.work.generator_row_queries, 0);
             }
         }

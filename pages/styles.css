@@ -79,6 +79,7 @@ pre {
 .swatch { display: inline-block; width: 9px; height: 9px; margin-right: 4px; border-radius: 2px; }
 .swatch.diagonal { background: #fff; }
 .swatch.off-diagonal { background: #ff8052; }
+.swatch.off-diagonal.eligible { background: #efb39d; }
 
 .explorer-grid { display: grid; grid-template-columns: minmax(250px, 330px) 1fr; }
 .controls { padding: 24px; border-right: 1px solid var(--line); background: #fff; }
@@ -97,6 +98,7 @@ input, select {
 }
 input:focus, select:focus, button:focus-visible { outline: 3px solid rgb(36 87 214 / 25%); outline-offset: 1px; border-color: var(--accent); }
 small { color: var(--muted); font-weight: 400; }
+.control-note { margin: -6px 0 16px; color: var(--muted); font-size: .75rem; }
 .form-error { padding: 8px; color: #8c1d18; background: #fff0ef; font-size: .8rem; }
 
 .plot-panel { min-width: 0; padding: 24px; }

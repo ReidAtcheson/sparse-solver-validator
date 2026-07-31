@@ -21,7 +21,8 @@ use thiserror::Error;
 use crate::{
     GeneratedProblem,
     generator::{
-        CompiledMatrixFamily, PeriodicSymmetricDiaLaplacian, PeriodicSymmetricTridiagonal,
+        CompiledMatrixFamily, PeriodicNonsymmetricRowSparse, PeriodicSymmetricDiaLaplacian,
+        PeriodicSymmetricTridiagonal,
     },
 };
 
@@ -355,6 +356,9 @@ fn evaluate_matrix<I: MleInterpreter>(
         CompiledMatrixFamily::SymmetricDiaLaplacian(matrix) => {
             evaluate_dia_matrix(matrix, interpreter, row_point, column_point)
         }
+        CompiledMatrixFamily::NonsymmetricRowSparse(matrix) => {
+            evaluate_nonsymmetric_matrix(matrix, interpreter, row_point, column_point)
+        }
     }
 }
 
@@ -515,6 +519,84 @@ fn evaluate_dia_matrix<I: MleInterpreter>(
             let edge_basis = arithmetic.sub(without_lower, upper_diagonal);
             let edge_mantissa = arithmetic.embed_i64(edge_mantissa);
             let contribution = arithmetic.mul(edge_mantissa, edge_basis);
+            result = arithmetic.add(result, contribution);
+            arithmetic.work.periodic_terms += 1;
+        }
+    }
+
+    Ok(MleEvaluation {
+        value: result,
+        fractional_bits: matrix.fractional_bits,
+        work: arithmetic.work,
+    })
+}
+
+fn evaluate_nonsymmetric_matrix<I: MleInterpreter>(
+    matrix: &PeriodicNonsymmetricRowSparse,
+    interpreter: &I,
+    row_point: &[I::Scalar],
+    column_point: &[I::Scalar],
+) -> Result<MleEvaluation<I::Scalar>, MleEvaluationError> {
+    let variables = matrix.dimension.next_power_of_two().ilog2() as usize;
+    check_point("row", row_point, variables)?;
+    check_point("column", column_point, variables)?;
+    let mut arithmetic = Arithmetic::new(interpreter);
+    let mut result = arithmetic.zero();
+    let period_bits = variables.min(matrix.period().ilog2() as usize);
+    let period = 1_usize << period_bits;
+    let active_patterns = matrix.period().min(matrix.dimension);
+
+    for pattern in 0..active_patterns {
+        let diagonal_basis = periodic_shift_pair_indices(
+            &mut arithmetic,
+            row_point,
+            column_point,
+            PeriodicShiftPair {
+                anchor_limit: matrix.dimension,
+                pattern,
+                period_bits,
+                left_shift: 0,
+                right_shift: 0,
+            },
+        );
+        let diagonal = arithmetic.embed_i64(matrix.diagonal_mantissas[pattern]);
+        let diagonal_contribution = arithmetic.mul(diagonal, diagonal_basis);
+        result = arithmetic.add(result, diagonal_contribution);
+        arithmetic.work.periodic_terms += 1;
+
+        for (&signed_offset, &mantissa) in matrix
+            .pattern_offsets(pattern)
+            .iter()
+            .zip(matrix.pattern_off_diagonal_mantissas(pattern))
+        {
+            let (anchor_pattern, anchor_limit, left_shift, right_shift) = if signed_offset < 0 {
+                let magnitude = usize::try_from(signed_offset.unsigned_abs())
+                    .expect("validated offset magnitude fits usize");
+                (
+                    (pattern + period - (magnitude & (period - 1))) & (period - 1),
+                    matrix.dimension - magnitude,
+                    magnitude,
+                    0,
+                )
+            } else {
+                let magnitude = usize::try_from(signed_offset)
+                    .expect("validated nonnegative offset fits usize");
+                (pattern, matrix.dimension - magnitude, 0, magnitude)
+            };
+            let basis = periodic_shift_pair_indices(
+                &mut arithmetic,
+                row_point,
+                column_point,
+                PeriodicShiftPair {
+                    anchor_limit,
+                    pattern: anchor_pattern,
+                    period_bits,
+                    left_shift,
+                    right_shift,
+                },
+            );
+            let mantissa = arithmetic.embed_i64(mantissa);
+            let contribution = arithmetic.mul(mantissa, basis);
             result = arithmetic.add(result, contribution);
             arithmetic.work.periodic_terms += 1;
         }
@@ -697,7 +779,7 @@ fn periodic_shift_pair_indices<I: MleInterpreter>(
     debug_assert!(relation.period_bits <= left.len());
     debug_assert!(relation.pattern < (1_usize << relation.period_bits));
     let domain = 1_usize << left.len();
-    debug_assert!(relation.anchor_limit < domain);
+    debug_assert!(relation.anchor_limit <= domain);
     debug_assert!(relation.left_shift < domain);
     debug_assert!(relation.right_shift < domain);
 
@@ -739,7 +821,8 @@ fn periodic_shift_pair_indices<I: MleInterpreter>(
         }
         states = next;
     }
-    states[shift_state_index(0, 0, 1)]
+    let accepted_borrow = usize::from(relation.anchor_limit < domain);
+    states[shift_state_index(0, 0, accepted_borrow)]
 }
 
 const fn shift_state_index(left_carry: usize, right_carry: usize, borrow: usize) -> usize {
@@ -1127,6 +1210,24 @@ mod tests {
         template.finalize_literal().unwrap().compile().unwrap()
     }
 
+    fn nonsymmetric_generated(dimension: u64) -> GeneratedProblem {
+        let mut template = template(dimension, seeded_rhs());
+        let maximum_half_bandwidth = 5_u64.min(dimension - 1);
+        let maximum_nonzeros_per_row =
+            u8::try_from((2 * maximum_half_bandwidth + 1).min(7)).expect("test row width fits u8");
+        template.matrix = MatrixSpec::SeededNonsymmetricRowSparseV1 {
+            dimension,
+            boundary: BoundaryRule::TruncateV1,
+            row_pattern_bits: 3,
+            maximum_half_bandwidth,
+            maximum_nonzeros_per_row,
+            fractional_bits: 8,
+            minimum_mantissa: -256,
+            maximum_mantissa: 256,
+        };
+        template.finalize_literal().unwrap().compile().unwrap()
+    }
+
     fn seeded_rhs() -> RhsSpec {
         RhsSpec::SeededPeriodicDyadicV1 {
             period_bits: 2,
@@ -1257,6 +1358,37 @@ mod tests {
             assert_eq!(matrix.work.periodic_terms, 6);
             assert_eq!(plan.metadata().evaluator_version, 2);
             assert_eq!(plan.metadata().matrix_period_terms, 6);
+        }
+    }
+
+    #[test]
+    fn nonsymmetric_evaluators_match_complete_scans_for_generated_row_patterns() {
+        for dimension in [2, 5, 8, 19, 32, 33] {
+            let problem = nonsymmetric_generated(dimension);
+            let plan = problem.public_evaluation_plan();
+            let variables = plan.metadata().domain.variables;
+            let row = test_point(variables, 7);
+            let column = test_point(variables, 11);
+            let matrix = plan
+                .evaluate_matrix_mle(&TestInterpreter, &row, &column)
+                .unwrap();
+            let rhs = plan.evaluate_rhs_mle(&TestInterpreter, &row).unwrap();
+            assert_eq!(
+                matrix.value,
+                scan_matrix(&TestInterpreter, &problem, &row, &column),
+                "nonsymmetric matrix mismatch at dimension {dimension}"
+            );
+            assert_eq!(
+                rhs.value,
+                scan_rhs(&TestInterpreter, &problem, &row),
+                "nonsymmetric RHS mismatch at dimension {dimension}"
+            );
+            assert_eq!(plan.metadata().evaluator_version, 3);
+            assert_eq!(
+                matrix.work.periodic_terms,
+                u64::try_from(plan.metadata().matrix_period_terms)
+                    .expect("test public term count fits u64")
+            );
         }
     }
 
@@ -1472,6 +1604,27 @@ mod tests {
     }
 
     #[test]
+    fn nonsymmetric_binary64_interpreter_bounds_its_complete_scan_difference() {
+        let problem = nonsymmetric_generated(19);
+        let plan = problem.public_evaluation_plan();
+        let variables = plan.metadata().domain.variables;
+        let row = (0..variables)
+            .map(|coordinate| (coordinate as f64 + 1.0) / 16.0)
+            .collect::<Vec<_>>();
+        let column = (0..variables)
+            .map(|coordinate| (2.0 * coordinate as f64 + 1.0) / 32.0)
+            .collect::<Vec<_>>();
+        let matrix = plan.evaluate_matrix_mle_f64(&row, &column).unwrap();
+        let scanned = tracked_scan_matrix(&problem, &row, &column);
+        let gap = (matrix.value - scanned.value).abs();
+        assert!(
+            gap <= matrix.roundoff.forward_absolute_error_bound
+                + scanned.roundoff.forward_absolute_error_bound,
+            "nonsymmetric matrix interval mismatch: gap={gap:e}"
+        );
+    }
+
+    #[test]
     fn work_depends_on_period_and_log_dimension_not_nnz() {
         let problem = generated(1 << 20, seeded_rhs());
         let plan = problem.public_evaluation_plan();
@@ -1504,6 +1657,22 @@ mod tests {
         assert_eq!(metadata.matrix_period_terms, 6);
         assert!(matrix.work.arithmetic_operations() < 100_000);
         assert!(problem.structural_nonzeros() > 3_000_000);
+    }
+
+    #[test]
+    fn nonsymmetric_work_depends_on_pattern_width_and_log_dimension() {
+        let problem = nonsymmetric_generated(1 << 20);
+        let plan = problem.public_evaluation_plan();
+        let metadata = plan.metadata();
+        let row = vec![TestInterpreter.embed_i64(2); metadata.domain.variables];
+        let column = vec![TestInterpreter.embed_i64(3); metadata.domain.variables];
+        let matrix = plan
+            .evaluate_matrix_mle(&TestInterpreter, &row, &column)
+            .unwrap();
+        assert_eq!(matrix.work.periodic_terms, 56);
+        assert_eq!(metadata.matrix_period_terms, 56);
+        assert!(matrix.work.arithmetic_operations() < 1_000_000);
+        assert!(problem.structural_nonzeros() > 5_000_000);
     }
 
     #[test]

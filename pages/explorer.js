@@ -2,9 +2,11 @@
 
 const TRIDIAGONAL_FAMILY = "seeded-symmetric-tridiagonal-v1";
 const DIA_FAMILY = "seeded-symmetric-dia-laplacian-v1";
+const NONSYMMETRIC_FAMILY = "seeded-nonsymmetric-row-sparse-v1";
 const SEEDED_RHS_FAMILY = "seeded-periodic-dyadic-v1";
 const MAX_SAFE_MANTISSA = 9007199254740991;
 const MAX_DIA_OFFSETS = 16;
+const MAX_NONSYMMETRIC_ROW_NONZEROS = 32;
 const LOCAL_SEED = "0101010101010101010101010101010101010101010101010101010101010101";
 
 function parseOffsets(value) {
@@ -16,35 +18,34 @@ function parseOffsets(value) {
 }
 
 function matrixOffsets(p) {
-  return p.family === DIA_FAMILY ? p.offsets : [1];
+  if (p.family === DIA_FAMILY) return p.offsets;
+  return p.family === TRIDIAGONAL_FAMILY ? [1] : [];
 }
 
 function validationError(p) {
-  if (p.family !== TRIDIAGONAL_FAMILY && p.family !== DIA_FAMILY) {
+  if (![TRIDIAGONAL_FAMILY, DIA_FAMILY, NONSYMMETRIC_FAMILY].includes(p.family)) {
     return "Select a registered matrix family.";
   }
   if (p.rhs !== SEEDED_RHS_FAMILY) return "Select a registered right-hand-side family.";
 
-  const integers = [
+  const commonIntegers = [
     p.dimension,
     p.periodBits,
     p.fractionalBits,
-    p.margin,
-    p.minimum,
-    p.maximum,
     p.rhsPeriodBits,
     p.rhsFractionalBits,
     p.rhsMinimum,
     p.rhsMaximum,
   ];
-  if (!integers.every(Number.isSafeInteger)) return "All generator parameters must be integers.";
+  const familyIntegers = p.family === NONSYMMETRIC_FAMILY
+    ? [p.maximumHalfBandwidth, p.maximumRowNonzeros, p.coefficientMinimum, p.coefficientMaximum]
+    : [p.margin, p.minimum, p.maximum];
+  if (![...commonIntegers, ...familyIntegers].every(Number.isSafeInteger)) {
+    return "All generator parameters must be integers.";
+  }
   if (p.dimension < 2 || p.dimension > 128) return "Visualization dimension must be between 2 and 128.";
   if (p.periodBits < 0 || p.periodBits > 16) return "Period bits must be between 0 and 16.";
   if (p.fractionalBits < 0 || p.fractionalBits > 52) return "Fractional bits must be between 0 and 52.";
-  if (p.minimum < 1 || p.minimum > p.maximum) return "Magnitudes must satisfy 1 ≤ minimum ≤ maximum.";
-  if (p.maximum > MAX_SAFE_MANTISSA || p.margin < 1 || p.margin > MAX_SAFE_MANTISSA) {
-    return "Mantissas must fit exactly in binary64.";
-  }
   if (p.rhsPeriodBits < 0 || p.rhsPeriodBits > 16) {
     return "RHS period bits must be between 0 and 16.";
   }
@@ -57,6 +58,37 @@ function validationError(p) {
   if (Math.abs(p.rhsMinimum) > MAX_SAFE_MANTISSA
       || Math.abs(p.rhsMaximum) > MAX_SAFE_MANTISSA) {
     return "RHS mantissas must fit exactly in binary64.";
+  }
+
+  if (p.family === NONSYMMETRIC_FAMILY) {
+    if (p.maximumHalfBandwidth < 0 || p.maximumHalfBandwidth >= p.dimension) {
+      return "Maximum half bandwidth must be nonnegative and smaller than the dimension.";
+    }
+    if (p.maximumRowNonzeros < 1
+        || p.maximumRowNonzeros > MAX_NONSYMMETRIC_ROW_NONZEROS) {
+      return `Maximum row nonzeros must be between 1 and ${MAX_NONSYMMETRIC_ROW_NONZEROS}.`;
+    }
+    if (p.maximumRowNonzeros > 2 * p.maximumHalfBandwidth + 1) {
+      return "Maximum row nonzeros exceed the diagonal plus available signed offsets.";
+    }
+    if (p.coefficientMinimum > p.coefficientMaximum) {
+      return "Coefficient mantissas must satisfy minimum ≤ maximum.";
+    }
+    const unitMantissa = 2 ** p.fractionalBits;
+    if (p.coefficientMinimum < -unitMantissa || p.coefficientMaximum > unitMantissa) {
+      return "Coefficient mantissas must represent values inside [-1, 1].";
+    }
+    if (p.coefficientMinimum === 0 && p.coefficientMaximum === 0) {
+      return "The coefficient range must contain a nonzero value.";
+    }
+    return "";
+  }
+
+  if (p.minimum < 1 || p.minimum > p.maximum) {
+    return "Magnitudes must satisfy 1 ≤ minimum ≤ maximum.";
+  }
+  if (p.maximum > MAX_SAFE_MANTISSA || p.margin < 1 || p.margin > MAX_SAFE_MANTISSA) {
+    return "Mantissas must fit exactly in binary64.";
   }
 
   if (p.family === DIA_FAMILY) {
@@ -80,6 +112,20 @@ function validationError(p) {
 }
 
 function matrixSpec(p) {
+  if (p.family === NONSYMMETRIC_FAMILY) {
+    return {
+      kind: p.family,
+      dimension: p.dimension,
+      boundary: "truncate-v1",
+      row_pattern_bits: p.periodBits,
+      maximum_half_bandwidth: p.maximumHalfBandwidth,
+      maximum_nonzeros_per_row: p.maximumRowNonzeros,
+      fractional_bits: p.fractionalBits,
+      minimum_mantissa: String(p.coefficientMinimum),
+      maximum_mantissa: String(p.coefficientMaximum),
+    };
+  }
+
   if (p.family === DIA_FAMILY) {
     return {
       kind: p.family,
@@ -138,6 +184,9 @@ function problemTemplate(p, kind) {
 }
 
 function structuralNonzeros(p) {
+  if (p.family === NONSYMMETRIC_FAMILY) {
+    return p.dimension * Math.min(p.dimension, p.maximumRowNonzeros);
+  }
   return p.dimension + matrixOffsets(p)
     .reduce((total, offset) => total + (2 * (p.dimension - offset)), 0);
 }
@@ -230,11 +279,18 @@ function initialize() {
     .map((id) => document.querySelector(`#${id}`));
   const privateService = document.querySelector("#private-service");
   const offsetsControl = document.querySelector("#offsets-control");
+  const marginControl = document.querySelector("#margin-control");
+  const structuredRangeControls = document.querySelector("#structured-range-controls");
+  const nonsymmetricShapeControls = document.querySelector("#nonsymmetric-shape-controls");
+  const nonsymmetricRangeControls = document.querySelector("#nonsymmetric-range-controls");
+  const nonsymmetricNote = document.querySelector("#nonsymmetric-note");
   const periodLabel = document.querySelector("#period-label");
   const periodHint = document.querySelector("#period-hint");
   const marginLabel = document.querySelector("#margin-label");
   const minimumLabel = document.querySelector("#minimum-label");
   const maximumLabel = document.querySelector("#maximum-label");
+  const offDiagonalLegend = document.querySelector("#off-diagonal-legend");
+  const offDiagonalSwatch = document.querySelector(".swatch.off-diagonal");
   const plotNote = document.querySelector("#plot-note");
 
   function numberValue(id) {
@@ -251,6 +307,10 @@ function initialize() {
       margin: numberValue("margin"),
       minimum: numberValue("minimum"),
       maximum: numberValue("maximum"),
+      maximumHalfBandwidth: numberValue("maximum-half-bandwidth"),
+      maximumRowNonzeros: numberValue("maximum-row-nonzeros"),
+      coefficientMinimum: numberValue("coefficient-minimum"),
+      coefficientMaximum: numberValue("coefficient-maximum"),
       rhs: document.querySelector("#rhs").value,
       rhsPeriodBits: numberValue("rhs-period-bits"),
       rhsFractionalBits: numberValue("rhs-fractional-bits"),
@@ -261,15 +321,28 @@ function initialize() {
 
   function updateFamilyControls(p) {
     const dia = p.family === DIA_FAMILY;
+    const nonsymmetric = p.family === NONSYMMETRIC_FAMILY;
     offsetsControl.hidden = !dia;
-    periodLabel.textContent = dia ? "Edge period bits" : "Period bits";
+    marginControl.hidden = nonsymmetric;
+    structuredRangeControls.hidden = nonsymmetric;
+    nonsymmetricShapeControls.hidden = !nonsymmetric;
+    nonsymmetricRangeControls.hidden = !nonsymmetric;
+    nonsymmetricNote.hidden = !nonsymmetric;
+    periodLabel.textContent = dia
+      ? "Edge period bits"
+      : nonsymmetric ? "Row pattern bits" : "Period bits";
     periodHint.textContent = dia
       ? "One shared period and range; each offset table is seeded independently"
-      : "";
-    periodHint.hidden = !dia;
+      : nonsymmetric
+        ? "The generated sparsity and values repeat after 2^k rows"
+        : "";
+    periodHint.hidden = !dia && !nonsymmetric;
     marginLabel.textContent = dia ? "Diagonal shift" : "Dominance margin";
     minimumLabel.textContent = dia ? "Minimum edge weight" : "Minimum magnitude";
     maximumLabel.textContent = dia ? "Maximum edge weight" : "Maximum magnitude";
+    offDiagonalLegend.textContent = nonsymmetric ? "eligible off-diagonal" : "off-diagonal";
+    offDiagonalSwatch.classList.toggle("eligible", nonsymmetric);
+    document.querySelector("#maximum-half-bandwidth").max = String(p.dimension - 1);
   }
 
   function drawPlot(p) {
@@ -291,14 +364,25 @@ function initialize() {
         dotSize,
       );
     };
+    const nonsymmetric = p.family === NONSYMMETRIC_FAMILY;
     const offsets = matrixOffsets(p);
     for (let row = 0; row < p.dimension; row += 1) {
-      for (const offset of offsets) {
-        if (row >= offset) drawEntry(row, row - offset, "#e45826");
+      if (nonsymmetric) {
+        const first = Math.max(0, row - p.maximumHalfBandwidth);
+        const last = Math.min(p.dimension - 1, row + p.maximumHalfBandwidth);
+        for (let column = first; column <= last; column += 1) {
+          if (column !== row) drawEntry(row, column, "#efb39d");
+        }
+      } else {
+        for (const offset of offsets) {
+          if (row >= offset) drawEntry(row, row - offset, "#e45826");
+        }
       }
       drawEntry(row, row, "#17233d");
-      for (const offset of offsets) {
-        if (row + offset < p.dimension) drawEntry(row, row + offset, "#e45826");
+      if (!nonsymmetric) {
+        for (const offset of offsets) {
+          if (row + offset < p.dimension) drawEntry(row, row + offset, "#e45826");
+        }
       }
     }
     context.strokeStyle = "#aeb6c5";
@@ -307,17 +391,25 @@ function initialize() {
     const nonzeros = structuralNonzeros(p);
     const density = (100 * nonzeros / (p.dimension * p.dimension)).toFixed(1);
     document.querySelector("#plot-title").textContent = `${p.dimension} × ${p.dimension}`;
-    document.querySelector("#plot-summary").textContent = `${nonzeros} structural nonzeros · ${density}% density`;
+    document.querySelector("#plot-summary").textContent = nonsymmetric
+      ? `at most ${nonzeros} structural nonzeros · at most ${density}% density`
+      : `${nonzeros} structural nonzeros · ${density}% density`;
     const familyDescription = p.family === DIA_FAMILY
       ? `symmetric DIA matrix with positive offsets ${offsets.join(", ")}`
-      : "symmetric tridiagonal matrix";
+      : nonsymmetric
+        ? `nonsymmetric generated-pattern matrix with half bandwidth ${p.maximumHalfBandwidth}`
+        : "symmetric tridiagonal matrix";
     canvas.setAttribute(
       "aria-label",
-      `${p.dimension} by ${p.dimension} ${familyDescription} spy plot with ${nonzeros} structural nonzeros`,
+      nonsymmetric
+        ? `${p.dimension} by ${p.dimension} ${familyDescription} eligible sparsity envelope`
+        : `${p.dimension} by ${p.dimension} ${familyDescription} spy plot with ${nonzeros} structural nonzeros`,
     );
     plotNote.textContent = p.family === DIA_FAMILY
       ? `Positive offsets ${offsets.join(", ")} are mirrored; boundary edges truncate without wrapping.`
-      : "Rows run top to bottom; columns run left to right. Values vary with the finalized seed, but this family’s sparsity pattern does not.";
+      : nonsymmetric
+        ? `The plot shows the eligible bandwidth envelope, not realized entries. The finalized seed chooses at most ${p.maximumRowNonzeros} entries per row, including a required diagonal; boundaries truncate without wrapping. Its MLE uses ${Math.min(2 ** p.periodBits, p.dimension) * p.maximumRowNonzeros} public pattern terms.`
+        : "Rows run top to bottom; columns run left to right. Values vary with the finalized seed, but this family’s sparsity pattern does not.";
   }
 
   function update() {
@@ -387,7 +479,9 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     DIA_FAMILY,
     MAX_DIA_OFFSETS,
+    MAX_NONSYMMETRIC_ROW_NONZEROS,
     MAX_SAFE_MANTISSA,
+    NONSYMMETRIC_FAMILY,
     SEEDED_RHS_FAMILY,
     TRIDIAGONAL_FAMILY,
     hostedWorkflow,
