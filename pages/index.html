@@ -79,7 +79,14 @@ curl --fail --silent --show-error \
               Matrix family
               <select id="family" name="family">
                 <option value="seeded-symmetric-tridiagonal-v1">Seeded symmetric tridiagonal v1</option>
+                <option value="seeded-symmetric-dia-laplacian-v1">Seeded symmetric DIA Laplacian v1</option>
               </select>
+            </label>
+
+            <label id="offsets-control" hidden>
+              Positive offsets
+              <input id="offsets" name="offsets" type="text" value="1, 4" inputmode="numeric" spellcheck="false">
+              <small>Comma-separated, strictly increasing, and smaller than the dimension</small>
             </label>
 
             <div class="control-row">
@@ -89,8 +96,9 @@ curl --fail --silent --show-error \
                 <small>2–128 for visualization</small>
               </label>
               <label>
-                Period bits
+                <span id="period-label">Period bits</span>
                 <input id="period-bits" name="periodBits" type="number" min="0" max="16" value="3">
+                <small id="period-hint" hidden></small>
               </label>
             </div>
 
@@ -100,18 +108,18 @@ curl --fail --silent --show-error \
                 <input id="fractional-bits" name="fractionalBits" type="number" min="0" max="52" value="8">
               </label>
               <label>
-                Dominance margin
+                <span id="margin-label">Dominance margin</span>
                 <input id="margin" name="margin" type="number" min="1" max="9007199254740991" value="32">
               </label>
             </div>
 
             <div class="control-row">
               <label>
-                Minimum magnitude
+                <span id="minimum-label">Minimum magnitude</span>
                 <input id="minimum" name="minimum" type="number" min="1" max="9007199254740991" value="8">
               </label>
               <label>
-                Maximum magnitude
+                <span id="maximum-label">Maximum magnitude</span>
                 <input id="maximum" name="maximum" type="number" min="1" max="9007199254740991" value="24">
               </label>
             </div>
@@ -132,7 +140,7 @@ curl --fail --silent --show-error \
               <span id="plot-summary">46 structural nonzeros · 18.0% density</span>
             </div>
             <canvas id="spy-plot" width="640" height="640" aria-label="Matrix sparsity spy plot"></canvas>
-            <p class="plot-note">Rows run top to bottom; columns run left to right. Values vary with the finalized seed, but this family’s sparsity pattern does not.</p>
+            <p id="plot-note" class="plot-note">Rows run top to bottom; columns run left to right. Values vary with the finalized seed, but this family’s sparsity pattern does not.</p>
           </div>
         </div>
 
