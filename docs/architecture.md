@@ -139,7 +139,7 @@ dyadic coefficient recipe, RHS recipe, requested metric, and seed policy. A
 hosted template omits a literal seed and is finalized from a verified signed
 challenge. A local template carries its literal 32-byte seed directly.
 
-Two matrix families are currently registered:
+Three matrix families are currently registered:
 
 - `seeded-symmetric-tridiagonal-v1` uses one flat periodic table of negative
   dyadic off-diagonal mantissas. Its diagonal is the absolute off-diagonal row
@@ -157,14 +157,23 @@ Two matrix families are currently registered:
   geometry-specific stencil. Truncating boundaries never wrap an edge. One
   generated edge value supplies both mirrored off-diagonal entries and both
   incident diagonal contributions, so symmetry cannot drift between rows.
+- `seeded-nonsymmetric-row-sparse-v1` generates a bounded table of periodic row
+  patterns. Each pattern contains a mandatory diagonal and a duplicate-free,
+  sorted subset of signed offsets no larger than `maximum_half_bandwidth` in
+  magnitude. `maximum_nonzeros_per_row` includes the diagonal, and truncating
+  boundaries can only reduce the realized row width. Structure, off-diagonal
+  values, and diagonal values use distinct seed domains. Every stored value is
+  a nonzero dyadic grid point in the configured subinterval of `[-1,1]`.
 
-Both implementations expose sorted, duplicate-free, allocation-free row
+  This family deliberately does not claim symmetry, definiteness, diagonal
+  dominance, or nonsingularity. Requiring a nonzero diagonal avoids a missing
+  pivot structurally but is not a numerical nonsingularity guarantee.
+
+All implementations expose sorted, duplicate-free, allocation-free row
 iterators over flat compiled storage. Their compilation reports structural and
 numerical facts such as symmetry, sign pattern, dominance, and row-width bounds.
 These facts are properties of a family, not requirements of the common compiled
-matrix or backend interfaces. A future nonsymmetric or indefinite family can
-implement the same row and succinct-evaluation contracts while reporting
-different facts.
+matrix or backend interfaces.
 
 Matrix and RHS compilation receive distinct domain-separated seed streams.
 Changing the matrix family therefore does not change a seeded RHS generated
@@ -217,8 +226,13 @@ O((sum_d min(P_d, n-d)) log n),
 
 where `P_d` is the period of offset `d`. A constant-state carry/borrow automaton
 evaluates each shifted edge orbit without enumerating its anchors. RHS work is
-`O(P_b log n)`. These bounded periodic term counts are recorded in metadata and
-capped by the validation manifest; the evaluator does not materialize
+`O(P_b log n)`. For the nonsymmetric family, matrix work is
+`O(min(P,n) K log n)`, where `P` is the row-pattern period and `K` is the
+configured row-width cap. The same carry/borrow automaton evaluates each signed
+offset orbit. Periodic row structure is the deliberate succinctness tradeoff:
+fully independent hash-generated rows would require a verifier scan with the
+current protocol. These bounded periodic term counts are recorded in metadata
+and capped by the validation manifest; the evaluator does not materialize
 dimension-sized public tables.
 
 The generator owns this capability. Exact and fast backends must not match on a

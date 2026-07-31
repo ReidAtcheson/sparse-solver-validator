@@ -6,7 +6,9 @@ const test = require("node:test");
 const {
   DIA_FAMILY,
   MAX_DIA_OFFSETS,
+  MAX_NONSYMMETRIC_ROW_NONZEROS,
   MAX_SAFE_MANTISSA,
+  NONSYMMETRIC_FAMILY,
   SEEDED_RHS_FAMILY,
   TRIDIAGONAL_FAMILY,
   hostedWorkflow,
@@ -28,6 +30,10 @@ function parameters(overrides = {}) {
     margin: 32,
     minimum: 8,
     maximum: 24,
+    maximumHalfBandwidth: 5,
+    maximumRowNonzeros: 7,
+    coefficientMinimum: -256,
+    coefficientMaximum: 256,
     rhs: SEEDED_RHS_FAMILY,
     rhsPeriodBits: 4,
     rhsFractionalBits: 8,
@@ -107,6 +113,58 @@ test("templates use a separately parameterized seeded RHS", () => {
     maximum_mantissa: "19",
   });
   assert.notEqual(template.rhs.kind, "manufactured-ones-v1");
+});
+
+test("nonsymmetric templates encode generated row-pattern constraints", () => {
+  const p = parameters({ family: NONSYMMETRIC_FAMILY });
+  assert.equal(validationError(p), "");
+  assert.equal(structuralNonzeros(p), 112);
+  assert.equal(
+    structuralNonzeros(parameters({
+      family: NONSYMMETRIC_FAMILY,
+      dimension: 4,
+      maximumHalfBandwidth: 3,
+      maximumRowNonzeros: 7,
+    })),
+    16,
+  );
+  assert.deepEqual(matrixSpec(p), {
+    kind: NONSYMMETRIC_FAMILY,
+    dimension: 16,
+    boundary: "truncate-v1",
+    row_pattern_bits: 3,
+    maximum_half_bandwidth: 5,
+    maximum_nonzeros_per_row: 7,
+    fractional_bits: 8,
+    minimum_mantissa: "-256",
+    maximum_mantissa: "256",
+  });
+});
+
+test("nonsymmetric controls enforce bandwidth, row width, and the unit interval", () => {
+  const sparse = (overrides = {}) => parameters({
+    family: NONSYMMETRIC_FAMILY,
+    ...overrides,
+  });
+  assert.match(validationError(sparse({ maximumHalfBandwidth: 16 })), /smaller/);
+  assert.match(validationError(sparse({ maximumRowNonzeros: 0 })), /between 1/);
+  assert.match(
+    validationError(sparse({ maximumRowNonzeros: MAX_NONSYMMETRIC_ROW_NONZEROS + 1 })),
+    /between 1/,
+  );
+  assert.match(
+    validationError(sparse({ maximumHalfBandwidth: 1, maximumRowNonzeros: 4 })),
+    /available signed offsets/,
+  );
+  assert.match(
+    validationError(sparse({ coefficientMinimum: 1, coefficientMaximum: -1 })),
+    /minimum ≤ maximum/,
+  );
+  assert.match(validationError(sparse({ coefficientMinimum: -257 })), /inside \[-1, 1\]/);
+  assert.match(
+    validationError(sparse({ coefficientMinimum: 0, coefficientMaximum: 0 })),
+    /nonzero/,
+  );
 });
 
 test("seeded RHS parameters are validated at the registered schema boundary", () => {

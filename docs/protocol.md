@@ -106,8 +106,15 @@ The registered matrix families are:
   range. Its independently derived table defines edges `(i, i+d)` for
   `0 <= i < n-d`. The matrix is the resulting weighted graph Laplacian plus a
   strictly positive diagonal shift.
+- `seeded-nonsymmetric-row-sparse-v1`: a seeded periodic table selects a sorted,
+  duplicate-free set of signed offsets for each row pattern. Every pattern has
+  a nonzero diagonal, no offset exceeds the configured half bandwidth, and the
+  configured row-width cap includes the diagonal. Independently generated
+  diagonal and off-diagonal mantissas are nonzero dyadic values in `[-1,1]`.
+  The family makes no symmetry, dominance, definiteness, or nonsingularity
+  claim.
 
-Both families truncate boundary edges instead of wrapping. The DIA family
+All families truncate boundary entries instead of wrapping. The DIA family
 derives each mirrored pair and both diagonal contributions from one edge value.
 It is therefore symmetric, strictly diagonally dominant, and positive definite
 by construction. Those are family-specific certified properties: the common
@@ -138,9 +145,13 @@ cannot raise.
 
 For the tridiagonal family, matrix endpoint work is `O(P_A log n)`. For DIA it
 is `O((sum_d min(P_d, n-d)) log n)`, using a constant-state binary
-carry/borrow evaluator for arbitrary positive offsets. RHS endpoint work is
-`O(P_b log n)`. A family without such a dimension-succinct capability is not
-eligible for the succinct profiles merely because it has a sparse row iterator.
+carry/borrow evaluator for arbitrary positive offsets. The nonsymmetric family
+uses the same automaton for signed row offsets in `O(min(P,n) K log n)`, where
+`K` includes the diagonal. Its row-pattern repetition is required by the
+current succinct evaluator; independently hashing every row would reintroduce
+a verifier scan. RHS endpoint work is `O(P_b log n)`. A family without such a
+dimension-succinct capability is not eligible for the succinct profiles merely
+because it has a sparse row iterator.
 
 ## 4. Problem-instance challenge
 

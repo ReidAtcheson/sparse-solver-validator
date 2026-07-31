@@ -69,7 +69,7 @@ curl --fail --silent --show-error \
           </div>
           <div class="legend" aria-label="Spy plot legend">
             <span><i class="swatch diagonal"></i> diagonal</span>
-            <span><i class="swatch off-diagonal"></i> off-diagonal</span>
+            <span><i class="swatch off-diagonal"></i> <span id="off-diagonal-legend">off-diagonal</span></span>
           </div>
         </div>
 
@@ -80,6 +80,7 @@ curl --fail --silent --show-error \
               <select id="family" name="family">
                 <option value="seeded-symmetric-tridiagonal-v1">Seeded symmetric tridiagonal v1</option>
                 <option value="seeded-symmetric-dia-laplacian-v1">Seeded symmetric DIA Laplacian v1</option>
+                <option value="seeded-nonsymmetric-row-sparse-v1">Seeded nonsymmetric row-sparse v1</option>
               </select>
             </label>
 
@@ -107,13 +108,13 @@ curl --fail --silent --show-error \
                 Fractional bits
                 <input id="fractional-bits" name="fractionalBits" type="number" min="0" max="52" value="8">
               </label>
-              <label>
+              <label id="margin-control">
                 <span id="margin-label">Dominance margin</span>
                 <input id="margin" name="margin" type="number" min="1" max="9007199254740991" value="32">
               </label>
             </div>
 
-            <div class="control-row">
+            <div id="structured-range-controls" class="control-row">
               <label>
                 <span id="minimum-label">Minimum magnitude</span>
                 <input id="minimum" name="minimum" type="number" min="1" max="9007199254740991" value="8">
@@ -123,6 +124,34 @@ curl --fail --silent --show-error \
                 <input id="maximum" name="maximum" type="number" min="1" max="9007199254740991" value="24">
               </label>
             </div>
+
+            <div id="nonsymmetric-shape-controls" class="control-row" hidden>
+              <label>
+                Maximum half bandwidth
+                <input id="maximum-half-bandwidth" name="maximumHalfBandwidth" type="number" min="0" max="127" value="5">
+                <small>Generated columns cannot be farther from their row</small>
+              </label>
+              <label>
+                Maximum nonzeros per row
+                <input id="maximum-row-nonzeros" name="maximumRowNonzeros" type="number" min="1" max="32" value="7">
+                <small>Includes the required diagonal</small>
+              </label>
+            </div>
+
+            <div id="nonsymmetric-range-controls" class="control-row" hidden>
+              <label>
+                Minimum coefficient mantissa
+                <input id="coefficient-minimum" name="coefficientMinimum" type="number" min="-4503599627370496" max="4503599627370496" value="-256">
+              </label>
+              <label>
+                Maximum coefficient mantissa
+                <input id="coefficient-maximum" name="coefficientMaximum" type="number" min="-4503599627370496" max="4503599627370496" value="256">
+              </label>
+            </div>
+            <p id="nonsymmetric-note" class="control-note" hidden>
+              Stored values are nonzero mantissas divided by 2<sup>fractional bits</sup>.
+              The resulting coefficient range must stay inside [−1, 1].
+            </p>
 
             <label>
               Right-hand-side family
