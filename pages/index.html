@@ -6,9 +6,9 @@
     <meta name="description" content="Generate and validate sparse linear-system proofs.">
     <title>Sparse Solver Validator</title>
     <!-- Bump the shared version whenever explorer assets or their DOM contract change. -->
-    <link rel="stylesheet" href="styles.css?v=3">
-    <script src="blake3.js?v=3" defer></script>
-    <script src="explorer.js?v=3" defer></script>
+    <link rel="stylesheet" href="styles.css?v=4">
+    <script src="blake3.js?v=4" defer></script>
+    <script src="explorer.js?v=4" defer></script>
   </head>
   <body>
     <header>
@@ -33,33 +33,34 @@
       </section>
 
       <section aria-labelledby="usage-heading">
-        <h2 id="usage-heading">Usage</h2>
-        <p>The hosted service exposes:</p>
-        <pre><code>POST ${SERVICE_URL}/v1/challenges
-POST ${SERVICE_URL}/v1/validate
-GET  ${SERVICE_URL}/health</code></pre>
+        <h2 id="usage-heading">Run a benchmark</h2>
         <p>
-          Start with a problem template, ask the service to bind fresh signed randomness to it,
-          finalize the public matrix, solve it, create a proof, and submit that proof for a signed
-          certificate. The explorer below generates the exact template and commands for both this
-          hosted workflow and a completely local workflow.
+          The <code>sparse-benchmark</code> runner handles challenge acquisition, problem export,
+          proof construction, submission, retries, and result-card creation. Download a complete
+          benchmark configuration from the explorer below, then run:
         </p>
-        <p>A minimal request/submit sequence looks like this (add an identity-token header for a private Cloud Run service):</p>
-        <pre><code>export SERVICE_URL="https://YOUR-SERVICE-URL"
+        <pre><code>cargo build --release -p sparse-benchmark
 
-curl --fail --silent --show-error \
-  -H 'content-type: application/json' \
-  --data-binary @/tmp/template.json \
-  "${SERVICE_URL}/v1/challenges" \
-  -o /tmp/challenge.json
+target/release/sparse-benchmark start \
+  --config benchmark.json \
+  --runs-dir runs
 
-# Finalize the challenge, solve the generated system, and create validation.proof.
+# Solve the printed public/A.mtx and public/b.mtx system.
+# Write the solution to the printed submission/x.json path.
 
-curl --fail --silent --show-error \
-  -H 'content-type: application/octet-stream' \
-  --data-binary @/tmp/validation.proof \
-  "${SERVICE_URL}/v1/validate" \
-  -o /tmp/certificate.json</code></pre>
+target/release/sparse-benchmark resume runs/run-...</code></pre>
+        <p>
+          <code>start</code> creates an independent, resumable run directory and stops for your
+          solver. <code>resume</code> safely advances that same run and writes
+          <code>result-card.json</code>. If a network request is interrupted, run the same
+          <code>resume</code> command again; the existing proof is reused.
+        </p>
+        <p>
+          See the
+          <a href="https://github.com/ReidAtcheson/sparse-solver-validator/blob/main/docs/benchmark-runner.md">runner guide</a>
+          for matrix-free export options, status inspection, card verification, and recovery
+          semantics.
+        </p>
       </section>
 
       <section class="explorer" aria-labelledby="explorer-heading">
@@ -67,7 +68,7 @@ curl --fail --silent --show-error \
           <div>
             <p class="eyebrow">Interactive tool</p>
             <h2 id="explorer-heading">Problem Explorer</h2>
-            <p>Choose matrix and RHS generators, actualize the matrix from a reproducible seed, then connect your solver to the validation workflow.</p>
+            <p>Choose matrix and RHS generators, inspect the actualized matrix, then download a complete configuration for the resumable runner.</p>
           </div>
           <div class="legend" aria-label="Spy plot legend">
             <span><i class="swatch positive diagonal"></i> positive</span>
@@ -218,8 +219,9 @@ curl --fail --silent --show-error \
               <h3 id="solver-handoff-heading">Solve your system here</h3>
               <p>
                 The finalized generator defines <var>A</var> and <var>b</var> without embedding a
-                known solution. Export the Matrix Market files, solve <var>Ax</var> = <var>b</var>
-                with your solver, and pass its solution JSON to <code>sparse-prover</code>.
+                known solution. The runner exports Matrix Market files by default and prints the
+                exact <code>x.json</code> path. Solve <var>Ax</var> = <var>b</var> with your solver,
+                write that file, then resume the run.
               </p>
               <p>
                 <code>values</code> must contain exactly one finite binary64 decimal string per
@@ -237,13 +239,13 @@ curl --fail --silent --show-error \
           </section>
 
           <div class="tabs" role="tablist" aria-label="Generated output">
-            <button type="button" role="tab" aria-selected="true" aria-controls="local-panel" id="local-tab" data-tab="local">Local</button>
-            <button type="button" role="tab" aria-selected="false" aria-controls="hosted-panel" id="hosted-tab" data-tab="hosted">Server validated</button>
-            <button type="button" role="tab" aria-selected="false" aria-controls="template-panel" id="template-tab" data-tab="template">Template JSON</button>
+            <button type="button" role="tab" aria-selected="true" aria-controls="local-panel" id="local-tab" data-tab="local">Local run</button>
+            <button type="button" role="tab" aria-selected="false" aria-controls="hosted-panel" id="hosted-tab" data-tab="hosted">Server-attested run</button>
+            <button type="button" role="tab" aria-selected="false" aria-controls="template-panel" id="template-tab" data-tab="template">Benchmark JSON</button>
           </div>
 
           <section id="local-panel" role="tabpanel" aria-labelledby="local-tab">
-            <div class="code-header"><span>Local workflow</span><button class="copy" type="button" data-copy="local-code">Copy</button></div>
+            <div class="code-header"><span>Local resumable workflow</span><button class="copy" type="button" data-copy="local-code">Copy</button></div>
             <pre><code id="local-code"></code></pre>
           </section>
 
@@ -252,26 +254,27 @@ curl --fail --silent --show-error \
               <label>Service URL <input id="service-url" value="https://YOUR-SERVICE-URL" spellcheck="false"></label>
               <label>Issuer <input id="issuer" value="YOUR-ISSUER" spellcheck="false"></label>
               <label>Key ID <input id="key-id" value="YOUR-KEY-ID" spellcheck="false"></label>
-              <label>Public key file <input id="public-key" value="/path/to/validator.pub" spellcheck="false"></label>
-              <label class="checkbox-label"><input id="private-service" type="checkbox" checked> Include a Cloud Run identity token</label>
+              <label>Ed25519 public key (64 lowercase hex characters) <input id="public-key" value="YOUR-PUBLIC-KEY-HEX" spellcheck="false"></label>
+              <label class="checkbox-label"><input id="private-service" type="checkbox" checked> Authenticate to private Cloud Run with gcloud</label>
             </div>
-            <p class="timestamp-note">The server signs the challenge’s issue and expiry timestamps. The CLI verifies both before finalizing the matrix.</p>
-            <div class="code-header"><span>Signed, timestamped workflow</span><button class="copy" type="button" data-copy="hosted-code">Copy</button></div>
+            <p class="timestamp-note">Copy the public-key file contents, not its path. The runner obtains a fresh identity token for each request and never stores it.</p>
+            <div class="code-header"><span>Signed, timestamped resumable workflow</span><button class="copy" type="button" data-copy="hosted-code">Copy</button></div>
             <pre><code id="hosted-code"></code></pre>
           </section>
 
           <section id="template-panel" role="tabpanel" aria-labelledby="template-tab" hidden>
             <div class="template-actions">
               <label>
-                Randomness
+                Authority
                 <select id="template-kind">
-                  <option value="literal">Literal seed (local)</option>
-                  <option value="challenge">Challenge-derived (server)</option>
+                  <option value="literal">Local literal seed</option>
+                  <option value="challenge">Server-issued challenge</option>
                 </select>
               </label>
-              <button id="download-template" type="button">Download JSON</button>
+              <button id="download-template" type="button">Download benchmark.json</button>
             </div>
-            <div class="code-header"><span>Problem template</span><button class="copy" type="button" data-copy="template-code">Copy</button></div>
+            <p class="timestamp-note">The generated configuration uses direct validation and bounds its solution and public-evaluator terms to this selected problem.</p>
+            <div class="code-header"><span>Complete benchmark configuration</span><button class="copy" type="button" data-copy="template-code">Copy</button></div>
             <pre><code id="template-code"></code></pre>
           </section>
         </div>

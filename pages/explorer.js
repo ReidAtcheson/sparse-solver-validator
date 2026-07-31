@@ -221,6 +221,59 @@ function problemTemplate(p, kind) {
   };
 }
 
+function publicEvaluationTerms(p) {
+  const paddedDimension = nextPowerOfTwo(p.dimension);
+  let matrix;
+  if (p.family === DIA_FAMILY) {
+    matrix = p.offsets.reduce(
+      (total, offset) => total + Math.min(2 ** p.periodBits, p.dimension - offset),
+      0,
+    );
+  } else if (p.family === NONSYMMETRIC_FAMILY) {
+    matrix = Math.min(2 ** p.periodBits, p.dimension) * p.maximumRowNonzeros;
+  } else if (p.family === PROJECTED_NONSYMMETRIC_FAMILY) {
+    matrix = Math.min(2 ** p.periodBits, paddedDimension) * p.maximumRowNonzeros;
+  } else {
+    matrix = Math.min(2 ** p.periodBits, paddedDimension);
+  }
+  return {
+    matrix,
+    rhs: Math.min(2 ** p.rhsPeriodBits, paddedDimension),
+  };
+}
+
+function benchmarkConfig(p, kind, options = {}) {
+  const remote = kind === "challenge";
+  const terms = publicEvaluationTerms(p);
+  const authority = remote
+    ? {
+      kind: "remote-v1",
+      service_url: options.serviceUrl ?? "https://YOUR-SERVICE-URL",
+      issuer: options.issuer ?? "YOUR-ISSUER",
+      key_id: options.keyId ?? "YOUR-KEY-ID",
+      public_key: options.publicKey ?? "YOUR-PUBLIC-KEY-HEX",
+      authentication: options.privateService === false
+        ? { kind: "none-v1" }
+        : { kind: "gcloud-identity-token-v1", audience: null },
+      maximum_future_skew_seconds: 30,
+      maximum_challenge_lifetime_seconds: 3600,
+    }
+    : { kind: "local-v1" };
+  return {
+    schema: "sparse-solve/benchmark/v1",
+    benchmark_id: remote ? "website-server-preview-v1" : "website-local-preview-v1",
+    authority,
+    problem_template: problemTemplate(p, kind),
+    validation: {
+      schema: "sparse-solve/validation/v1",
+      protocol: "direct-reference-v1",
+      max_solution_elements: p.dimension,
+      max_public_matrix_terms: terms.matrix,
+      max_public_rhs_terms: terms.rhs,
+    },
+  };
+}
+
 // This is an exact browser mirror of the frozen Rust seed derivation and
 // bounded matrix generators. Cross-language test vectors protect the wire
 // semantics; do not replace these streams with a presentation-only PRNG.
@@ -594,78 +647,48 @@ function structuralNonzeros(p) {
 }
 
 function solverHandoff() {
-  return `cargo run -p sparse-problem -- export \\
-  --problem /tmp/problem.json \\
-  --matrix /tmp/A.mtx \\
-  --rhs /tmp/b.mtx
-
-# Solve A x = b here with any sparse solver.
-# Write /tmp/x.json in this prover input format (the values shown are only a
-# three-entry example; provide exactly one finite binary64 decimal string per unknown):
-# {"schema":"sparse-solve/solution/binary64-v1","values":["1.0","-2.5","0"]}`;
+  return `# start prints the exact matrix_file, rhs_file, and solution_file paths.
+# Solve A x = b with any sparse solver, then write submission/x.json as:
+# {"schema":"sparse-solve/solution/binary64-v1","values":["1.0","-2.5","0"]}
+# The values above are only a three-entry format example. Supply exactly one
+# finite binary64 decimal string per unknown.`;
 }
 
 function localWorkflow() {
-  return `# Save the Local template from this explorer as /tmp/template.json.
-cargo run -p sparse-problem -- finalize-local \\
-  --template /tmp/template.json \\
-  --problem /tmp/problem.json
+  return `# In Benchmark JSON, choose Local literal seed and download benchmark.json.
+cargo build --release -p sparse-benchmark
+
+target/release/sparse-benchmark start \\
+  --config benchmark.json \\
+  --runs-dir runs
 
 ${solverHandoff()}
 
-cargo run --release -p sparse-prover -- prove \\
-  --problem /tmp/problem.json \\
-  --validation examples/direct-validation.json \\
-  --solution /tmp/x.json \\
-  --proof /tmp/validation.proof
+target/release/sparse-benchmark resume runs/run-...
 
-cargo run --release -p sparse-validator -- verify \\
-  --proof /tmp/validation.proof \\
-  --allow-literal`;
+# The completed run contains result-card.json. Local cards are reproducible
+# validation records, but they are not signed by a server.`;
 }
 
-function hostedWorkflow({ serviceUrl, issuer, keyId, publicKey, privateService }) {
-  const authOption = privateService
-    ? ` --header="Authorization: Bearer $(gcloud auth print-identity-token)"`
+function hostedWorkflow({ privateService }) {
+  const authentication = privateService
+    ? "# Ensure gcloud is authenticated; the runner fetches a fresh identity token per request.\n"
     : "";
-  return `# Save the Server template from this explorer as /tmp/template.json.
-export SERVICE_URL="${serviceUrl}"
+  return `# Fill the service fields above. In Benchmark JSON, choose Server-issued
+# challenge and download benchmark.json.
+${authentication}cargo build --release -p sparse-benchmark
 
-# The service signs fresh issued-at and expiry timestamps into this challenge.
-curl --fail --silent --show-error${authOption} \\
-  -H 'content-type: application/json' \\
-  --data-binary @/tmp/template.json \\
-  "\${SERVICE_URL}/v1/challenges" \\
-  -o /tmp/challenge.json
-
-cargo run -p sparse-problem -- finalize-challenge \\
-  --template /tmp/template.json \\
-  --challenge /tmp/challenge.json \\
-  --public-key "${publicKey}" \\
-  --issuer "${issuer}" \\
-  --key-id "${keyId}" \\
-  --problem /tmp/problem.json
+target/release/sparse-benchmark start \\
+  --config benchmark.json \\
+  --runs-dir runs
 
 ${solverHandoff()}
 
-cargo run --release -p sparse-prover -- prove \\
-  --problem /tmp/problem.json \\
-  --validation examples/direct-validation.json \\
-  --solution /tmp/x.json \\
-  --challenge /tmp/challenge.json \\
-  --proof /tmp/validation.proof
+target/release/sparse-benchmark resume runs/run-...
 
-curl --fail --silent --show-error${authOption} \\
-  -H 'content-type: application/octet-stream' \\
-  --data-binary @/tmp/validation.proof \\
-  "\${SERVICE_URL}/v1/validate" \\
-  -o /tmp/certificate.json
-
-cargo run -p sparse-validator -- verify-certificate \\
-  --certificate /tmp/certificate.json \\
-  --public-key "${publicKey}" \\
-  --issuer "${issuer}" \\
-  --key-id "${keyId}"`;
+# resume constructs and locally verifies the proof, submits it, authenticates
+# the signed certificate, and writes result-card.json. Re-run it after a
+# network interruption; the existing proof is reused.`;
 }
 
 function initialize() {
@@ -837,13 +860,15 @@ function initialize() {
     localCode.textContent = localWorkflow();
     const [serviceUrl, issuer, keyId, publicKey] = hostInputs.map((input) => input.value.trim());
     hostedCode.textContent = hostedWorkflow({
+      privateService: privateService.checked,
+    });
+    templateCode.textContent = `${JSON.stringify(benchmarkConfig(p, templateKind.value, {
       serviceUrl,
       issuer,
       keyId,
       publicKey,
       privateService: privateService.checked,
-    });
-    templateCode.textContent = `${JSON.stringify(problemTemplate(p, templateKind.value), null, 2)}\n`;
+    }), null, 2)}\n`;
   }
 
   form.addEventListener("input", update);
@@ -888,9 +913,7 @@ function initialize() {
     const blob = new Blob([templateCode.textContent], { type: "application/json" });
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = templateKind.value === "challenge"
-      ? "challenge-template.json"
-      : "local-template.json";
+    link.download = "benchmark.json";
     link.click();
     URL.revokeObjectURL(link.href);
   });
@@ -911,6 +934,7 @@ if (typeof module !== "undefined" && module.exports) {
     SEEDED_RHS_FAMILY,
     TRIDIAGONAL_FAMILY,
     actualizeMatrix,
+    benchmarkConfig,
     deriveSubseed,
     hostedWorkflow,
     initialize,
@@ -919,6 +943,7 @@ if (typeof module !== "undefined" && module.exports) {
     matrixSpec,
     parseOffsets,
     problemTemplate,
+    publicEvaluationTerms,
     nextSeedHex,
     rhsSpec,
     solverHandoff,
@@ -934,7 +959,7 @@ function initializeWhenReady() {
   }
 
   const dependency = document.createElement("script");
-  dependency.src = "blake3.js?v=3";
+  dependency.src = "blake3.js?v=4";
   dependency.addEventListener("load", () => {
     blake3 = globalThis.SsvBlake3;
     if (blake3) {

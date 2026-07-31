@@ -55,12 +55,14 @@ numerical audit.
 - `sparse-prover`: read `x` from a file and build a proof artifact
 - `sparse-validator`: inspect, verify, and authenticate certificates
 - `sparse-validator-server`: localhost/Cloud Run-compatible HTTP adapter
+- `sparse-benchmark`: resumable problem runs and portable validation cards
 
 See [architecture.md](docs/architecture.md), [protocol.md](docs/protocol.md), and
 [benchmarking.md](docs/benchmarking.md) for component boundaries, exact/fast
 semantics, security limits, and the measurement method required before making
-performance claims about this rewrite. The private-by-default deployment
-runbook is [gcp-cloud-run.md](docs/gcp-cloud-run.md).
+performance claims about this rewrite. The staged participant workflow is in
+[benchmark-runner.md](docs/benchmark-runner.md), and the private-by-default
+deployment runbook is [gcp-cloud-run.md](docs/gcp-cloud-run.md).
 
 ## Local direct workflow
 

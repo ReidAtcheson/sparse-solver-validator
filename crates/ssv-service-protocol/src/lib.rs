@@ -742,7 +742,12 @@ impl CanonicalEncode for FastConsistencyMetrics {
 }
 
 impl CertifiedScore {
-    fn validate_for(&self, protocol: ProofProtocol) -> Result<(), ProtocolError> {
+    /// Checks that this score is well formed for the selected proof protocol.
+    ///
+    /// Signed certificates call this as part of payload validation. Local tools
+    /// that retain the same typed score without a service signature use it to
+    /// enforce identical numerical and cross-protocol invariants.
+    pub fn validate_for_protocol(&self, protocol: ProofProtocol) -> Result<(), ProtocolError> {
         match (protocol, self) {
             (ProofProtocol::DirectReferenceV1, Self::DirectBinary64ResidualV1 { residual }) => {
                 residual.validate()
@@ -870,7 +875,7 @@ impl CertificatePayload {
         if self.issued_at_unix_seconds < 0 {
             return Err(ProtocolError::NegativeTimestamp);
         }
-        self.score.validate_for(self.protocol)
+        self.score.validate_for_protocol(self.protocol)
     }
 }
 

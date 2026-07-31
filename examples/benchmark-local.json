@@ -1,0 +1,44 @@
+{
+  "schema": "sparse-solve/benchmark/v1",
+  "benchmark_id": "local-nonsymmetric-v2-smoke",
+  "authority": {
+    "kind": "local-v1"
+  },
+  "problem_template": {
+    "schema": "sparse-solve/problem-template/v1",
+    "randomness": {
+      "kind": "literal-v1",
+      "seed": "0101010101010101010101010101010101010101010101010101010101010101"
+    },
+    "matrix": {
+      "kind": "seeded-nonsymmetric-row-sparse-v2",
+      "dimension": 16,
+      "boundary": "truncate-v1",
+      "row_pattern_bits": 2,
+      "maximum_half_bandwidth": 4,
+      "maximum_nonzeros_per_row": 3,
+      "fractional_bits": 8,
+      "minimum_mantissa": "-16",
+      "maximum_mantissa": "19"
+    },
+    "rhs": {
+      "kind": "seeded-periodic-dyadic-v1",
+      "period_bits": 4,
+      "fractional_bits": 8,
+      "minimum_mantissa": "-16",
+      "maximum_mantissa": "19"
+    },
+    "requested_outputs": [
+      {
+        "kind": "squared-l2-residual-v1"
+      }
+    ]
+  },
+  "validation": {
+    "schema": "sparse-solve/validation/v1",
+    "protocol": "direct-reference-v1",
+    "max_solution_elements": 1024,
+    "max_public_matrix_terms": 4096,
+    "max_public_rhs_terms": 4096
+  }
+}
