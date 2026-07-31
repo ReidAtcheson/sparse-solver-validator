@@ -18,6 +18,7 @@ const {
   SEEDED_RHS_FAMILY,
   TRIDIAGONAL_FAMILY,
   actualizeMatrix,
+  benchmarkConfig,
   hostedWorkflow,
   initialize,
   localWorkflow,
@@ -25,6 +26,7 @@ const {
   nextSeedHex,
   parseOffsets,
   problemTemplate,
+  publicEvaluationTerms,
   structuralNonzeros,
   validationError,
 } = require("../../pages/explorer.js");
@@ -91,7 +93,7 @@ function explorerDocument(includeSeedControls) {
     "service-url": "https://validator.example",
     issuer: "issuer",
     "key-id": "key",
-    "public-key": "/tmp/key.pub",
+    "public-key": "11".repeat(32),
   };
   const ids = [
     "generator-form", "spy-plot", "form-error", "local-code", "hosted-code",
@@ -134,14 +136,17 @@ function explorerDocument(includeSeedControls) {
 
 test("the static page loads exact actualization support before the explorer", () => {
   const html = readFileSync(join(__dirname, "../../pages/index.html"), "utf8");
-  assert.ok(html.indexOf('src="blake3.js?v=3"') < html.indexOf('src="explorer.js?v=3"'));
-  assert.match(html, /href="styles\.css\?v=3"/);
+  assert.ok(html.indexOf('src="blake3.js?v=4"') < html.indexOf('src="explorer.js?v=4"'));
+  assert.match(html, /href="styles\.css\?v=4"/);
   assert.match(html, /id="instance-seed"/);
   assert.match(html, /id="new-seed"/);
   assert.match(html, /seeded-nonsymmetric-row-sparse-v2/);
   assert.match(html, /id="dimension"[^>]+max="1024"/);
   assert.match(html, /class="swatch negative off-diagonal"/);
   assert.match(html, /id="off-diagonal-legend"/);
+  assert.match(html, /sparse-benchmark start/);
+  assert.match(html, /Download benchmark\.json/);
+  assert.doesNotMatch(html, /curl --fail/);
 });
 
 test("browser initialization renders with cached legacy markup and advances current seeds", () => {
@@ -240,6 +245,73 @@ test("templates use a separately parameterized seeded RHS", () => {
     maximum_mantissa: "19",
   });
   assert.notEqual(template.rhs.kind, "manufactured-ones-v1");
+});
+
+test("benchmark JSON wraps the selected problem in bounded local runner policy", () => {
+  const config = benchmarkConfig(parameters(), "literal");
+  assert.equal(config.schema, "sparse-solve/benchmark/v1");
+  assert.equal(config.benchmark_id, "website-local-preview-v1");
+  assert.deepEqual(config.authority, { kind: "local-v1" });
+  assert.equal(config.problem_template.randomness.kind, "literal-v1");
+  assert.deepEqual(config.validation, {
+    schema: "sparse-solve/validation/v1",
+    protocol: "direct-reference-v1",
+    max_solution_elements: 16,
+    max_public_matrix_terms: 8,
+    max_public_rhs_terms: 16,
+  });
+});
+
+test("server benchmark JSON pins authority and Cloud Run authentication", () => {
+  const config = benchmarkConfig(parameters(), "challenge", {
+    serviceUrl: "https://validator.example",
+    issuer: "benchmark-issuer",
+    keyId: "benchmark-key-v1",
+    publicKey: "11".repeat(32),
+    privateService: true,
+  });
+  assert.deepEqual(config.authority, {
+    kind: "remote-v1",
+    service_url: "https://validator.example",
+    issuer: "benchmark-issuer",
+    key_id: "benchmark-key-v1",
+    public_key: "11".repeat(32),
+    authentication: {
+      kind: "gcloud-identity-token-v1",
+      audience: null,
+    },
+    maximum_future_skew_seconds: 30,
+    maximum_challenge_lifetime_seconds: 3600,
+  });
+  assert.deepEqual(config.problem_template.randomness, {
+    kind: "challenge-derived-v1",
+    derivation: "blake3-xof-v1",
+  });
+
+  const publicService = benchmarkConfig(parameters(), "challenge", {
+    privateService: false,
+  });
+  assert.deepEqual(publicService.authority.authentication, { kind: "none-v1" });
+});
+
+test("benchmark manifests use the generator's exact succinct evaluator bounds", () => {
+  assert.deepEqual(publicEvaluationTerms(parameters({
+    family: DIA_FAMILY,
+    dimension: 65,
+    offsets: [1, 64],
+  })), {
+    matrix: 9,
+    rhs: 16,
+  });
+  assert.deepEqual(publicEvaluationTerms(parameters({
+    family: PROJECTED_NONSYMMETRIC_FAMILY,
+    dimension: 37,
+    periodBits: 3,
+    maximumRowNonzeros: 7,
+  })), {
+    matrix: 56,
+    rhs: 16,
+  });
 });
 
 test("seed validation and cheap advancement preserve the protocol's canonical spelling", () => {
@@ -562,24 +634,26 @@ test("seeded RHS parameters are validated at the registered schema boundary", ()
   );
 });
 
-test("workflows export generated systems and hand solver output to the prover", () => {
+test("workflows hand one resumable run to the solver and back to the runner", () => {
   const local = localWorkflow();
-  assert.match(local, /sparse-problem -- export/);
-  assert.match(local, /Solve A x = b here/);
+  assert.match(local, /sparse-benchmark start/);
+  assert.match(local, /sparse-benchmark resume/);
+  assert.match(local, /Solve A x = b/);
   assert.match(local, /sparse-solve\/solution\/binary64-v1/);
-  assert.match(local, /--solution \/tmp\/x\.json/);
+  assert.match(local, /submission\/x\.json/);
+  assert.match(local, /result-card\.json/);
+  assert.doesNotMatch(local, /sparse-problem|sparse-prover|curl --fail/);
   assert.doesNotMatch(local, /manufactured-solution/);
 
   const hosted = hostedWorkflow({
-    serviceUrl: "https://validator.example",
-    issuer: "issuer",
-    keyId: "key-v1",
-    publicKey: "/tmp/validator.pub",
     privateService: true,
   });
-  assert.match(hosted, /sparse-problem -- export/);
-  assert.match(hosted, /Solve A x = b here/);
-  assert.match(hosted, /Authorization: Bearer/);
+  assert.match(hosted, /sparse-benchmark start/);
+  assert.match(hosted, /sparse-benchmark resume/);
+  assert.match(hosted, /Solve A x = b/);
+  assert.match(hosted, /fresh identity token per request/);
+  assert.match(hosted, /existing proof is reused/);
+  assert.doesNotMatch(hosted, /sparse-problem|sparse-prover|curl --fail/);
   assert.doesNotMatch(hosted, /manufactured-solution/);
 });
 
