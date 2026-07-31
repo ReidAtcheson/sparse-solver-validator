@@ -1,7 +1,9 @@
 use ed25519_dalek::SigningKey;
-use ssv_backends::{BackendProverReport, BackendVerifierReport, prove_single_stage};
+use ssv_backends::{BackendProverReport, BackendVerifierReport, prove_single_stage, verify};
 use ssv_canonical::Digest;
-use ssv_problem::{ProblemTemplate, RhsSpec};
+use ssv_problem::{
+    BoundaryRule, GeneratedProblem, MatrixSpec, ProblemTemplate, RhsSpec, SymmetricDiaEdge,
+};
 use ssv_service::{ServiceConfig, ServiceError, StatelessValidatorService, ValidationCancellation};
 use ssv_service_protocol::{
     CertifiedScore, MAX_ID_BYTES, MAX_PUBLIC_EVALUATION_TERMS_LIMIT, ProofProtocol, ProtocolError,
@@ -51,6 +53,93 @@ fn seeded_rhs_challenge_template() -> ProblemTemplate {
         maximum_mantissa: 7,
     };
     template
+}
+
+fn dia_seeded_rhs_local_template() -> ProblemTemplate {
+    let mut template = local_template();
+    template.matrix = MatrixSpec::SeededSymmetricDiaLaplacianV1 {
+        dimension: 8,
+        boundary: BoundaryRule::TruncateV1,
+        fractional_bits: 8,
+        diagonal_shift_mantissa: 64,
+        edge_diagonals: vec![
+            SymmetricDiaEdge {
+                positive_offset: 1,
+                period_bits: 2,
+                minimum_weight_mantissa: 2,
+                maximum_weight_mantissa: 7,
+            },
+            SymmetricDiaEdge {
+                positive_offset: 3,
+                period_bits: 1,
+                minimum_weight_mantissa: 1,
+                maximum_weight_mantissa: 5,
+            },
+        ],
+    };
+    template.rhs = RhsSpec::SeededPeriodicDyadicV1 {
+        period_bits: 3,
+        fractional_bits: 8,
+        minimum_mantissa: -16,
+        maximum_mantissa: 19,
+    };
+    template
+}
+
+fn conjugate_gradient_solution(problem: &GeneratedProblem) -> Solution {
+    fn dot(left: &[f64], right: &[f64]) -> f64 {
+        left.iter()
+            .zip(right)
+            .map(|(&left, &right)| left * right)
+            .sum()
+    }
+
+    fn apply(problem: &GeneratedProblem, input: &[f64]) -> Vec<f64> {
+        problem
+            .rows()
+            .map(|row| {
+                row.map(|entry| entry.value.to_f64() * input[entry.column])
+                    .sum()
+            })
+            .collect()
+    }
+
+    let dimension = problem.dimension();
+    let mut solution = vec![0.0; dimension];
+    let mut residual = (0..dimension)
+        .map(|row| problem.rhs_f64(row).unwrap())
+        .collect::<Vec<_>>();
+    let mut direction = residual.clone();
+    let initial_squared_norm = dot(&residual, &residual);
+    let target_squared_norm = initial_squared_norm.max(1.0) * 1.0e-28;
+    let mut squared_norm = initial_squared_norm;
+    if squared_norm <= target_squared_norm {
+        return Solution::new(solution, dimension).unwrap();
+    }
+    for _ in 0..4 * dimension {
+        let image = apply(problem, &direction);
+        let denominator = dot(&direction, &image);
+        assert!(denominator > 0.0, "the generated DIA matrix must be SPD");
+        let step = squared_norm / denominator;
+        for ((solution, residual), (&direction, &image)) in solution
+            .iter_mut()
+            .zip(&mut residual)
+            .zip(direction.iter().zip(&image))
+        {
+            *solution += step * direction;
+            *residual -= step * image;
+        }
+        let next_squared_norm = dot(&residual, &residual);
+        if next_squared_norm <= target_squared_norm {
+            return Solution::new(solution, dimension).unwrap();
+        }
+        let beta = next_squared_norm / squared_norm;
+        for (direction, &residual) in direction.iter_mut().zip(&residual) {
+            *direction = residual + beta * *direction;
+        }
+        squared_norm = next_squared_norm;
+    }
+    panic!("conjugate gradient did not converge on the shifted DIA system");
 }
 
 fn manifest() -> ValidationManifest {
@@ -638,4 +727,54 @@ fn hosted_fast_and_exact_followup_share_the_signed_problem_header() {
         exact_certificate.certificate.payload.score,
         CertifiedScore::ExactDyadicSquaredL2V1 { .. }
     ));
+}
+
+#[test]
+fn dia_family_with_seeded_rhs_round_trips_every_backend_without_a_manufactured_solution() {
+    let problem = dia_seeded_rhs_local_template().finalize_literal().unwrap();
+    assert!(matches!(
+        problem.rhs,
+        RhsSpec::SeededPeriodicDyadicV1 { .. }
+    ));
+    let generated = problem.compile().unwrap();
+    let solution = conjugate_gradient_solution(&generated);
+
+    for protocol in [
+        ProofProtocol::DirectReferenceV1,
+        ProofProtocol::WhirField192L2V4,
+        ProofProtocol::FastBinary64UnitCircleV5,
+    ] {
+        let statement = statement(
+            problem.clone(),
+            ValidationManifest {
+                protocol,
+                max_solution_elements: 8,
+                max_public_matrix_terms: 64,
+                max_public_rhs_terms: 64,
+                ..ValidationManifest::default()
+            },
+            None,
+        );
+        let artifact = single_stage_proof(&statement, &solution);
+        let prelude = ArtifactPrelude::parse(&artifact).unwrap();
+        match verify(&prelude).unwrap() {
+            BackendVerifierReport::Direct(report) => {
+                assert_eq!(protocol, ProofProtocol::DirectReferenceV1);
+                assert!(report.residual.l2 < 1.0e-12);
+                assert_eq!(report.rows_visited, 8);
+                assert_eq!(report.nonzeros_visited, 32);
+            }
+            BackendVerifierReport::Exact(report) => {
+                assert_eq!(protocol, ProofProtocol::WhirField192L2V4);
+                assert!(report.residual.l2_approx().unwrap() < 1.0e-12);
+                assert_eq!(report.algebra.generator_row_queries, 0);
+            }
+            BackendVerifierReport::Fast(report) => {
+                assert_eq!(protocol, ProofProtocol::FastBinary64UnitCircleV5);
+                assert!(report.score.squared_l2_claim < 1.0e-20);
+                assert_eq!(report.work.public_matrix_period_terms, 6);
+                assert_eq!(report.work.generator_row_queries, 0);
+            }
+        }
+    }
 }

@@ -16,6 +16,11 @@ use crate::randomness::{
 pub const MAX_DIMENSION: u64 = 1 << 30;
 pub const MAX_PERIOD_BITS: u8 = 16;
 pub const MAX_FRACTIONAL_BITS: u8 = 52;
+/// Maximum number of generated positive-offset diagonals in one DIA family.
+///
+/// A row contains at most two off-diagonal entries per registered positive
+/// offset, so this also bounds row-iterator work independently of dimension.
+pub const MAX_DIA_EDGE_DIAGONALS: usize = 16;
 pub const MAX_CHALLENGE_CONTEXT_BYTES: usize = 64 * 1024;
 const MIN_DIMENSION: u64 = 2;
 const MAX_EXACT_BINARY64_MANTISSA: u64 = (1_u64 << 53) - 1;
@@ -92,8 +97,24 @@ impl DiagonalConstruction {
     }
 }
 
-/// Registered sparse matrix construction families.
+/// One generated positive-offset diagonal in a symmetric DIA graph.
+///
+/// For offset `d`, anchors `i` in `0..dimension-d` define the undirected edge
+/// `(i, i + d)`. The seeded table stores positive edge-weight mantissas; matrix
+/// off-diagonal entries are their negatives.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SymmetricDiaEdge {
+    pub positive_offset: u64,
+    pub period_bits: u8,
+    #[serde(with = "decimal_u64")]
+    pub minimum_weight_mantissa: u64,
+    #[serde(with = "decimal_u64")]
+    pub maximum_weight_mantissa: u64,
+}
+
+/// Registered sparse matrix construction families.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum MatrixSpec {
     #[serde(rename = "seeded-symmetric-tridiagonal-v1")]
@@ -103,26 +124,30 @@ pub enum MatrixSpec {
         off_diagonal: OffDiagonalValues,
         diagonal: DiagonalConstruction,
     },
+    /// Shifted weighted graph Laplacian in generated DIA form.
+    ///
+    /// Only positive offsets are specified. Each generated edge contributes
+    /// `w (e_i - e_j) (e_i - e_j)^T`, and the positive shift is added to every
+    /// diagonal entry. Symmetry and positive definiteness are therefore
+    /// consequences of this family, not requirements of the compiled-family
+    /// interface used by backends.
+    #[serde(rename = "seeded-symmetric-dia-laplacian-v1")]
+    SeededSymmetricDiaLaplacianV1 {
+        dimension: u64,
+        boundary: BoundaryRule,
+        fractional_bits: u8,
+        #[serde(with = "decimal_u64")]
+        diagonal_shift_mantissa: u64,
+        edge_diagonals: Vec<SymmetricDiaEdge>,
+    },
 }
 
 impl MatrixSpec {
     #[must_use]
-    pub const fn dimension(self) -> u64 {
+    pub const fn dimension(&self) -> u64 {
         match self {
-            Self::SeededSymmetricTridiagonalV1 { dimension, .. } => dimension,
-        }
-    }
-
-    pub(crate) const fn components(
-        self,
-    ) -> (u64, BoundaryRule, OffDiagonalValues, DiagonalConstruction) {
-        match self {
-            Self::SeededSymmetricTridiagonalV1 {
-                dimension,
-                boundary,
-                off_diagonal,
-                diagonal,
-            } => (dimension, boundary, off_diagonal, diagonal),
+            Self::SeededSymmetricTridiagonalV1 { dimension, .. }
+            | Self::SeededSymmetricDiaLaplacianV1 { dimension, .. } => *dimension,
         }
     }
 }
@@ -233,6 +258,14 @@ pub enum ProblemError {
     FractionalBitsTooLarge { actual: u8 },
     #[error("off-diagonal magnitudes must satisfy 1 <= minimum <= maximum")]
     InvalidOffDiagonalRange,
+    #[error("a DIA matrix must register at least one positive-offset edge diagonal")]
+    EmptyDiaEdgeDiagonals,
+    #[error("a DIA matrix registers {actual} edge diagonals; maximum is {MAX_DIA_EDGE_DIAGONALS}")]
+    TooManyDiaEdgeDiagonals { actual: usize },
+    #[error("DIA positive offsets must be strictly increasing and smaller than the dimension")]
+    InvalidDiaOffset,
+    #[error("DIA edge weights must satisfy 1 <= minimum <= maximum")]
+    InvalidDiaWeightRange,
     #[error("the strict diagonal-dominance margin must be positive")]
     ZeroDominanceMargin,
     #[error(
@@ -247,6 +280,8 @@ pub enum ProblemError {
         "a generated RHS mantissa can exceed the exact binary64 limit {MAX_EXACT_BINARY64_MANTISSA}"
     )]
     RhsMagnitudeTooLarge,
+    #[error("manufactured-ones-v1 is not supported by the selected matrix family")]
+    UnsupportedManufacturedRhs,
     #[error("integer overflow while validating {0}")]
     IntegerOverflow(&'static str),
     #[error("the v1 problem must request squared-l2-residual-v1 exactly once")]
@@ -294,7 +329,7 @@ impl ProblemTemplate {
     }
 
     pub fn validate(&self) -> Result<(), ProblemError> {
-        validate_common(self.matrix, self.rhs, &self.requested_outputs)
+        validate_common(&self.matrix, self.rhs, &self.requested_outputs)
     }
 
     /// Computes public-evaluator term counts without generating periodic tables.
@@ -302,7 +337,7 @@ impl ProblemTemplate {
     /// This operation is constant-time and does not allocate.
     pub fn public_evaluation_terms(&self) -> Result<PublicEvaluationTerms, ProblemError> {
         self.validate()?;
-        Ok(public_evaluation_terms(self.matrix, self.rhs))
+        public_evaluation_terms(&self.matrix, self.rhs)
     }
 
     pub fn digest(&self) -> Result<ProblemTemplateDigest, ProblemError> {
@@ -340,7 +375,7 @@ impl ProblemTemplate {
         let problem = FinalizedProblem {
             schema: ProblemSchema::V1,
             randomness,
-            matrix: self.matrix,
+            matrix: self.matrix.clone(),
             rhs: self.rhs,
             requested_outputs: self.requested_outputs.clone(),
         };
@@ -409,14 +444,14 @@ impl FinalizedProblem {
         ProblemTemplate {
             schema: TemplateSchema::V1,
             randomness,
-            matrix: self.matrix,
+            matrix: self.matrix.clone(),
             rhs: self.rhs,
             requested_outputs: self.requested_outputs.clone(),
         }
     }
 
     pub fn validate(&self) -> Result<(), ProblemError> {
-        validate_common(self.matrix, self.rhs, &self.requested_outputs)?;
+        validate_common(&self.matrix, self.rhs, &self.requested_outputs)?;
         if let FinalizedRandomness::ChallengeDerivedV1 {
             template_digest,
             challenge_context,
@@ -451,7 +486,7 @@ impl FinalizedProblem {
     /// This operation is constant-time and does not allocate.
     pub fn public_evaluation_terms(&self) -> Result<PublicEvaluationTerms, ProblemError> {
         self.validate()?;
-        Ok(public_evaluation_terms(self.matrix, self.rhs))
+        public_evaluation_terms(&self.matrix, self.rhs)
     }
 
     /// Application-layer check used before accepting a service-issued context.
@@ -523,6 +558,15 @@ impl CanonicalEncode for DiagonalConstruction {
     }
 }
 
+impl CanonicalEncode for SymmetricDiaEdge {
+    fn encode(&self, encoder: &mut Encoder) {
+        encoder.write_u64(self.positive_offset);
+        encoder.write_u8(self.period_bits);
+        encoder.write_u64(self.minimum_weight_mantissa);
+        encoder.write_u64(self.maximum_weight_mantissa);
+    }
+}
+
 impl CanonicalEncode for MatrixSpec {
     fn encode(&self, encoder: &mut Encoder) {
         match self {
@@ -537,6 +581,23 @@ impl CanonicalEncode for MatrixSpec {
                 boundary.encode(encoder);
                 off_diagonal.encode(encoder);
                 diagonal.encode(encoder);
+            }
+            Self::SeededSymmetricDiaLaplacianV1 {
+                dimension,
+                boundary,
+                fractional_bits,
+                diagonal_shift_mantissa,
+                edge_diagonals,
+            } => {
+                encoder.write_u16(2);
+                encoder.write_u64(*dimension);
+                boundary.encode(encoder);
+                encoder.write_u8(*fractional_bits);
+                encoder.write_u64(*diagonal_shift_mantissa);
+                encoder.write_u32(edge_diagonals.len() as u32);
+                for edge in edge_diagonals {
+                    edge.encode(encoder);
+                }
             }
         }
     }
@@ -595,7 +656,7 @@ impl CanonicalEncode for FinalizedProblem {
 }
 
 fn validate_common(
-    matrix: MatrixSpec,
+    matrix: &MatrixSpec,
     rhs: RhsSpec,
     requested_outputs: &[RequestedOutput],
 ) -> Result<(), ProblemError> {
@@ -608,40 +669,102 @@ fn validate_common(
         return Err(ProblemError::InvalidRequestedOutputs);
     }
 
-    let (dimension, _boundary, off_diagonal, diagonal) = matrix.components();
+    let dimension = matrix.dimension();
     if !(MIN_DIMENSION..=MAX_DIMENSION).contains(&dimension) {
         return Err(ProblemError::InvalidDimension { actual: dimension });
     }
     let dimension = usize::try_from(dimension)
         .map_err(|_| ProblemError::IntegerOverflow("matrix dimension"))?;
-    dimension
-        .checked_mul(3)
-        .and_then(|value| value.checked_sub(2))
-        .ok_or(ProblemError::IntegerOverflow("structural nonzero count"))?;
+    match matrix {
+        MatrixSpec::SeededSymmetricTridiagonalV1 {
+            off_diagonal,
+            diagonal,
+            ..
+        } => {
+            dimension
+                .checked_mul(3)
+                .and_then(|value| value.checked_sub(2))
+                .ok_or(ProblemError::IntegerOverflow("structural nonzero count"))?;
 
-    let (period_bits, fractional_bits, minimum_magnitude, maximum_magnitude) =
-        off_diagonal.parameters();
-    validate_period_and_scale(period_bits, fractional_bits)?;
-    if minimum_magnitude == 0 || minimum_magnitude > maximum_magnitude {
-        return Err(ProblemError::InvalidOffDiagonalRange);
+            let (period_bits, fractional_bits, minimum_magnitude, maximum_magnitude) =
+                off_diagonal.parameters();
+            validate_period_and_scale(period_bits, fractional_bits)?;
+            if minimum_magnitude == 0 || minimum_magnitude > maximum_magnitude {
+                return Err(ProblemError::InvalidOffDiagonalRange);
+            }
+            let margin = diagonal.margin_mantissa();
+            let maximum_incident_weight =
+                maximum_magnitude
+                    .checked_mul(2)
+                    .ok_or(ProblemError::IntegerOverflow(
+                        "maximum incident edge weight",
+                    ))?;
+            validate_shifted_laplacian_bounds(maximum_incident_weight, margin)?;
+        }
+        MatrixSpec::SeededSymmetricDiaLaplacianV1 {
+            fractional_bits,
+            diagonal_shift_mantissa,
+            edge_diagonals,
+            ..
+        } => {
+            if edge_diagonals.is_empty() {
+                return Err(ProblemError::EmptyDiaEdgeDiagonals);
+            }
+            if edge_diagonals.len() > MAX_DIA_EDGE_DIAGONALS {
+                return Err(ProblemError::TooManyDiaEdgeDiagonals {
+                    actual: edge_diagonals.len(),
+                });
+            }
+            if *diagonal_shift_mantissa == 0 {
+                return Err(ProblemError::ZeroDominanceMargin);
+            }
+
+            let mut previous_offset = 0_u64;
+            let mut maximum_weight_sum = 0_u64;
+            let mut structural_nonzeros = dimension;
+            let mut table_elements = 0_usize;
+            for edge in edge_diagonals {
+                if edge.positive_offset <= previous_offset
+                    || edge.positive_offset >= matrix.dimension()
+                {
+                    return Err(ProblemError::InvalidDiaOffset);
+                }
+                previous_offset = edge.positive_offset;
+                validate_period_and_scale(edge.period_bits, *fractional_bits)?;
+                if edge.minimum_weight_mantissa == 0
+                    || edge.minimum_weight_mantissa > edge.maximum_weight_mantissa
+                {
+                    return Err(ProblemError::InvalidDiaWeightRange);
+                }
+                maximum_weight_sum = maximum_weight_sum
+                    .checked_add(edge.maximum_weight_mantissa)
+                    .ok_or(ProblemError::IntegerOverflow("DIA maximum edge-weight sum"))?;
+                let edge_count = dimension
+                    .checked_sub(
+                        usize::try_from(edge.positive_offset)
+                            .map_err(|_| ProblemError::IntegerOverflow("DIA positive offset"))?,
+                    )
+                    .ok_or(ProblemError::IntegerOverflow("DIA edge count"))?;
+                structural_nonzeros = edge_count
+                    .checked_mul(2)
+                    .and_then(|count| structural_nonzeros.checked_add(count))
+                    .ok_or(ProblemError::IntegerOverflow("structural nonzero count"))?;
+                table_elements = (1_usize << edge.period_bits)
+                    .checked_add(table_elements)
+                    .ok_or(ProblemError::IntegerOverflow("DIA periodic table elements"))?;
+            }
+            let maximum_incident_weight =
+                maximum_weight_sum
+                    .checked_mul(2)
+                    .ok_or(ProblemError::IntegerOverflow(
+                        "DIA maximum incident edge weight",
+                    ))?;
+            validate_shifted_laplacian_bounds(maximum_incident_weight, *diagonal_shift_mantissa)?;
+            let _ = structural_nonzeros;
+            let _ = table_elements;
+        }
     }
-    let margin = diagonal.margin_mantissa();
-    if margin == 0 {
-        return Err(ProblemError::ZeroDominanceMargin);
-    }
-    let maximum_diagonal = maximum_magnitude
-        .checked_mul(2)
-        .and_then(|value| value.checked_add(margin))
-        .ok_or(ProblemError::IntegerOverflow("maximum diagonal mantissa"))?;
-    maximum_magnitude
-        .checked_mul(4)
-        .and_then(|value| value.checked_add(margin))
-        .ok_or(ProblemError::IntegerOverflow(
-            "maximum absolute row-sum mantissa",
-        ))?;
-    if maximum_diagonal > MAX_EXACT_BINARY64_MANTISSA {
-        return Err(ProblemError::CoefficientTooLarge);
-    }
+    matrix_public_evaluation_terms(matrix)?;
 
     if let RhsSpec::SeededPeriodicDyadicV1 {
         period_bits,
@@ -667,19 +790,63 @@ fn validate_common(
     Ok(())
 }
 
-fn public_evaluation_terms(matrix: MatrixSpec, rhs: RhsSpec) -> PublicEvaluationTerms {
+fn public_evaluation_terms(
+    matrix: &MatrixSpec,
+    rhs: RhsSpec,
+) -> Result<PublicEvaluationTerms, ProblemError> {
     let padded_dimension = matrix.dimension().next_power_of_two();
-    let (_, _, off_diagonal, _) = matrix.components();
-    let (matrix_period_bits, _, _, _) = off_diagonal.parameters();
-    let matrix_period = 1_u64 << matrix_period_bits;
     let rhs_period = match rhs {
         RhsSpec::ManufacturedOnesV1 => 1,
         RhsSpec::SeededPeriodicDyadicV1 { period_bits, .. } => 1_u64 << period_bits,
     };
-    PublicEvaluationTerms {
-        matrix_period_terms: matrix_period.min(padded_dimension),
+    Ok(PublicEvaluationTerms {
+        matrix_period_terms: matrix_public_evaluation_terms(matrix)?,
         rhs_period_terms: rhs_period.min(padded_dimension),
+    })
+}
+
+fn matrix_public_evaluation_terms(matrix: &MatrixSpec) -> Result<u64, ProblemError> {
+    match matrix {
+        MatrixSpec::SeededSymmetricTridiagonalV1 { off_diagonal, .. } => {
+            let (period_bits, _, _, _) = off_diagonal.parameters();
+            Ok((1_u64 << period_bits).min(matrix.dimension().next_power_of_two()))
+        }
+        MatrixSpec::SeededSymmetricDiaLaplacianV1 {
+            dimension,
+            edge_diagonals,
+            ..
+        } => edge_diagonals.iter().try_fold(0_u64, |total, edge| {
+            let edge_count = dimension
+                .checked_sub(edge.positive_offset)
+                .ok_or(ProblemError::IntegerOverflow("DIA edge count"))?;
+            let active_patterns = (1_u64 << edge.period_bits).min(edge_count);
+            total
+                .checked_add(active_patterns)
+                .ok_or(ProblemError::IntegerOverflow("DIA public evaluation terms"))
+        }),
     }
+}
+
+fn validate_shifted_laplacian_bounds(
+    maximum_incident_weight_mantissa: u64,
+    diagonal_shift_mantissa: u64,
+) -> Result<(), ProblemError> {
+    if diagonal_shift_mantissa == 0 {
+        return Err(ProblemError::ZeroDominanceMargin);
+    }
+    let maximum_diagonal = maximum_incident_weight_mantissa
+        .checked_add(diagonal_shift_mantissa)
+        .ok_or(ProblemError::IntegerOverflow("maximum diagonal mantissa"))?;
+    maximum_incident_weight_mantissa
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(diagonal_shift_mantissa))
+        .ok_or(ProblemError::IntegerOverflow(
+            "maximum absolute row-sum mantissa",
+        ))?;
+    if maximum_diagonal > MAX_EXACT_BINARY64_MANTISSA {
+        return Err(ProblemError::CoefficientTooLarge);
+    }
+    Ok(())
 }
 
 fn validate_period_and_scale(period_bits: u8, fractional_bits: u8) -> Result<(), ProblemError> {
@@ -796,6 +963,29 @@ mod tests {
         }
     }
 
+    fn dia_matrix(dimension: u64) -> MatrixSpec {
+        MatrixSpec::SeededSymmetricDiaLaplacianV1 {
+            dimension,
+            boundary: BoundaryRule::TruncateV1,
+            fractional_bits: 12,
+            diagonal_shift_mantissa: 32,
+            edge_diagonals: vec![
+                SymmetricDiaEdge {
+                    positive_offset: 1,
+                    period_bits: 2,
+                    minimum_weight_mantissa: 2,
+                    maximum_weight_mantissa: 7,
+                },
+                SymmetricDiaEdge {
+                    positive_offset: 3,
+                    period_bits: 1,
+                    minimum_weight_mantissa: 1,
+                    maximum_weight_mantissa: 5,
+                },
+            ],
+        }
+    }
+
     fn template() -> ProblemTemplate {
         ProblemTemplate {
             schema: TemplateSchema::V1,
@@ -828,6 +1018,33 @@ mod tests {
     }
 
     #[test]
+    fn dia_schema_round_trips_and_binds_all_edge_descriptors() {
+        let mut template = template();
+        template.matrix = dia_matrix(19);
+        template.rhs = RhsSpec::SeededPeriodicDyadicV1 {
+            period_bits: 3,
+            fractional_bits: 9,
+            minimum_mantissa: -11,
+            maximum_mantissa: 13,
+        };
+        let json = template.to_pretty_json().unwrap();
+        assert!(json.contains("\"kind\": \"seeded-symmetric-dia-laplacian-v1\""));
+        assert!(json.contains("\"positive_offset\": 3"));
+        assert_eq!(
+            ProblemTemplate::from_json_slice(json.as_bytes()).unwrap(),
+            template
+        );
+
+        let mut changed = template.clone();
+        let MatrixSpec::SeededSymmetricDiaLaplacianV1 { edge_diagonals, .. } = &mut changed.matrix
+        else {
+            unreachable!()
+        };
+        edge_diagonals[1].maximum_weight_mantissa += 1;
+        assert_ne!(template.digest().unwrap(), changed.digest().unwrap());
+    }
+
+    #[test]
     fn public_evaluation_terms_are_known_before_compilation() {
         let mut template = template();
         template.matrix = matrix(6);
@@ -852,6 +1069,29 @@ mod tests {
             expected.matrix_period_terms
         );
         assert_eq!(metadata.rhs_period_terms as u64, expected.rhs_period_terms);
+    }
+
+    #[test]
+    fn dia_public_terms_sum_active_patterns_across_offsets() {
+        let mut template = template();
+        template.matrix = dia_matrix(6);
+        template.rhs = RhsSpec::SeededPeriodicDyadicV1 {
+            period_bits: 2,
+            fractional_bits: 8,
+            minimum_mantissa: -4,
+            maximum_mantissa: 7,
+        };
+        let expected = PublicEvaluationTerms {
+            // Offset one has four active patterns; offset three has two.
+            matrix_period_terms: 6,
+            rhs_period_terms: 4,
+        };
+        assert_eq!(template.public_evaluation_terms().unwrap(), expected);
+        let generated = template.finalize_literal().unwrap().compile().unwrap();
+        let metadata = generated.public_evaluation_plan().metadata();
+        assert_eq!(metadata.evaluator_version, 2);
+        assert_eq!(metadata.matrix_period_terms, 6);
+        assert_eq!(metadata.rhs_period_terms, 4);
     }
 
     #[test]
@@ -940,6 +1180,46 @@ mod tests {
             },
             diagonal: DiagonalConstruction::AbsoluteRowSumPlusMarginV1 { margin_mantissa: 1 },
         };
+        assert!(matches!(
+            value.validate(),
+            Err(ProblemError::CoefficientTooLarge)
+        ));
+
+        value.matrix = MatrixSpec::SeededSymmetricDiaLaplacianV1 {
+            dimension: 10,
+            boundary: BoundaryRule::TruncateV1,
+            fractional_bits: 8,
+            diagonal_shift_mantissa: 1,
+            edge_diagonals: Vec::new(),
+        };
+        assert!(matches!(
+            value.validate(),
+            Err(ProblemError::EmptyDiaEdgeDiagonals)
+        ));
+
+        value.matrix = dia_matrix(10);
+        let MatrixSpec::SeededSymmetricDiaLaplacianV1 { edge_diagonals, .. } = &mut value.matrix
+        else {
+            unreachable!()
+        };
+        edge_diagonals[1].positive_offset = 1;
+        assert!(matches!(
+            value.validate(),
+            Err(ProblemError::InvalidDiaOffset)
+        ));
+
+        value.matrix = dia_matrix(10);
+        let MatrixSpec::SeededSymmetricDiaLaplacianV1 {
+            diagonal_shift_mantissa,
+            edge_diagonals,
+            ..
+        } = &mut value.matrix
+        else {
+            unreachable!()
+        };
+        *diagonal_shift_mantissa = MAX_EXACT_BINARY64_MANTISSA;
+        edge_diagonals[0].maximum_weight_mantissa = 2;
+        edge_diagonals[1].maximum_weight_mantissa = 2;
         assert!(matches!(
             value.validate(),
             Err(ProblemError::CoefficientTooLarge)

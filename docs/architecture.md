@@ -139,12 +139,39 @@ dyadic coefficient recipe, RHS recipe, requested metric, and seed policy. A
 hosted template omits a literal seed and is finalized from a verified signed
 challenge. A local template carries its literal 32-byte seed directly.
 
-The current registered matrix family is a seeded symmetric tridiagonal matrix.
-It uses a flat periodic table of negative dyadic off-diagonal mantissas and a
-diagonal constructed as the absolute off-diagonal row sum plus a positive
-margin. Rows are sorted, duplicate-free, truncated at boundaries, strictly row
-diagonally dominant, and contain at most three entries. Registered RHS variants
-include a manufactured-ones relation and a seeded periodic dyadic RHS.
+Two matrix families are currently registered:
+
+- `seeded-symmetric-tridiagonal-v1` uses one flat periodic table of negative
+  dyadic off-diagonal mantissas. Its diagonal is the absolute off-diagonal row
+  sum plus a positive margin.
+- `seeded-symmetric-dia-laplacian-v1` registers a bounded, strictly increasing
+  list of positive offsets. Each offset has an independently seeded periodic
+  table of positive edge weights. For shift `mu > 0`, it represents
+
+  ```text
+  A = mu I + sum_d sum_(0 <= i < n-d) w_(d,i)
+      (e_i - e_(i+d)) (e_i - e_(i+d))^T.
+  ```
+
+  This is a shifted weighted graph Laplacian with DIA storage, not a
+  geometry-specific stencil. Truncating boundaries never wrap an edge. One
+  generated edge value supplies both mirrored off-diagonal entries and both
+  incident diagonal contributions, so symmetry cannot drift between rows.
+
+Both implementations expose sorted, duplicate-free, allocation-free row
+iterators over flat compiled storage. Their compilation reports structural and
+numerical facts such as symmetry, sign pattern, dominance, and row-width bounds.
+These facts are properties of a family, not requirements of the common compiled
+matrix or backend interfaces. A future nonsymmetric or indefinite family can
+implement the same row and succinct-evaluation contracts while reporting
+different facts.
+
+Matrix and RHS compilation receive distinct domain-separated seed streams.
+Changing the matrix family therefore does not change a seeded RHS generated
+from the same instance seed and RHS specification. Registered RHS variants
+include a manufactured-ones relation and a seeded periodic dyadic RHS; the
+latter exercises ordinary solve-and-validate workflows without embedding a
+known solution in the problem.
 
 Compilation validates parameters and derives structural, coefficient, scale,
 dominance, work, and exact-arithmetic bounds from trusted code. Proof-supplied
@@ -181,10 +208,18 @@ The current plan has these invariants:
   order; and
 - work depends on the registered period and `log2(n)`, not on `n` or `nnz(A)`.
 
-For the current family, matrix work is `O(P_A log n)` and RHS work is
-`O(P_b log n)`, where `P_A` and `P_b` are bounded periodic term counts recorded
-in metadata and capped by the validation manifest. The evaluator does not
-materialize dimension-sized public tables.
+For the tridiagonal family, matrix work is `O(P_A log n)`. For the DIA family it
+is
+
+```text
+O((sum_d min(P_d, n-d)) log n),
+```
+
+where `P_d` is the period of offset `d`. A constant-state carry/borrow automaton
+evaluates each shifted edge orbit without enumerating its anchors. RHS work is
+`O(P_b log n)`. These bounded periodic term counts are recorded in metadata and
+capped by the validation manifest; the evaluator does not materialize
+dimension-sized public tables.
 
 The generator owns this capability. Exact and fast backends must not match on a
 matrix-family enum and duplicate its formulas. Adding a family therefore requires

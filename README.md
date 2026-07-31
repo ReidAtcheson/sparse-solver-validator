@@ -12,6 +12,12 @@ factors reusable generators, public multilinear-extension evaluation, fixed
 relations, sumcheck, commitments, metric primitives, service protocol, and
 backend dispatch behind explicit boundaries.
 
+Registered generators include the original seeded symmetric tridiagonal family
+and a seeded symmetric DIA graph-Laplacian family with arbitrary positive
+offsets. Matrix and RHS streams are independent, and each family must provide a
+validator-side multilinear-extension evaluator whose work is logarithmic in the
+matrix dimension for a bounded number of generated patterns.
+
 This is development software and has not received an external security or
 numerical audit.
 

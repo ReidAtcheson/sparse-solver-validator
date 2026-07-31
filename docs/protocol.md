@@ -95,10 +95,29 @@ The problem schema fixes:
 - dimensions, boundaries, and zero padding; and
 - the requested squared-L2 residual output.
 
-The current family is `seeded-symmetric-tridiagonal-v1`. Off-diagonal mantissas
-come from a seed-derived periodic table, symmetry reuses the same edge value, and
-the diagonal is the absolute off-diagonal row sum plus a positive margin.
-Boundary rows truncate instead of wrapping.
+The registered matrix families are:
+
+- `seeded-symmetric-tridiagonal-v1`: off-diagonal mantissas come from one
+  seed-derived periodic table, symmetry reuses the same edge value, and the
+  diagonal is the absolute off-diagonal row sum plus a positive margin.
+- `seeded-symmetric-dia-laplacian-v1`: the schema carries a bounded,
+  strictly-increasing list of positive-offset descriptors. The family fixes one
+  dyadic scale; each descriptor fixes its offset, period, and positive weight
+  range. Its independently derived table defines edges `(i, i+d)` for
+  `0 <= i < n-d`. The matrix is the resulting weighted graph Laplacian plus a
+  strictly positive diagonal shift.
+
+Both families truncate boundary edges instead of wrapping. The DIA family
+derives each mirrored pair and both diagonal contributions from one edge value.
+It is therefore symmetric, strictly diagonally dominant, and positive definite
+by construction. Those are family-specific certified properties: the common
+compiled-family, sparse-row, and public-evaluator boundaries do not require
+symmetry or positive definiteness.
+
+Matrix tables and RHS tables use distinct domain-separated subseeds. DIA edge
+diagonals derive further per-descriptor streams. Consequently the seeded
+periodic RHS is fixed independently of the selected matrix family and does not
+encode a manufactured solution.
 
 Both succinct backends interpret the same Boolean tables with
 most-significant-bit-first coordinates and a zero tail to the next power of two:
@@ -117,8 +136,10 @@ Validation manifests cap matrix and RHS periodic terms before proving or
 verification; hosted deployments impose independent ceilings that a manifest
 cannot raise.
 
-For the current family, endpoint work depends on the registered periods and
-`log2(n)`, not on `n` or `nnz(A)`. A family without such a capability is not
+For the tridiagonal family, matrix endpoint work is `O(P_A log n)`. For DIA it
+is `O((sum_d min(P_d, n-d)) log n)`, using a constant-state binary
+carry/borrow evaluator for arbitrary positive offsets. RHS endpoint work is
+`O(P_b log n)`. A family without such a dimension-succinct capability is not
 eligible for the succinct profiles merely because it has a sparse row iterator.
 
 ## 4. Problem-instance challenge

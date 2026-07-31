@@ -8,6 +8,7 @@ use crate::{
 };
 
 const MATRIX_VALUES_LABEL: &str = "matrix/seeded-symmetric-tridiagonal-v1/off-diagonal-values";
+const DIA_MATRIX_VALUES_LABEL: &str = "matrix/seeded-symmetric-dia-laplacian-v1/edge-values";
 const RHS_VALUES_LABEL: &str = "rhs/seeded-periodic-dyadic-v1/values";
 const UNBIASED_STREAM_CONTEXT: &str = "sparse-solve/unbiased-u64-stream/v1";
 
@@ -27,6 +28,10 @@ pub struct GeneratorCertificate {
     pub dimension: usize,
     pub structural_nonzeros: usize,
     pub maximum_nonzeros_per_row: u8,
+    /// Family-defined periodic pattern terms used by one public matrix evaluation.
+    ///
+    /// This is the table period for the legacy tridiagonal family and the sum
+    /// of active per-offset patterns for the DIA family.
     pub matrix_period: usize,
     pub coefficient_fractional_bits: u8,
     pub minimum_off_diagonal_magnitude_mantissa: u64,
@@ -62,18 +67,74 @@ pub trait SparseMatrix {
 pub struct GeneratedProblem {
     problem_digest: ProblemDigest,
     instance_seed: InstanceSeed,
-    matrix: PeriodicSymmetricTridiagonal,
+    pub(crate) matrix: CompiledMatrixFamily,
     rhs: GeneratedRhs,
     certificate: GeneratorCertificate,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct PeriodicSymmetricTridiagonal {
-    dimension: usize,
-    fractional_bits: u8,
-    margin_mantissa: u64,
+pub(crate) enum CompiledMatrixFamily {
+    Tridiagonal(PeriodicSymmetricTridiagonal),
+    SymmetricDiaLaplacian(PeriodicSymmetricDiaLaplacian),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PeriodicSymmetricTridiagonal {
+    pub(crate) dimension: usize,
+    pub(crate) fractional_bits: u8,
+    pub(crate) margin_mantissa: u64,
     /// Negative mantissas for edges `(i, i + 1)`, indexed by `i mod period`.
-    off_diagonal_mantissas: Box<[i64]>,
+    pub(crate) off_diagonal_mantissas: Box<[i64]>,
+}
+
+/// One positive-offset generated diagonal backed by a range in the flat table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DiaEdgeDescriptor {
+    pub(crate) positive_offset: usize,
+    pub(crate) table_start: usize,
+    pub(crate) table_len: usize,
+}
+
+/// Compact shifted graph Laplacian with DIA-generated undirected edges.
+///
+/// Descriptors and all periodic values are kept in two flat allocations.
+/// Symmetry is derived from one canonical positive-offset edge table rather
+/// than independently generated rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PeriodicSymmetricDiaLaplacian {
+    pub(crate) dimension: usize,
+    pub(crate) fractional_bits: u8,
+    pub(crate) diagonal_shift_mantissa: u64,
+    pub(crate) edges: Box<[DiaEdgeDescriptor]>,
+    /// Negative matrix off-diagonal mantissas, flattened by edge descriptor.
+    pub(crate) off_diagonal_mantissas: Box<[i64]>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MatrixSeed(InstanceSeed);
+
+#[derive(Clone, Copy, Debug)]
+struct RhsSeed(InstanceSeed);
+
+#[derive(Clone, Copy, Debug)]
+struct MatrixFacts {
+    dimension: usize,
+    structural_nonzeros: usize,
+    maximum_nonzeros_per_row: u8,
+    matrix_period: usize,
+    coefficient_fractional_bits: u8,
+    minimum_off_diagonal_magnitude_mantissa: u64,
+    maximum_off_diagonal_magnitude_mantissa: u64,
+    maximum_diagonal_mantissa_bound: u64,
+    maximum_absolute_row_sum_mantissa_bound: u64,
+    maximum_absolute_column_sum_mantissa_bound: u64,
+    strict_diagonal_dominance_margin_mantissa: u64,
+    symmetric: bool,
+    positive_diagonal: bool,
+    nonpositive_off_diagonal: bool,
+    strictly_row_diagonally_dominant: bool,
+    nonsingular_m_matrix: bool,
+    boundary: BoundaryRule,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,15 +150,26 @@ enum GeneratedRhs {
     },
 }
 
-/// Allocation-free, sorted iterator containing at most three entries.
+/// Allocation-free, sorted row iterator for any registered compiled family.
 #[derive(Clone, Debug)]
-pub struct MatrixRow {
+pub struct MatrixRow<'a> {
+    inner: MatrixRowInner<'a>,
+}
+
+#[derive(Clone, Debug)]
+enum MatrixRowInner<'a> {
+    Tridiagonal(TridiagonalMatrixRow),
+    SymmetricDiaLaplacian(DiaMatrixRow<'a>),
+}
+
+#[derive(Clone, Debug)]
+struct TridiagonalMatrixRow {
     entries: [MatrixEntry; 3],
     front: u8,
     back: u8,
 }
 
-impl MatrixRow {
+impl TridiagonalMatrixRow {
     fn new(matrix: &PeriodicSymmetricTridiagonal, row: usize) -> Self {
         let empty = MatrixEntry {
             column: 0,
@@ -145,7 +217,88 @@ impl MatrixRow {
     }
 }
 
-impl Iterator for MatrixRow {
+#[derive(Clone, Debug)]
+struct DiaMatrixRow<'a> {
+    matrix: &'a PeriodicSymmetricDiaLaplacian,
+    row: usize,
+    incoming_count: usize,
+    diagonal_mantissa: i64,
+    front: usize,
+    back: usize,
+}
+
+impl<'a> DiaMatrixRow<'a> {
+    fn new(matrix: &'a PeriodicSymmetricDiaLaplacian, row: usize) -> Self {
+        let incoming_count = matrix
+            .edges
+            .partition_point(|edge| edge.positive_offset <= row);
+        let outgoing_count = matrix
+            .edges
+            .partition_point(|edge| edge.positive_offset < matrix.dimension - row);
+        let mut diagonal_mantissa = matrix.diagonal_shift_mantissa;
+        for edge in &matrix.edges[..incoming_count] {
+            diagonal_mantissa += matrix
+                .edge_mantissa(edge, row - edge.positive_offset)
+                .unsigned_abs();
+        }
+        for edge in &matrix.edges[..outgoing_count] {
+            diagonal_mantissa += matrix.edge_mantissa(edge, row).unsigned_abs();
+        }
+        Self {
+            matrix,
+            row,
+            incoming_count,
+            diagonal_mantissa: i64::try_from(diagonal_mantissa)
+                .expect("validated DIA diagonal fits i64"),
+            front: 0,
+            back: incoming_count + 1 + outgoing_count,
+        }
+    }
+
+    fn entry_at(&self, position: usize) -> MatrixEntry {
+        if position < self.incoming_count {
+            let edge = &self.matrix.edges[self.incoming_count - 1 - position];
+            let column = self.row - edge.positive_offset;
+            return MatrixEntry {
+                column,
+                value: Dyadic::new(
+                    self.matrix.edge_mantissa(edge, column),
+                    self.matrix.fractional_bits,
+                ),
+            };
+        }
+        if position == self.incoming_count {
+            return MatrixEntry {
+                column: self.row,
+                value: Dyadic::new(self.diagonal_mantissa, self.matrix.fractional_bits),
+            };
+        }
+        let edge = &self.matrix.edges[position - self.incoming_count - 1];
+        MatrixEntry {
+            column: self.row + edge.positive_offset,
+            value: Dyadic::new(
+                self.matrix.edge_mantissa(edge, self.row),
+                self.matrix.fractional_bits,
+            ),
+        }
+    }
+}
+
+impl MatrixRow<'_> {
+    fn tridiagonal(matrix: &PeriodicSymmetricTridiagonal, row: usize) -> Self {
+        Self {
+            inner: MatrixRowInner::Tridiagonal(TridiagonalMatrixRow::new(matrix, row)),
+        }
+    }
+
+    fn dia(matrix: &PeriodicSymmetricDiaLaplacian, row: usize) -> MatrixRow<'_> {
+        MatrixRow {
+            inner: MatrixRowInner::SymmetricDiaLaplacian(DiaMatrixRow::new(matrix, row)),
+        }
+    }
+}
+
+impl Iterator for TridiagonalMatrixRow {
     type Item = MatrixEntry;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -163,7 +316,7 @@ impl Iterator for MatrixRow {
     }
 }
 
-impl DoubleEndedIterator for MatrixRow {
+impl DoubleEndedIterator for TridiagonalMatrixRow {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.front == self.back {
             return None;
@@ -173,31 +326,103 @@ impl DoubleEndedIterator for MatrixRow {
     }
 }
 
-impl ExactSizeIterator for MatrixRow {
+impl ExactSizeIterator for TridiagonalMatrixRow {
     fn len(&self) -> usize {
         usize::from(self.back - self.front)
     }
 }
 
-impl FusedIterator for MatrixRow {}
+impl FusedIterator for TridiagonalMatrixRow {}
+
+impl Iterator for DiaMatrixRow<'_> {
+    type Item = MatrixEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.front == self.back {
+            return None;
+        }
+        let entry = self.entry_at(self.front);
+        self.front += 1;
+        Some(entry)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl DoubleEndedIterator for DiaMatrixRow<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.front == self.back {
+            return None;
+        }
+        self.back -= 1;
+        Some(self.entry_at(self.back))
+    }
+}
+
+impl ExactSizeIterator for DiaMatrixRow<'_> {
+    fn len(&self) -> usize {
+        self.back - self.front
+    }
+}
+
+impl FusedIterator for DiaMatrixRow<'_> {}
+
+impl Iterator for MatrixRow<'_> {
+    type Item = MatrixEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.inner {
+            MatrixRowInner::Tridiagonal(row) => row.next(),
+            MatrixRowInner::SymmetricDiaLaplacian(row) => row.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl DoubleEndedIterator for MatrixRow<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match &mut self.inner {
+            MatrixRowInner::Tridiagonal(row) => row.next_back(),
+            MatrixRowInner::SymmetricDiaLaplacian(row) => row.next_back(),
+        }
+    }
+}
+
+impl ExactSizeIterator for MatrixRow<'_> {
+    fn len(&self) -> usize {
+        match &self.inner {
+            MatrixRowInner::Tridiagonal(row) => row.len(),
+            MatrixRowInner::SymmetricDiaLaplacian(row) => row.len(),
+        }
+    }
+}
+
+impl FusedIterator for MatrixRow<'_> {}
 
 /// Sequential row view that retains the same allocation-free row representation.
 #[derive(Clone, Debug)]
 pub struct MatrixRows<'a> {
-    matrix: &'a PeriodicSymmetricTridiagonal,
+    matrix: &'a CompiledMatrixFamily,
     next: usize,
 }
 
-impl Iterator for MatrixRows<'_> {
-    type Item = MatrixRow;
+impl<'a> Iterator for MatrixRows<'a> {
+    type Item = MatrixRow<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next == self.matrix.dimension {
+        if self.next == self.matrix.dimension() {
             return None;
         }
         let row = self.next;
         self.next += 1;
-        Some(MatrixRow::new(self.matrix, row))
+        Some(self.matrix.row(row))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -208,7 +433,7 @@ impl Iterator for MatrixRows<'_> {
 
 impl ExactSizeIterator for MatrixRows<'_> {
     fn len(&self) -> usize {
-        self.matrix.dimension - self.next
+        self.matrix.dimension() - self.next
     }
 }
 
@@ -219,76 +444,37 @@ impl GeneratedProblem {
         problem.validate()?;
         let problem_digest = problem.digest()?;
         let instance_seed = problem.instance_seed();
-        let MatrixSpec::SeededSymmetricTridiagonalV1 {
-            dimension,
-            boundary,
-            off_diagonal,
-            diagonal,
-        } = problem.matrix;
-        let dimension = usize::try_from(dimension)
-            .map_err(|_| ProblemError::IntegerOverflow("compiled matrix dimension"))?;
-        let (period_bits, fractional_bits, minimum_magnitude, maximum_magnitude) =
-            off_diagonal.parameters();
-        let matrix_period = 1_usize << period_bits;
-        let matrix_seed = derive_subseed(instance_seed, MATRIX_VALUES_LABEL);
-        let off_diagonal_mantissas = generate_negative_i64_table(
-            matrix_seed,
-            matrix_period,
-            minimum_magnitude,
-            maximum_magnitude,
-        )?
-        .into_boxed_slice();
-        let margin_mantissa = diagonal.margin_mantissa();
-        let maximum_generated_off_diagonal = off_diagonal_mantissas
-            .iter()
-            .map(|value| value.unsigned_abs())
-            .max()
-            .expect("validated period is nonempty");
-        let minimum_generated_off_diagonal = off_diagonal_mantissas
-            .iter()
-            .map(|value| value.unsigned_abs())
-            .min()
-            .expect("validated period is nonempty");
-
-        let matrix = PeriodicSymmetricTridiagonal {
-            dimension,
-            fractional_bits,
-            margin_mantissa,
-            off_diagonal_mantissas,
-        };
-        let rhs = compile_rhs(problem.rhs, dimension, &matrix, instance_seed)?;
-        let structural_nonzeros = structural_nonzeros(dimension)?;
-        let maximum_diagonal_mantissa_bound = maximum_generated_off_diagonal
-            .checked_mul(2)
-            .and_then(|value| value.checked_add(margin_mantissa))
-            .ok_or(ProblemError::IntegerOverflow("compiled diagonal bound"))?;
-        let maximum_absolute_row_sum_mantissa_bound = maximum_generated_off_diagonal
-            .checked_mul(4)
-            .and_then(|value| value.checked_add(margin_mantissa))
-            .ok_or(ProblemError::IntegerOverflow("compiled row-sum bound"))?;
+        let (matrix, matrix_facts) = compile_matrix(&problem.matrix, instance_seed)?;
+        let rhs_seed = RhsSeed(derive_subseed(instance_seed, RHS_VALUES_LABEL));
+        let rhs = compile_rhs(problem.rhs, matrix_facts.dimension, &matrix, rhs_seed)?;
         let (rhs_period, rhs_fractional_bits, maximum_absolute_rhs_mantissa) =
             rhs.certificate_values();
         let certificate = GeneratorCertificate {
-            dimension,
-            structural_nonzeros,
-            maximum_nonzeros_per_row: if dimension == 2 { 2 } else { 3 },
-            matrix_period,
-            coefficient_fractional_bits: fractional_bits,
-            minimum_off_diagonal_magnitude_mantissa: minimum_generated_off_diagonal,
-            maximum_off_diagonal_magnitude_mantissa: maximum_generated_off_diagonal,
-            maximum_diagonal_mantissa_bound,
-            maximum_absolute_row_sum_mantissa_bound,
-            maximum_absolute_column_sum_mantissa_bound: maximum_absolute_row_sum_mantissa_bound,
-            strict_diagonal_dominance_margin_mantissa: margin_mantissa,
+            dimension: matrix_facts.dimension,
+            structural_nonzeros: matrix_facts.structural_nonzeros,
+            maximum_nonzeros_per_row: matrix_facts.maximum_nonzeros_per_row,
+            matrix_period: matrix_facts.matrix_period,
+            coefficient_fractional_bits: matrix_facts.coefficient_fractional_bits,
+            minimum_off_diagonal_magnitude_mantissa: matrix_facts
+                .minimum_off_diagonal_magnitude_mantissa,
+            maximum_off_diagonal_magnitude_mantissa: matrix_facts
+                .maximum_off_diagonal_magnitude_mantissa,
+            maximum_diagonal_mantissa_bound: matrix_facts.maximum_diagonal_mantissa_bound,
+            maximum_absolute_row_sum_mantissa_bound: matrix_facts
+                .maximum_absolute_row_sum_mantissa_bound,
+            maximum_absolute_column_sum_mantissa_bound: matrix_facts
+                .maximum_absolute_column_sum_mantissa_bound,
+            strict_diagonal_dominance_margin_mantissa: matrix_facts
+                .strict_diagonal_dominance_margin_mantissa,
             rhs_period,
             rhs_fractional_bits,
             maximum_absolute_rhs_mantissa,
-            symmetric: true,
-            positive_diagonal: true,
-            nonpositive_off_diagonal: true,
-            strictly_row_diagonally_dominant: true,
-            nonsingular_m_matrix: true,
-            boundary,
+            symmetric: matrix_facts.symmetric,
+            positive_diagonal: matrix_facts.positive_diagonal,
+            nonpositive_off_diagonal: matrix_facts.nonpositive_off_diagonal,
+            strictly_row_diagonally_dominant: matrix_facts.strictly_row_diagonally_dominant,
+            nonsingular_m_matrix: matrix_facts.nonsingular_m_matrix,
+            boundary: matrix_facts.boundary,
         };
 
         Ok(Self {
@@ -311,8 +497,8 @@ impl GeneratedProblem {
     }
 
     #[must_use]
-    pub const fn dimension(&self) -> usize {
-        self.matrix.dimension
+    pub fn dimension(&self) -> usize {
+        self.matrix.dimension()
     }
 
     #[must_use]
@@ -332,11 +518,11 @@ impl GeneratedProblem {
     }
 
     #[must_use]
-    pub fn row(&self, row: usize) -> Option<MatrixRow> {
+    pub fn row(&self, row: usize) -> Option<MatrixRow<'_>> {
         if row >= self.dimension() {
             return None;
         }
-        Some(MatrixRow::new(&self.matrix, row))
+        Some(self.matrix.row(row))
     }
 
     #[must_use]
@@ -357,10 +543,13 @@ impl GeneratedProblem {
         self.rhs(row).map(Dyadic::to_f64)
     }
 
-    /// Flat periodic matrix table, useful for diagnostics and succinct evaluators.
+    /// Flat periodic matrix values in compiled-family order.
+    ///
+    /// The legacy tridiagonal has one table. DIA families concatenate one
+    /// table per increasing positive-offset descriptor.
     #[must_use]
     pub fn off_diagonal_periodic_mantissas(&self) -> &[i64] {
-        &self.matrix.off_diagonal_mantissas
+        self.matrix.off_diagonal_mantissas()
     }
 
     /// Returns the seeded RHS table. Manufactured RHS values have no table.
@@ -374,7 +563,7 @@ impl GeneratedProblem {
 }
 
 impl SparseMatrix for GeneratedProblem {
-    type Row<'a> = MatrixRow;
+    type Row<'a> = MatrixRow<'a>;
 
     fn dimension(&self) -> usize {
         self.dimension()
@@ -390,8 +579,264 @@ impl SparseMatrix for GeneratedProblem {
 }
 
 impl PeriodicSymmetricTridiagonal {
-    fn edge_mantissa(&self, lower_endpoint: usize) -> i64 {
+    pub(crate) fn edge_mantissa(&self, lower_endpoint: usize) -> i64 {
         self.off_diagonal_mantissas[lower_endpoint & (self.off_diagonal_mantissas.len() - 1)]
+    }
+}
+
+impl PeriodicSymmetricDiaLaplacian {
+    pub(crate) fn edge_table<'a>(&'a self, edge: &DiaEdgeDescriptor) -> &'a [i64] {
+        &self.off_diagonal_mantissas[edge.table_start..edge.table_start + edge.table_len]
+    }
+
+    pub(crate) fn edge_mantissa(&self, edge: &DiaEdgeDescriptor, anchor: usize) -> i64 {
+        self.edge_table(edge)[anchor & (edge.table_len - 1)]
+    }
+}
+
+impl CompiledMatrixFamily {
+    pub(crate) fn dimension(&self) -> usize {
+        match self {
+            Self::Tridiagonal(matrix) => matrix.dimension,
+            Self::SymmetricDiaLaplacian(matrix) => matrix.dimension,
+        }
+    }
+
+    fn row(&self, row: usize) -> MatrixRow<'_> {
+        match self {
+            Self::Tridiagonal(matrix) => MatrixRow::tridiagonal(matrix, row),
+            Self::SymmetricDiaLaplacian(matrix) => MatrixRow::dia(matrix, row),
+        }
+    }
+
+    pub(crate) const fn evaluator_version(&self) -> u16 {
+        match self {
+            Self::Tridiagonal(_) => 1,
+            Self::SymmetricDiaLaplacian(_) => 2,
+        }
+    }
+
+    pub(crate) fn public_matrix_terms(
+        &self,
+        certificate: &GeneratorCertificate,
+        padded_dimension: usize,
+    ) -> usize {
+        match self {
+            Self::Tridiagonal(_) => certificate.matrix_period.min(padded_dimension),
+            Self::SymmetricDiaLaplacian(_) => certificate.matrix_period,
+        }
+    }
+
+    fn manufactured_ones_value(&self) -> Option<Dyadic> {
+        match self {
+            Self::Tridiagonal(matrix) => Some(Dyadic::new(
+                i64::try_from(matrix.margin_mantissa).expect("validated dominance margin fits i64"),
+                matrix.fractional_bits,
+            )),
+            Self::SymmetricDiaLaplacian(matrix) => Some(Dyadic::new(
+                i64::try_from(matrix.diagonal_shift_mantissa)
+                    .expect("validated diagonal shift fits i64"),
+                matrix.fractional_bits,
+            )),
+        }
+    }
+
+    fn off_diagonal_mantissas(&self) -> &[i64] {
+        match self {
+            Self::Tridiagonal(matrix) => &matrix.off_diagonal_mantissas,
+            Self::SymmetricDiaLaplacian(matrix) => &matrix.off_diagonal_mantissas,
+        }
+    }
+}
+
+fn compile_matrix(
+    spec: &MatrixSpec,
+    instance_seed: InstanceSeed,
+) -> Result<(CompiledMatrixFamily, MatrixFacts), ProblemError> {
+    match spec {
+        MatrixSpec::SeededSymmetricTridiagonalV1 {
+            dimension,
+            boundary,
+            off_diagonal,
+            diagonal,
+        } => {
+            let dimension = usize::try_from(*dimension)
+                .map_err(|_| ProblemError::IntegerOverflow("compiled matrix dimension"))?;
+            let (period_bits, fractional_bits, minimum_magnitude, maximum_magnitude) =
+                off_diagonal.parameters();
+            let matrix_period = 1_usize << period_bits;
+            let matrix_seed = MatrixSeed(derive_subseed(instance_seed, MATRIX_VALUES_LABEL));
+            let off_diagonal_mantissas = generate_negative_i64_table(
+                matrix_seed.0,
+                matrix_period,
+                minimum_magnitude,
+                maximum_magnitude,
+            )?
+            .into_boxed_slice();
+            let maximum_generated_off_diagonal = off_diagonal_mantissas
+                .iter()
+                .map(|value| value.unsigned_abs())
+                .max()
+                .expect("validated period is nonempty");
+            let minimum_generated_off_diagonal = off_diagonal_mantissas
+                .iter()
+                .map(|value| value.unsigned_abs())
+                .min()
+                .expect("validated period is nonempty");
+            let margin_mantissa = diagonal.margin_mantissa();
+            let maximum_diagonal_mantissa_bound = maximum_generated_off_diagonal
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(margin_mantissa))
+                .ok_or(ProblemError::IntegerOverflow("compiled diagonal bound"))?;
+            let maximum_absolute_row_sum_mantissa_bound = maximum_generated_off_diagonal
+                .checked_mul(4)
+                .and_then(|value| value.checked_add(margin_mantissa))
+                .ok_or(ProblemError::IntegerOverflow("compiled row-sum bound"))?;
+            let matrix = PeriodicSymmetricTridiagonal {
+                dimension,
+                fractional_bits,
+                margin_mantissa,
+                off_diagonal_mantissas,
+            };
+            let facts = MatrixFacts {
+                dimension,
+                structural_nonzeros: tridiagonal_structural_nonzeros(dimension)?,
+                maximum_nonzeros_per_row: if dimension == 2 { 2 } else { 3 },
+                matrix_period,
+                coefficient_fractional_bits: fractional_bits,
+                minimum_off_diagonal_magnitude_mantissa: minimum_generated_off_diagonal,
+                maximum_off_diagonal_magnitude_mantissa: maximum_generated_off_diagonal,
+                maximum_diagonal_mantissa_bound,
+                maximum_absolute_row_sum_mantissa_bound,
+                maximum_absolute_column_sum_mantissa_bound: maximum_absolute_row_sum_mantissa_bound,
+                strict_diagonal_dominance_margin_mantissa: margin_mantissa,
+                symmetric: true,
+                positive_diagonal: true,
+                nonpositive_off_diagonal: true,
+                strictly_row_diagonally_dominant: true,
+                nonsingular_m_matrix: true,
+                boundary: *boundary,
+            };
+            Ok((CompiledMatrixFamily::Tridiagonal(matrix), facts))
+        }
+        MatrixSpec::SeededSymmetricDiaLaplacianV1 {
+            dimension,
+            boundary,
+            fractional_bits,
+            diagonal_shift_mantissa,
+            edge_diagonals,
+        } => {
+            let dimension = usize::try_from(*dimension)
+                .map_err(|_| ProblemError::IntegerOverflow("compiled DIA dimension"))?;
+            let total_table_elements =
+                edge_diagonals.iter().try_fold(0_usize, |total, edge| {
+                    total.checked_add(1_usize << edge.period_bits).ok_or(
+                        ProblemError::IntegerOverflow("compiled DIA periodic table elements"),
+                    )
+                })?;
+            let mut descriptors = Vec::new();
+            descriptors
+                .try_reserve_exact(edge_diagonals.len())
+                .map_err(|_| ProblemError::AllocationFailed)?;
+            let mut off_diagonal_mantissas = Vec::new();
+            off_diagonal_mantissas
+                .try_reserve_exact(total_table_elements)
+                .map_err(|_| ProblemError::AllocationFailed)?;
+
+            let family_seed = MatrixSeed(derive_subseed(instance_seed, DIA_MATRIX_VALUES_LABEL));
+            let mut structural_nonzeros = dimension;
+            let mut matrix_period = 0_usize;
+            let mut minimum_generated_weight = u64::MAX;
+            let mut maximum_generated_weight = 0_u64;
+            let mut maximum_incident_weight_bound = 0_u64;
+            for (index, edge) in edge_diagonals.iter().enumerate() {
+                let positive_offset = usize::try_from(edge.positive_offset)
+                    .map_err(|_| ProblemError::IntegerOverflow("compiled DIA positive offset"))?;
+                let table_len = 1_usize << edge.period_bits;
+                let table_start = off_diagonal_mantissas.len();
+                let edge_label = format!("edge-diagonal/{index}/offset/{}", edge.positive_offset);
+                let edge_seed = MatrixSeed(derive_subseed(family_seed.0, &edge_label));
+                append_negative_i64_table(
+                    &mut off_diagonal_mantissas,
+                    edge_seed.0,
+                    table_len,
+                    edge.minimum_weight_mantissa,
+                    edge.maximum_weight_mantissa,
+                )?;
+                let table = &off_diagonal_mantissas[table_start..table_start + table_len];
+                let generated_minimum = table
+                    .iter()
+                    .map(|value| value.unsigned_abs())
+                    .min()
+                    .expect("validated period is nonempty");
+                let generated_maximum = table
+                    .iter()
+                    .map(|value| value.unsigned_abs())
+                    .max()
+                    .expect("validated period is nonempty");
+                minimum_generated_weight = minimum_generated_weight.min(generated_minimum);
+                maximum_generated_weight = maximum_generated_weight.max(generated_maximum);
+                maximum_incident_weight_bound = generated_maximum
+                    .checked_mul(2)
+                    .and_then(|value| maximum_incident_weight_bound.checked_add(value))
+                    .ok_or(ProblemError::IntegerOverflow(
+                        "compiled DIA incident-weight bound",
+                    ))?;
+                let edge_count = dimension
+                    .checked_sub(positive_offset)
+                    .ok_or(ProblemError::IntegerOverflow("compiled DIA edge count"))?;
+                structural_nonzeros = edge_count
+                    .checked_mul(2)
+                    .and_then(|count| structural_nonzeros.checked_add(count))
+                    .ok_or(ProblemError::IntegerOverflow(
+                        "compiled DIA structural nonzeros",
+                    ))?;
+                matrix_period = matrix_period.checked_add(table_len.min(edge_count)).ok_or(
+                    ProblemError::IntegerOverflow("compiled DIA public evaluation terms"),
+                )?;
+                descriptors.push(DiaEdgeDescriptor {
+                    positive_offset,
+                    table_start,
+                    table_len,
+                });
+            }
+            let maximum_diagonal_mantissa_bound = maximum_incident_weight_bound
+                .checked_add(*diagonal_shift_mantissa)
+                .ok_or(ProblemError::IntegerOverflow("compiled DIA diagonal bound"))?;
+            let maximum_absolute_row_sum_mantissa_bound = maximum_incident_weight_bound
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(*diagonal_shift_mantissa))
+                .ok_or(ProblemError::IntegerOverflow("compiled DIA row-sum bound"))?;
+            let maximum_nonzeros_per_row =
+                u8::try_from(1 + 2 * descriptors.len()).expect("validated DIA edge count fits u8");
+            let matrix = PeriodicSymmetricDiaLaplacian {
+                dimension,
+                fractional_bits: *fractional_bits,
+                diagonal_shift_mantissa: *diagonal_shift_mantissa,
+                edges: descriptors.into_boxed_slice(),
+                off_diagonal_mantissas: off_diagonal_mantissas.into_boxed_slice(),
+            };
+            let facts = MatrixFacts {
+                dimension,
+                structural_nonzeros,
+                maximum_nonzeros_per_row,
+                matrix_period,
+                coefficient_fractional_bits: *fractional_bits,
+                minimum_off_diagonal_magnitude_mantissa: minimum_generated_weight,
+                maximum_off_diagonal_magnitude_mantissa: maximum_generated_weight,
+                maximum_diagonal_mantissa_bound,
+                maximum_absolute_row_sum_mantissa_bound,
+                maximum_absolute_column_sum_mantissa_bound: maximum_absolute_row_sum_mantissa_bound,
+                strict_diagonal_dominance_margin_mantissa: *diagonal_shift_mantissa,
+                symmetric: true,
+                positive_diagonal: true,
+                nonpositive_off_diagonal: true,
+                strictly_row_diagonally_dominant: true,
+                nonsingular_m_matrix: true,
+                boundary: *boundary,
+            };
+            Ok((CompiledMatrixFamily::SymmetricDiaLaplacian(matrix), facts))
+        }
     }
 }
 
@@ -433,17 +878,16 @@ impl GeneratedRhs {
 fn compile_rhs(
     spec: RhsSpec,
     dimension: usize,
-    matrix: &PeriodicSymmetricTridiagonal,
-    instance_seed: InstanceSeed,
+    matrix: &CompiledMatrixFamily,
+    seed: RhsSeed,
 ) -> Result<GeneratedRhs, ProblemError> {
     match spec {
-        RhsSpec::ManufacturedOnesV1 => Ok(GeneratedRhs::ManufacturedOnes {
-            dimension,
-            value: Dyadic::new(
-                i64::try_from(matrix.margin_mantissa).expect("validated dominance margin fits i64"),
-                matrix.fractional_bits,
-            ),
-        }),
+        RhsSpec::ManufacturedOnesV1 => {
+            let value = matrix
+                .manufactured_ones_value()
+                .ok_or(ProblemError::UnsupportedManufacturedRhs)?;
+            Ok(GeneratedRhs::ManufacturedOnes { dimension, value })
+        }
         RhsSpec::SeededPeriodicDyadicV1 {
             period_bits,
             fractional_bits,
@@ -451,11 +895,10 @@ fn compile_rhs(
             maximum_mantissa,
         } => {
             let period = 1_usize << period_bits;
-            let seed = derive_subseed(instance_seed, RHS_VALUES_LABEL);
             let width =
                 u64::try_from(i128::from(maximum_mantissa) - i128::from(minimum_mantissa) + 1)
                     .map_err(|_| ProblemError::RhsRangeTooWide)?;
-            let mut stream = UniformStream::new(seed);
+            let mut stream = UniformStream::new(seed.0);
             let mut mantissas = Vec::new();
             mantissas
                 .try_reserve_exact(period)
@@ -496,7 +939,26 @@ fn generate_negative_i64_table(
     Ok(table)
 }
 
-fn structural_nonzeros(dimension: usize) -> Result<usize, ProblemError> {
+fn append_negative_i64_table(
+    table: &mut Vec<i64>,
+    seed: InstanceSeed,
+    period: usize,
+    minimum: u64,
+    maximum: u64,
+) -> Result<(), ProblemError> {
+    let width = maximum
+        .checked_sub(minimum)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(ProblemError::IntegerOverflow("generator sample interval"))?;
+    let mut stream = UniformStream::new(seed);
+    for _ in 0..period {
+        let magnitude = minimum + stream.sample_below(width);
+        table.push(-i64::try_from(magnitude).expect("validated edge weight fits i64"));
+    }
+    Ok(())
+}
+
+fn tridiagonal_structural_nonzeros(dimension: usize) -> Result<usize, ProblemError> {
     dimension
         .checked_mul(3)
         .and_then(|value| value.checked_sub(2))
@@ -540,7 +1002,7 @@ mod tests {
     use super::*;
     use crate::{
         DiagonalConstruction, MatrixSpec, OffDiagonalValues, ProblemSchema, ProblemTemplate,
-        RequestedOutput, SeedDerivation, TemplateRandomness, TemplateSchema,
+        RequestedOutput, SeedDerivation, SymmetricDiaEdge, TemplateRandomness, TemplateSchema,
     };
 
     fn matrix(dimension: u64) -> MatrixSpec {
@@ -571,12 +1033,41 @@ mod tests {
         }
     }
 
+    fn dia_matrix(dimension: u64) -> MatrixSpec {
+        MatrixSpec::SeededSymmetricDiaLaplacianV1 {
+            dimension,
+            boundary: BoundaryRule::TruncateV1,
+            fractional_bits: 8,
+            diagonal_shift_mantissa: 16,
+            edge_diagonals: vec![
+                SymmetricDiaEdge {
+                    positive_offset: 1,
+                    period_bits: 2,
+                    minimum_weight_mantissa: 1,
+                    maximum_weight_mantissa: 7,
+                },
+                SymmetricDiaEdge {
+                    positive_offset: 4,
+                    period_bits: 1,
+                    minimum_weight_mantissa: 2,
+                    maximum_weight_mantissa: 9,
+                },
+            ],
+        }
+    }
+
     fn generated(seed_byte: u8, rhs: RhsSpec) -> GeneratedProblem {
         template(seed_byte, rhs)
             .finalize_literal()
             .unwrap()
             .compile()
             .unwrap()
+    }
+
+    fn dia_generated(seed_byte: u8, rhs: RhsSpec) -> GeneratedProblem {
+        let mut template = template(seed_byte, rhs);
+        template.matrix = dia_matrix(19);
+        template.finalize_literal().unwrap().compile().unwrap()
     }
 
     #[test]
@@ -622,6 +1113,51 @@ mod tests {
                 assert_eq!(entry.value, transpose.value);
             }
         }
+    }
+
+    #[test]
+    fn dia_rows_derive_symmetry_dominance_and_exact_structure_from_edges() {
+        let problem = dia_generated(17, RhsSpec::ManufacturedOnesV1);
+        let dimension = problem.dimension();
+        let expected_nonzeros = dimension + 2 * ((dimension - 1) + (dimension - 4));
+        assert_eq!(problem.structural_nonzeros(), expected_nonzeros);
+        assert_eq!(
+            problem.rows().map(|row| row.len()).sum::<usize>(),
+            expected_nonzeros
+        );
+        for row_index in 0..dimension {
+            let row = problem.row(row_index).unwrap().collect::<Vec<_>>();
+            assert!(row.windows(2).all(|pair| pair[0].column < pair[1].column));
+            let diagonal = row
+                .iter()
+                .find(|entry| entry.column == row_index)
+                .unwrap()
+                .value
+                .mantissa();
+            let off_diagonal_sum = row
+                .iter()
+                .filter(|entry| entry.column != row_index)
+                .map(|entry| {
+                    assert!(entry.value.mantissa() < 0);
+                    let transpose = problem
+                        .row(entry.column)
+                        .unwrap()
+                        .find(|candidate| candidate.column == row_index)
+                        .unwrap();
+                    assert_eq!(entry.value, transpose.value);
+                    entry.value.mantissa().unsigned_abs()
+                })
+                .sum::<u64>();
+            assert_eq!(u64::try_from(diagonal).unwrap() - off_diagonal_sum, 16);
+
+            let reverse = problem.row(row_index).unwrap().rev().collect::<Vec<_>>();
+            assert_eq!(reverse, row.iter().rev().copied().collect::<Vec<_>>());
+        }
+        let certificate = problem.certificate();
+        assert!(certificate.symmetric);
+        assert!(certificate.strictly_row_diagonally_dominant);
+        assert!(certificate.nonsingular_m_matrix);
+        assert_eq!(certificate.maximum_nonzeros_per_row, 5);
     }
 
     #[test]
@@ -677,6 +1213,26 @@ mod tests {
         assert_ne!(
             table,
             &problem.off_diagonal_periodic_mantissas()[..table.len()]
+        );
+    }
+
+    #[test]
+    fn seeded_rhs_stream_is_independent_of_the_compiled_matrix_family() {
+        let rhs = RhsSpec::SeededPeriodicDyadicV1 {
+            period_bits: 3,
+            fractional_bits: 6,
+            minimum_mantissa: -17,
+            maximum_mantissa: 19,
+        };
+        let tridiagonal = generated(23, rhs);
+        let dia = dia_generated(23, rhs);
+        assert_eq!(
+            tridiagonal.rhs_periodic_mantissas(),
+            dia.rhs_periodic_mantissas()
+        );
+        assert_ne!(
+            tridiagonal.off_diagonal_periodic_mantissas(),
+            dia.off_diagonal_periodic_mantissas()
         );
     }
 
