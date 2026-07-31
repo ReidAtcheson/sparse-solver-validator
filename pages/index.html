@@ -5,9 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="description" content="Generate and validate sparse linear-system proofs.">
     <title>Sparse Solver Validator</title>
-    <link rel="stylesheet" href="styles.css">
-    <script src="blake3.js" defer></script>
-    <script src="explorer.js" defer></script>
+    <!-- Bump the shared version whenever explorer assets or their DOM contract change. -->
+    <link rel="stylesheet" href="styles.css?v=2">
+    <script src="blake3.js?v=2" defer></script>
+    <script src="explorer.js?v=2" defer></script>
   </head>
   <body>
     <header>
@@ -69,8 +70,8 @@ curl --fail --silent --show-error \
             <p>Choose matrix and RHS generators, actualize the matrix from a reproducible seed, then connect your solver to the validation workflow.</p>
           </div>
           <div class="legend" aria-label="Spy plot legend">
-            <span><i class="swatch positive"></i> positive</span>
-            <span><i class="swatch negative"></i> negative</span>
+            <span><i class="swatch positive diagonal"></i> positive</span>
+            <span><i class="swatch negative off-diagonal"></i> <span id="off-diagonal-legend">negative</span></span>
           </div>
         </div>
 

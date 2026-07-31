@@ -17,11 +17,12 @@ const {
   TRIDIAGONAL_FAMILY,
   actualizeMatrix,
   hostedWorkflow,
+  initialize,
   localWorkflow,
   matrixSpec,
+  nextSeedHex,
   parseOffsets,
   problemTemplate,
-  randomSeedHex,
   structuralNonzeros,
   validationError,
 } = require("../../pages/explorer.js");
@@ -50,11 +51,115 @@ function parameters(overrides = {}) {
   };
 }
 
+function fakeElement(value = "") {
+  const listeners = new Map();
+  return {
+    checked: false,
+    classList: { toggle() {} },
+    hidden: false,
+    listeners,
+    max: "",
+    textContent: "",
+    value,
+    addEventListener(kind, listener) { listeners.set(kind, listener); },
+    setAttribute() {},
+  };
+}
+
+function explorerDocument(includeSeedControls) {
+  const values = {
+    family: TRIDIAGONAL_FAMILY,
+    dimension: "16",
+    offsets: "1, 4",
+    "period-bits": "3",
+    "fractional-bits": "8",
+    margin: "32",
+    minimum: "8",
+    maximum: "24",
+    "maximum-half-bandwidth": "5",
+    "maximum-row-nonzeros": "7",
+    "coefficient-minimum": "-256",
+    "coefficient-maximum": "256",
+    rhs: SEEDED_RHS_FAMILY,
+    "rhs-period-bits": "4",
+    "rhs-fractional-bits": "8",
+    "rhs-minimum": "-16",
+    "rhs-maximum": "19",
+    "template-kind": "literal",
+    "service-url": "https://validator.example",
+    issuer: "issuer",
+    "key-id": "key",
+    "public-key": "/tmp/key.pub",
+  };
+  const ids = [
+    "generator-form", "spy-plot", "form-error", "local-code", "hosted-code",
+    "template-code", "template-kind", "service-url", "issuer", "key-id", "public-key",
+    "private-service", "offsets-control", "margin-control", "structured-range-controls",
+    "nonsymmetric-shape-controls", "nonsymmetric-range-controls", "nonsymmetric-note",
+    "period-label", "period-hint", "margin-label", "minimum-label", "maximum-label",
+    "plot-note", "family", "dimension", "offsets", "period-bits", "fractional-bits",
+    "margin", "minimum", "maximum", "maximum-half-bandwidth", "maximum-row-nonzeros",
+    "coefficient-minimum", "coefficient-maximum", "rhs", "rhs-period-bits",
+    "rhs-fractional-bits", "rhs-minimum", "rhs-maximum", "plot-title", "plot-summary",
+    "download-template",
+  ];
+  if (includeSeedControls) ids.push("instance-seed", "new-seed");
+  const elements = Object.fromEntries(ids.map((id) => [id, fakeElement(values[id] ?? "")]));
+  if (includeSeedControls) elements["instance-seed"].value = DEFAULT_INSTANCE_SEED;
+  elements["private-service"].checked = true;
+
+  const context = {
+    fillCount: 0,
+    clearRect() {},
+    fillRect() { this.fillCount += 1; },
+    strokeRect() {},
+  };
+  elements["spy-plot"].width = 640;
+  elements["spy-plot"].getContext = () => context;
+  return {
+    context,
+    elements,
+    document: {
+      head: { append() {} },
+      createElement: () => fakeElement(),
+      querySelector(selector) {
+        return selector.startsWith("#") ? elements[selector.slice(1)] ?? null : null;
+      },
+      querySelectorAll: () => [],
+    },
+  };
+}
+
 test("the static page loads exact actualization support before the explorer", () => {
   const html = readFileSync(join(__dirname, "../../pages/index.html"), "utf8");
-  assert.ok(html.indexOf('src="blake3.js"') < html.indexOf('src="explorer.js"'));
+  assert.ok(html.indexOf('src="blake3.js?v=2"') < html.indexOf('src="explorer.js?v=2"'));
+  assert.match(html, /href="styles\.css\?v=2"/);
   assert.match(html, /id="instance-seed"/);
   assert.match(html, /id="new-seed"/);
+  assert.match(html, /class="swatch negative off-diagonal"/);
+  assert.match(html, /id="off-diagonal-legend"/);
+});
+
+test("browser initialization renders with cached legacy markup and advances current seeds", () => {
+  const legacy = explorerDocument(false);
+  const current = explorerDocument(true);
+  try {
+    global.document = legacy.document;
+    initialize();
+    assert.ok(legacy.context.fillCount > 2);
+    assert.equal(legacy.elements["form-error"].hidden, true);
+
+    global.document = current.document;
+    initialize();
+    const before = current.elements["instance-seed"].value;
+    current.elements["new-seed"].listeners.get("click")();
+    assert.equal(current.elements["instance-seed"].value, nextSeedHex(before));
+    assert.match(current.elements["template-code"].textContent, new RegExp(nextSeedHex(before)));
+    assert.ok(current.context.fillCount > 2);
+    assert.equal(current.elements["form-error"].hidden, true);
+  } finally {
+    delete global.document;
+  }
 });
 
 test("the legacy tridiagonal template remains unchanged", () => {
@@ -133,18 +238,14 @@ test("templates use a separately parameterized seeded RHS", () => {
   assert.notEqual(template.rhs.kind, "manufactured-ones-v1");
 });
 
-test("seed validation and generation preserve the protocol's canonical spelling", () => {
+test("seed validation and cheap advancement preserve the protocol's canonical spelling", () => {
   assert.match(validationError(parameters({ seed: "01" })), /64 lowercase hexadecimal/);
   assert.match(validationError(parameters({ seed: "AB".repeat(32) })), /lowercase hexadecimal/);
   assert.equal(validationError(parameters({ seed: "ab".repeat(32) })), "");
 
-  const generated = randomSeedHex({
-    getRandomValues(bytes) {
-      for (let index = 0; index < bytes.length; index += 1) bytes[index] = index;
-      return bytes;
-    },
-  });
-  assert.equal(generated, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+  assert.equal(nextSeedHex(DEFAULT_INSTANCE_SEED), `${"01".repeat(31)}02`);
+  assert.equal(nextSeedHex("ff".repeat(32)), "00".repeat(32));
+  assert.throws(() => nextSeedHex("not-a-seed"), /exactly 64 lowercase hexadecimal/);
 });
 
 test("the bounded browser BLAKE3 implementation matches the standard hash vectors", () => {
