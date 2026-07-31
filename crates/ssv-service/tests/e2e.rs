@@ -107,6 +107,27 @@ fn nonsymmetric_seeded_rhs_local_template() -> ProblemTemplate {
     template
 }
 
+fn projected_nonsymmetric_seeded_rhs_local_template() -> ProblemTemplate {
+    let mut template = local_template();
+    template.matrix = MatrixSpec::SeededNonsymmetricRowSparseV2 {
+        dimension: 8,
+        boundary: BoundaryRule::TruncateV1,
+        row_pattern_bits: 2,
+        maximum_half_bandwidth: 3,
+        maximum_nonzeros_per_row: 5,
+        fractional_bits: 12,
+        minimum_mantissa: -4096,
+        maximum_mantissa: 4096,
+    };
+    template.rhs = RhsSpec::SeededPeriodicDyadicV1 {
+        period_bits: 3,
+        fractional_bits: 12,
+        minimum_mantissa: -2048,
+        maximum_mantissa: 2047,
+    };
+    template
+}
+
 fn conjugate_gradient_solution(problem: &GeneratedProblem) -> Solution {
     fn dot(left: &[f64], right: &[f64]) -> f64 {
         left.iter()
@@ -856,11 +877,14 @@ fn dia_family_with_seeded_rhs_round_trips_every_backend_without_a_manufactured_s
     }
 }
 
-#[test]
-fn nonsymmetric_generated_pattern_family_round_trips_every_backend() {
-    let problem = nonsymmetric_seeded_rhs_local_template()
-        .finalize_literal()
-        .unwrap();
+fn assert_nonsymmetric_family_round_trips_every_backend(
+    template: ProblemTemplate,
+    expected_dimension: u64,
+    expected_half_bandwidth: usize,
+    expected_row_width: u8,
+    expected_public_terms: u64,
+) {
+    let problem = template.finalize_literal().unwrap();
     assert!(matches!(
         problem.rhs,
         RhsSpec::SeededPeriodicDyadicV1 { .. }
@@ -868,8 +892,14 @@ fn nonsymmetric_generated_pattern_family_round_trips_every_backend() {
     let generated = problem.compile().unwrap();
     assert!(!generated.certificate().symmetric);
     assert!(!generated.certificate().strictly_row_diagonally_dominant);
-    assert_eq!(generated.certificate().maximum_half_bandwidth, 5);
-    assert_eq!(generated.certificate().maximum_nonzeros_per_row, 7);
+    assert_eq!(
+        generated.certificate().maximum_half_bandwidth,
+        expected_half_bandwidth
+    );
+    assert_eq!(
+        generated.certificate().maximum_nonzeros_per_row,
+        expected_row_width
+    );
     let solution = pivoted_dense_solution(&generated);
 
     for protocol in [
@@ -881,7 +911,7 @@ fn nonsymmetric_generated_pattern_family_round_trips_every_backend() {
             problem.clone(),
             ValidationManifest {
                 protocol,
-                max_solution_elements: 12,
+                max_solution_elements: expected_dimension,
                 max_public_matrix_terms: 64,
                 max_public_rhs_terms: 64,
                 ..ValidationManifest::default()
@@ -894,7 +924,7 @@ fn nonsymmetric_generated_pattern_family_round_trips_every_backend() {
             BackendVerifierReport::Direct(report) => {
                 assert_eq!(protocol, ProofProtocol::DirectReferenceV1);
                 assert!(report.residual.l2 < 1.0e-10);
-                assert_eq!(report.rows_visited, 12);
+                assert_eq!(report.rows_visited, expected_dimension);
                 assert_eq!(
                     report.nonzeros_visited,
                     u64::try_from(generated.structural_nonzeros())
@@ -909,9 +939,34 @@ fn nonsymmetric_generated_pattern_family_round_trips_every_backend() {
             BackendVerifierReport::Fast(report) => {
                 assert_eq!(protocol, ProofProtocol::FastBinary64UnitCircleV5);
                 assert!(report.score.squared_l2_claim < 1.0e-18);
-                assert_eq!(report.work.public_matrix_period_terms, 56);
+                assert_eq!(
+                    report.work.public_matrix_period_terms,
+                    expected_public_terms
+                );
                 assert_eq!(report.work.generator_row_queries, 0);
             }
         }
     }
+}
+
+#[test]
+fn nonsymmetric_generated_pattern_family_round_trips_every_backend() {
+    assert_nonsymmetric_family_round_trips_every_backend(
+        nonsymmetric_seeded_rhs_local_template(),
+        12,
+        5,
+        7,
+        56,
+    );
+}
+
+#[test]
+fn projected_nonsymmetric_family_round_trips_every_backend() {
+    assert_nonsymmetric_family_round_trips_every_backend(
+        projected_nonsymmetric_seeded_rhs_local_template(),
+        8,
+        3,
+        5,
+        20,
+    );
 }

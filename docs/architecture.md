@@ -139,7 +139,7 @@ dyadic coefficient recipe, RHS recipe, requested metric, and seed policy. A
 hosted template omits a literal seed and is finalized from a verified signed
 challenge. A local template carries its literal 32-byte seed directly.
 
-Three matrix families are currently registered:
+Four matrix families are currently registered:
 
 - `seeded-symmetric-tridiagonal-v1` uses one flat periodic table of negative
   dyadic off-diagonal mantissas. Its diagonal is the absolute off-diagonal row
@@ -168,6 +168,24 @@ Three matrix families are currently registered:
   This family deliberately does not claim symmetry, definiteness, diagonal
   dominance, or nonsingularity. Requiring a nonzero diagonal avoids a missing
   pivot structurally but is not a numerical nonsingularity guarantee.
+- `seeded-nonsymmetric-row-sparse-v2` keeps the same coefficient, bandwidth,
+  row-width, boundary, and non-manufactured-RHS contract, but removes the
+  shared low-bit row pattern. Let `m` be the padded row-index width and
+  `p = min(row_pattern_bits, m)`. A seed-derived permutation of the `m` row bits
+  supplies a different `p`-bit projection to each of the `K` entry slots.
+  Validation requires `K*p >= m`, and construction makes the union of those
+  projections cover every row bit. Thus the tuple of slot patterns identifies
+  a padded row; there is no family-imposed translation such as
+  `A[r+2^p,c+2^p] = A[r,c]`.
+
+  Off-diagonal slots sample from disjoint increasing offset buckets, so rows
+  remain sorted and duplicate-free without allocation. A singleton `+1`
+  bucket is always present when `K > 1`, preventing all generated offsets from
+  sharing a nontrivial divisor. Values and other offsets remain independently
+  table-generated. This is still structured data, not a hardness claim: it is
+  a sum of bit-projected masked shifts. The incompatible projections remove the
+  obvious repeated unit cell while preserving a public MLE cost of
+  `O(K * 2^p * log(n))` and `O(K * 2^p)` compiled table storage.
 
 All implementations expose sorted, duplicate-free, allocation-free row
 iterators over flat compiled storage. Their compilation reports structural and
@@ -215,7 +233,8 @@ The current plan has these invariants:
 - the padded tail is exactly zero;
 - exact and binary64 evaluators execute the same generator plan and operation
   order; and
-- work depends on the registered period and `log2(n)`, not on `n` or `nnz(A)`.
+- work depends on bounded generator-table terms and `log2(n)`, not on `n` or
+  `nnz(A)`.
 
 For the tridiagonal family, matrix work is `O(P_A log n)`. For the DIA family it
 is
@@ -226,14 +245,15 @@ O((sum_d min(P_d, n-d)) log n),
 
 where `P_d` is the period of offset `d`. A constant-state carry/borrow automaton
 evaluates each shifted edge orbit without enumerating its anchors. RHS work is
-`O(P_b log n)`. For the nonsymmetric family, matrix work is
-`O(min(P,n) K log n)`, where `P` is the row-pattern period and `K` is the
-configured row-width cap. The same carry/borrow automaton evaluates each signed
-offset orbit. Periodic row structure is the deliberate succinctness tradeoff:
-fully independent hash-generated rows would require a verifier scan with the
-current protocol. These bounded periodic term counts are recorded in metadata
-and capped by the validation manifest; the evaluator does not materialize
-dimension-sized public tables.
+`O(P_b log n)`. Nonsymmetric v1 matrix work is `O(min(P,n) K log n)`, where `P`
+is the row-pattern period and `K` is the configured row-width cap. Projected v2
+uses `O(2^p K log n)`, where each slot's `p` row-bit constraints replace the
+shared periodic low-bit constraint. The same carry/borrow automaton evaluates
+each signed offset orbit. Bounded lookup structure is the deliberate
+succinctness tradeoff: fully independent hash-generated rows would require a
+verifier scan with the current protocol. These bounded pattern-term counts are
+recorded in metadata and capped by the validation manifest; the evaluator does
+not materialize dimension-sized public tables.
 
 The generator owns this capability. Exact and fast backends must not match on a
 matrix-family enum and duplicate its formulas. Adding a family therefore requires

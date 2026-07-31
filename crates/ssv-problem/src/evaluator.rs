@@ -22,7 +22,7 @@ use crate::{
     GeneratedProblem,
     generator::{
         CompiledMatrixFamily, PeriodicNonsymmetricRowSparse, PeriodicSymmetricDiaLaplacian,
-        PeriodicSymmetricTridiagonal,
+        PeriodicSymmetricTridiagonal, ProjectedNonsymmetricRowSparse,
     },
 };
 
@@ -359,6 +359,9 @@ fn evaluate_matrix<I: MleInterpreter>(
         CompiledMatrixFamily::NonsymmetricRowSparse(matrix) => {
             evaluate_nonsymmetric_matrix(matrix, interpreter, row_point, column_point)
         }
+        CompiledMatrixFamily::ProjectedNonsymmetricRowSparse(matrix) => {
+            evaluate_projected_nonsymmetric_matrix(matrix, interpreter, row_point, column_point)
+        }
     }
 }
 
@@ -609,6 +612,64 @@ fn evaluate_nonsymmetric_matrix<I: MleInterpreter>(
     })
 }
 
+fn evaluate_projected_nonsymmetric_matrix<I: MleInterpreter>(
+    matrix: &ProjectedNonsymmetricRowSparse,
+    interpreter: &I,
+    row_point: &[I::Scalar],
+    column_point: &[I::Scalar],
+) -> Result<MleEvaluation<I::Scalar>, MleEvaluationError> {
+    let variables = matrix.dimension.next_power_of_two().ilog2() as usize;
+    check_point("row", row_point, variables)?;
+    check_point("column", column_point, variables)?;
+    let mut arithmetic = Arithmetic::new(interpreter);
+    let mut result = arithmetic.zero();
+    let pattern_count = matrix.pattern_count();
+
+    for slot in 0..matrix.row_width {
+        let projection = matrix.slot_projection(slot);
+        for pattern in 0..pattern_count {
+            let (anchor_limit, left_shift, right_shift, mantissa) = if slot == 0 {
+                (matrix.dimension, 0, 0, matrix.diagonal_mantissas[pattern])
+            } else {
+                let table_index = matrix.off_diagonal_table_index(slot - 1, pattern);
+                let signed_offset = matrix.signed_offsets[table_index];
+                let mantissa = matrix.off_diagonal_mantissas[table_index];
+                if signed_offset < 0 {
+                    let magnitude = usize::try_from(signed_offset.unsigned_abs())
+                        .expect("validated projected offset magnitude fits usize");
+                    (matrix.dimension - magnitude, magnitude, 0, mantissa)
+                } else {
+                    let magnitude = usize::try_from(signed_offset)
+                        .expect("validated projected nonnegative offset fits usize");
+                    (matrix.dimension - magnitude, 0, magnitude, mantissa)
+                }
+            };
+            let basis = projected_shift_pair_indices(
+                &mut arithmetic,
+                row_point,
+                column_point,
+                ProjectedShiftPair {
+                    anchor_limit,
+                    projection,
+                    pattern,
+                    left_shift,
+                    right_shift,
+                },
+            );
+            let mantissa = arithmetic.embed_i64(mantissa);
+            let contribution = arithmetic.mul(mantissa, basis);
+            result = arithmetic.add(result, contribution);
+            arithmetic.work.periodic_terms += 1;
+        }
+    }
+
+    Ok(MleEvaluation {
+        value: result,
+        fractional_bits: matrix.fractional_bits,
+        work: arithmetic.work,
+    })
+}
+
 fn evaluate_rhs<I: MleInterpreter>(
     problem: &GeneratedProblem,
     interpreter: &I,
@@ -753,13 +814,6 @@ fn bounded_equal_indices<I: MleInterpreter>(
     states[1]
 }
 
-/// Evaluates one periodic DIA edge-orbit relation without scanning anchors.
-///
-/// The summed anchor `i` is restricted by `i < anchor_limit` and by its low
-/// `period_bits`. The two equality weights select `i + left_shift` and
-/// `i + right_shift`. A constant-size least-significant-bit-first automaton
-/// tracks both addition carries and the borrow proving the anchor bound, so
-/// work is linear in the Boolean-domain bit count for each active pattern.
 #[derive(Clone, Copy)]
 struct PeriodicShiftPair {
     anchor_limit: usize,
@@ -769,6 +823,29 @@ struct PeriodicShiftPair {
     right_shift: usize,
 }
 
+#[derive(Clone, Copy)]
+struct ProjectedShiftPair<'a> {
+    anchor_limit: usize,
+    projection: &'a [u8],
+    pattern: usize,
+    left_shift: usize,
+    right_shift: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ShiftPair {
+    anchor_limit: usize,
+    left_shift: usize,
+    right_shift: usize,
+}
+
+/// Evaluates one periodic DIA edge-orbit relation without scanning anchors.
+///
+/// The summed anchor `i` is restricted by `i < anchor_limit` and by its low
+/// `period_bits`. The two equality weights select `i + left_shift` and
+/// `i + right_shift`. A constant-size least-significant-bit-first automaton
+/// tracks both addition carries and the borrow proving the anchor bound, so
+/// work is linear in the Boolean-domain bit count for each active pattern.
 fn periodic_shift_pair_indices<I: MleInterpreter>(
     arithmetic: &mut Arithmetic<'_, I>,
     left: &[I::Scalar],
@@ -778,6 +855,63 @@ fn periodic_shift_pair_indices<I: MleInterpreter>(
     debug_assert_eq!(left.len(), right.len());
     debug_assert!(relation.period_bits <= left.len());
     debug_assert!(relation.pattern < (1_usize << relation.period_bits));
+    shift_pair_indices(
+        arithmetic,
+        left,
+        right,
+        ShiftPair {
+            anchor_limit: relation.anchor_limit,
+            left_shift: relation.left_shift,
+            right_shift: relation.right_shift,
+        },
+        |bit, anchor_bit, _left_bit| {
+            bit >= relation.period_bits || anchor_bit == ((relation.pattern >> bit) & 1)
+        },
+    )
+}
+
+/// Evaluates a shifted pair whose matrix-row index matches arbitrary projected
+/// bits. The projection constrains `i + left_shift`, allowing negative and
+/// positive row offsets to share the same carry/borrow program.
+fn projected_shift_pair_indices<I: MleInterpreter>(
+    arithmetic: &mut Arithmetic<'_, I>,
+    left: &[I::Scalar],
+    right: &[I::Scalar],
+    relation: ProjectedShiftPair<'_>,
+) -> I::Scalar {
+    debug_assert_eq!(left.len(), right.len());
+    debug_assert!(relation.projection.len() <= left.len());
+    debug_assert!(relation.pattern < (1_usize << relation.projection.len()));
+    shift_pair_indices(
+        arithmetic,
+        left,
+        right,
+        ShiftPair {
+            anchor_limit: relation.anchor_limit,
+            left_shift: relation.left_shift,
+            right_shift: relation.right_shift,
+        },
+        |bit, _anchor_bit, left_bit| {
+            relation
+                .projection
+                .iter()
+                .position(|&projected| usize::from(projected) == bit)
+                .is_none_or(|pattern_bit| left_bit == ((relation.pattern >> pattern_bit) & 1))
+        },
+    )
+}
+
+fn shift_pair_indices<I, F>(
+    arithmetic: &mut Arithmetic<'_, I>,
+    left: &[I::Scalar],
+    right: &[I::Scalar],
+    relation: ShiftPair,
+    accepts_bit: F,
+) -> I::Scalar
+where
+    I: MleInterpreter,
+    F: Fn(usize, usize, usize) -> bool,
+{
     let domain = 1_usize << left.len();
     debug_assert!(relation.anchor_limit <= domain);
     debug_assert!(relation.left_shift < domain);
@@ -796,14 +930,12 @@ fn periodic_shift_pair_indices<I: MleInterpreter>(
                 for borrow_in in 0..=1 {
                     let state = states[shift_state_index(left_carry, right_carry, borrow_in)];
                     for anchor_bit in 0..=1 {
-                        if bit < relation.period_bits
-                            && anchor_bit != ((relation.pattern >> bit) & 1)
-                        {
-                            continue;
-                        }
                         let left_sum = anchor_bit + left_shift_bit + left_carry;
                         let left_bit = left_sum & 1;
                         let left_carry_out = left_sum >> 1;
+                        if !accepts_bit(bit, anchor_bit, left_bit) {
+                            continue;
+                        }
                         let right_sum = anchor_bit + right_shift_bit + right_carry;
                         let right_bit = right_sum & 1;
                         let right_carry_out = right_sum >> 1;
@@ -1228,6 +1360,24 @@ mod tests {
         template.finalize_literal().unwrap().compile().unwrap()
     }
 
+    fn projected_nonsymmetric_generated(dimension: u64) -> GeneratedProblem {
+        let mut template = template(dimension, seeded_rhs());
+        let maximum_half_bandwidth = 5_u64.min(dimension - 1);
+        let maximum_nonzeros_per_row =
+            u8::try_from((2 * maximum_half_bandwidth + 1).min(7)).expect("test row width fits u8");
+        template.matrix = MatrixSpec::SeededNonsymmetricRowSparseV2 {
+            dimension,
+            boundary: BoundaryRule::TruncateV1,
+            row_pattern_bits: 3,
+            maximum_half_bandwidth,
+            maximum_nonzeros_per_row,
+            fractional_bits: 8,
+            minimum_mantissa: -256,
+            maximum_mantissa: 256,
+        };
+        template.finalize_literal().unwrap().compile().unwrap()
+    }
+
     fn seeded_rhs() -> RhsSpec {
         RhsSpec::SeededPeriodicDyadicV1 {
             period_bits: 2,
@@ -1384,6 +1534,37 @@ mod tests {
                 "nonsymmetric RHS mismatch at dimension {dimension}"
             );
             assert_eq!(plan.metadata().evaluator_version, 3);
+            assert_eq!(
+                matrix.work.periodic_terms,
+                u64::try_from(plan.metadata().matrix_period_terms)
+                    .expect("test public term count fits u64")
+            );
+        }
+    }
+
+    #[test]
+    fn projected_nonsymmetric_evaluators_match_complete_scans() {
+        for dimension in [2, 5, 8, 19, 32, 33] {
+            let problem = projected_nonsymmetric_generated(dimension);
+            let plan = problem.public_evaluation_plan();
+            let variables = plan.metadata().domain.variables;
+            let row = test_point(variables, 7);
+            let column = test_point(variables, 11);
+            let matrix = plan
+                .evaluate_matrix_mle(&TestInterpreter, &row, &column)
+                .unwrap();
+            let rhs = plan.evaluate_rhs_mle(&TestInterpreter, &row).unwrap();
+            assert_eq!(
+                matrix.value,
+                scan_matrix(&TestInterpreter, &problem, &row, &column),
+                "projected nonsymmetric matrix mismatch at dimension {dimension}"
+            );
+            assert_eq!(
+                rhs.value,
+                scan_rhs(&TestInterpreter, &problem, &row),
+                "projected nonsymmetric RHS mismatch at dimension {dimension}"
+            );
+            assert_eq!(plan.metadata().evaluator_version, 4);
             assert_eq!(
                 matrix.work.periodic_terms,
                 u64::try_from(plan.metadata().matrix_period_terms)
@@ -1673,6 +1854,34 @@ mod tests {
         assert_eq!(metadata.matrix_period_terms, 56);
         assert!(matrix.work.arithmetic_operations() < 1_000_000);
         assert!(problem.structural_nonzeros() > 5_000_000);
+    }
+
+    #[test]
+    fn projected_work_depends_on_slot_tables_and_log_dimension() {
+        let dimension = 1 << 20;
+        let mut value = template(dimension, seeded_rhs());
+        value.matrix = MatrixSpec::SeededNonsymmetricRowSparseV2 {
+            dimension,
+            boundary: BoundaryRule::TruncateV1,
+            row_pattern_bits: 8,
+            maximum_half_bandwidth: 128,
+            maximum_nonzeros_per_row: 7,
+            fractional_bits: 8,
+            minimum_mantissa: -256,
+            maximum_mantissa: 256,
+        };
+        let problem = value.finalize_literal().unwrap().compile().unwrap();
+        let plan = problem.public_evaluation_plan();
+        let metadata = plan.metadata();
+        let row = vec![TestInterpreter.embed_i64(2); metadata.domain.variables];
+        let column = vec![TestInterpreter.embed_i64(3); metadata.domain.variables];
+        let matrix = plan
+            .evaluate_matrix_mle(&TestInterpreter, &row, &column)
+            .unwrap();
+        assert_eq!(matrix.work.periodic_terms, 7 * 256);
+        assert_eq!(metadata.matrix_period_terms, 7 * 256);
+        assert!(matrix.work.arithmetic_operations() < 10_000_000);
+        assert!(problem.structural_nonzeros() > 7_000_000);
     }
 
     #[test]

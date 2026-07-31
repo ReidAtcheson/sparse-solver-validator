@@ -14,8 +14,10 @@ backend dispatch behind explicit boundaries.
 
 Registered generators include the original seeded symmetric tridiagonal family,
 a symmetric DIA graph-Laplacian family with arbitrary positive offsets, and a
-nonsymmetric row-sparse family whose mixed-sign values and bounded-bandwidth
-nonzero patterns are both generated. Matrix and RHS streams are independent,
+nonsymmetric row-sparse family with both periodic-v1 and projected-v2 pattern
+schemes. The projected scheme mixes different row-index bits for each entry
+slot, avoiding v1's forced short translation period while retaining bounded
+mixed-sign values and half bandwidth. Matrix and RHS streams are independent,
 and each family must provide a validator-side multilinear-extension evaluator
 whose work is logarithmic in the matrix dimension for a bounded number of
 generated patterns.

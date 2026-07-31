@@ -12,7 +12,9 @@ const {
   MAX_DIA_OFFSETS,
   MAX_NONSYMMETRIC_ROW_NONZEROS,
   MAX_SAFE_MANTISSA,
+  MAX_VISUALIZATION_DIMENSION,
   NONSYMMETRIC_FAMILY,
+  PROJECTED_NONSYMMETRIC_FAMILY,
   SEEDED_RHS_FAMILY,
   TRIDIAGONAL_FAMILY,
   actualizeMatrix,
@@ -132,10 +134,12 @@ function explorerDocument(includeSeedControls) {
 
 test("the static page loads exact actualization support before the explorer", () => {
   const html = readFileSync(join(__dirname, "../../pages/index.html"), "utf8");
-  assert.ok(html.indexOf('src="blake3.js?v=2"') < html.indexOf('src="explorer.js?v=2"'));
-  assert.match(html, /href="styles\.css\?v=2"/);
+  assert.ok(html.indexOf('src="blake3.js?v=3"') < html.indexOf('src="explorer.js?v=3"'));
+  assert.match(html, /href="styles\.css\?v=3"/);
   assert.match(html, /id="instance-seed"/);
   assert.match(html, /id="new-seed"/);
+  assert.match(html, /seeded-nonsymmetric-row-sparse-v2/);
+  assert.match(html, /id="dimension"[^>]+max="1024"/);
   assert.match(html, /class="swatch negative off-diagonal"/);
   assert.match(html, /id="off-diagonal-legend"/);
 });
@@ -356,6 +360,40 @@ test("browser matrix actualization matches Rust export vectors for every family"
 6,6,198
 7,5,33
 7,7,-39`);
+
+  assert.equal(signature(PROJECTED_NONSYMMETRIC_FAMILY), `0,0,-181
+0,1,-88
+0,3,-10
+1,0,202
+1,1,-32
+1,2,-139
+1,4,-10
+2,0,255
+2,1,-10
+2,2,97
+2,3,18
+2,4,168
+3,1,255
+3,2,202
+3,3,172
+3,4,-45
+3,5,168
+4,1,112
+4,3,100
+4,4,-181
+4,5,-88
+4,7,-28
+5,2,112
+5,4,-173
+5,5,-32
+5,6,-139
+6,3,-214
+6,5,100
+6,6,97
+6,7,18
+7,4,-214
+7,6,-173
+7,7,172`);
 });
 
 test("actualized nonsymmetric rows obey the generated structural contract", () => {
@@ -410,6 +448,52 @@ test("nonsymmetric templates encode generated row-pattern constraints", () => {
   });
 });
 
+test("projected nonsymmetric templates select the distinct v2 protocol family", () => {
+  const p = parameters({ family: PROJECTED_NONSYMMETRIC_FAMILY });
+  assert.equal(validationError(p), "");
+  assert.deepEqual(matrixSpec(p), {
+    kind: PROJECTED_NONSYMMETRIC_FAMILY,
+    dimension: 16,
+    boundary: "truncate-v1",
+    row_pattern_bits: 3,
+    maximum_half_bandwidth: 5,
+    maximum_nonzeros_per_row: 7,
+    fractional_bits: 8,
+    minimum_mantissa: "-256",
+    maximum_mantissa: "256",
+  });
+});
+
+test("projected nonsymmetric rows are bounded without the v1 translation period", () => {
+  const p = parameters({
+    family: PROJECTED_NONSYMMETRIC_FAMILY,
+    dimension: 37,
+    periodBits: 3,
+    maximumHalfBandwidth: 5,
+    maximumRowNonzeros: 7,
+  });
+  const matrix = actualizeMatrix(p);
+  const changedSeed = actualizeMatrix({ ...p, seed: "02".repeat(32) });
+  assert.notDeepEqual(matrix.entries, changedSeed.entries);
+
+  const normalizedRow = (row) => matrix.entries
+    .filter((entry) => entry.row === row)
+    .map((entry) => [entry.column - row, entry.mantissa]);
+  assert.notDeepEqual(normalizedRow(5), normalizedRow(13));
+
+  for (let row = 0; row < p.dimension; row += 1) {
+    const entries = matrix.entries.filter((entry) => entry.row === row);
+    assert.ok(entries.length >= 1 && entries.length <= p.maximumRowNonzeros);
+    assert.equal(entries.filter((entry) => entry.column === row).length, 1);
+    assert.equal(new Set(entries.map((entry) => entry.column)).size, entries.length);
+    assert.ok(entries.every((entry) => Math.abs(entry.column - row) <= p.maximumHalfBandwidth));
+    assert.ok(entries.every((entry) => entry.mantissa !== 0n));
+    if (row + 1 < p.dimension) {
+      assert.ok(entries.some((entry) => entry.column === row + 1));
+    }
+  }
+});
+
 test("nonsymmetric controls enforce bandwidth, row width, and the unit interval", () => {
   const sparse = (overrides = {}) => parameters({
     family: NONSYMMETRIC_FAMILY,
@@ -434,6 +518,34 @@ test("nonsymmetric controls enforce bandwidth, row width, and the unit interval"
     validationError(sparse({ coefficientMinimum: 0, coefficientMaximum: 0 })),
     /nonzero/,
   );
+  assert.match(
+    validationError(sparse({
+      family: PROJECTED_NONSYMMETRIC_FAMILY,
+      dimension: 1024,
+      periodBits: 1,
+    })),
+    /collectively cover/,
+  );
+  assert.equal(validationError(sparse({
+    family: PROJECTED_NONSYMMETRIC_FAMILY,
+    dimension: 1024,
+    periodBits: 2,
+  })), "");
+});
+
+test("the browser admits matrix previews through dimension 1024", () => {
+  assert.equal(MAX_VISUALIZATION_DIMENSION, 1024);
+  assert.equal(validationError(parameters({ dimension: 1024 })), "");
+  assert.match(validationError(parameters({ dimension: 1025 })), /between 2 and 1024/);
+  const projected = parameters({
+    family: PROJECTED_NONSYMMETRIC_FAMILY,
+    dimension: 1024,
+    periodBits: 2,
+  });
+  assert.equal(validationError(projected), "");
+  const matrix = actualizeMatrix(projected);
+  assert.ok(matrix.entries.length >= 1024);
+  assert.ok(matrix.entries.length <= 1024 * projected.maximumRowNonzeros);
 });
 
 test("seeded RHS parameters are validated at the registered schema boundary", () => {
