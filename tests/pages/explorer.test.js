@@ -1,9 +1,13 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const { readFileSync } = require("node:fs");
+const { join } = require("node:path");
 const test = require("node:test");
+const blake3 = require("../../pages/blake3.js");
 
 const {
+  DEFAULT_INSTANCE_SEED,
   DIA_FAMILY,
   MAX_DIA_OFFSETS,
   MAX_NONSYMMETRIC_ROW_NONZEROS,
@@ -11,11 +15,13 @@ const {
   NONSYMMETRIC_FAMILY,
   SEEDED_RHS_FAMILY,
   TRIDIAGONAL_FAMILY,
+  actualizeMatrix,
   hostedWorkflow,
   localWorkflow,
   matrixSpec,
   parseOffsets,
   problemTemplate,
+  randomSeedHex,
   structuralNonzeros,
   validationError,
 } = require("../../pages/explorer.js");
@@ -23,6 +29,7 @@ const {
 function parameters(overrides = {}) {
   return {
     family: TRIDIAGONAL_FAMILY,
+    seed: DEFAULT_INSTANCE_SEED,
     dimension: 16,
     offsets: [1, 4],
     periodBits: 3,
@@ -42,6 +49,13 @@ function parameters(overrides = {}) {
     ...overrides,
   };
 }
+
+test("the static page loads exact actualization support before the explorer", () => {
+  const html = readFileSync(join(__dirname, "../../pages/index.html"), "utf8");
+  assert.ok(html.indexOf('src="blake3.js"') < html.indexOf('src="explorer.js"'));
+  assert.match(html, /id="instance-seed"/);
+  assert.match(html, /id="new-seed"/);
+});
 
 test("the legacy tridiagonal template remains unchanged", () => {
   const p = parameters();
@@ -105,6 +119,10 @@ test("DIA templates preserve noncontiguous offsets and exact string mantissas", 
 
 test("templates use a separately parameterized seeded RHS", () => {
   const template = problemTemplate(parameters(), "literal");
+  assert.deepEqual(template.randomness, {
+    kind: "literal-v1",
+    seed: DEFAULT_INSTANCE_SEED,
+  });
   assert.deepEqual(template.rhs, {
     kind: SEEDED_RHS_FAMILY,
     period_bits: 4,
@@ -113,6 +131,156 @@ test("templates use a separately parameterized seeded RHS", () => {
     maximum_mantissa: "19",
   });
   assert.notEqual(template.rhs.kind, "manufactured-ones-v1");
+});
+
+test("seed validation and generation preserve the protocol's canonical spelling", () => {
+  assert.match(validationError(parameters({ seed: "01" })), /64 lowercase hexadecimal/);
+  assert.match(validationError(parameters({ seed: "AB".repeat(32) })), /lowercase hexadecimal/);
+  assert.equal(validationError(parameters({ seed: "ab".repeat(32) })), "");
+
+  const generated = randomSeedHex({
+    getRandomValues(bytes) {
+      for (let index = 0; index < bytes.length; index += 1) bytes[index] = index;
+      return bytes;
+    },
+  });
+  assert.equal(generated, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+});
+
+test("the bounded browser BLAKE3 implementation matches the standard hash vectors", () => {
+  assert.equal(
+    blake3.bytesToHex(blake3.hash(new Uint8Array())),
+    "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+  );
+  assert.equal(
+    blake3.bytesToHex(blake3.hash(new TextEncoder().encode("abc"))),
+    "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+  );
+});
+
+test("browser matrix actualization matches Rust export vectors for every family", () => {
+  const base = parameters({
+    dimension: 8,
+    offsets: [1, 3],
+    periodBits: 2,
+    maximumHalfBandwidth: 3,
+    maximumRowNonzeros: 5,
+  });
+  const signature = (family) => actualizeMatrix({ ...base, family }).entries
+    .map((entry) => `${entry.row},${entry.column},${entry.mantissa}`)
+    .join("\n");
+
+  assert.equal(signature(TRIDIAGONAL_FAMILY), `0,0,41
+0,1,-9
+1,0,-9
+1,1,65
+1,2,-24
+2,1,-24
+2,2,66
+2,3,-10
+3,2,-10
+3,3,57
+3,4,-15
+4,3,-15
+4,4,56
+4,5,-9
+5,4,-9
+5,5,65
+5,6,-24
+6,5,-24
+6,6,66
+6,7,-10
+7,6,-10
+7,7,42`);
+
+  assert.equal(signature(DIA_FAMILY), `0,0,73
+0,1,-19
+0,3,-22
+1,0,-19
+1,1,87
+1,2,-12
+1,4,-24
+2,1,-12
+2,2,91
+2,3,-24
+2,5,-23
+3,0,-22
+3,2,-24
+3,3,111
+3,4,-12
+3,6,-21
+4,1,-24
+4,3,-12
+4,4,109
+4,5,-19
+4,7,-22
+5,2,-23
+5,4,-19
+5,5,86
+5,6,-12
+6,3,-21
+6,5,-12
+6,6,89
+6,7,-24
+7,4,-22
+7,6,-24
+7,7,78`);
+
+  assert.equal(signature(NONSYMMETRIC_FAMILY), `0,0,255
+0,2,58
+1,1,-47
+1,2,-251
+1,3,-215
+2,0,-254
+2,2,198
+2,4,-182
+2,5,-135
+3,1,33
+3,3,-39
+3,4,102
+3,5,-151
+3,6,-37
+4,1,189
+4,2,-224
+4,3,-223
+4,4,255
+4,6,58
+5,2,181
+5,3,-138
+5,5,-47
+5,6,-251
+5,7,-215
+6,3,-55
+6,4,-254
+6,6,198
+7,5,33
+7,7,-39`);
+});
+
+test("actualized nonsymmetric rows obey the generated structural contract", () => {
+  const p = parameters({
+    family: NONSYMMETRIC_FAMILY,
+    dimension: 37,
+    periodBits: 3,
+    maximumHalfBandwidth: 5,
+    maximumRowNonzeros: 7,
+  });
+  const matrix = actualizeMatrix(p);
+  const changedSeed = actualizeMatrix({ ...p, seed: "02".repeat(32) });
+  assert.notDeepEqual(matrix.entries, changedSeed.entries);
+
+  for (let row = 0; row < p.dimension; row += 1) {
+    const entries = matrix.entries.filter((entry) => entry.row === row);
+    assert.ok(entries.length >= 1 && entries.length <= p.maximumRowNonzeros);
+    assert.equal(entries.filter((entry) => entry.column === row).length, 1);
+    assert.equal(new Set(entries.map((entry) => entry.column)).size, entries.length);
+    assert.ok(entries.every((entry) => Math.abs(entry.column - row) <= p.maximumHalfBandwidth));
+    assert.ok(entries.every((entry) => entry.mantissa !== 0n));
+    assert.ok(entries.every((entry) => (
+      entry.mantissa >= BigInt(p.coefficientMinimum)
+      && entry.mantissa <= BigInt(p.coefficientMaximum)
+    )));
+  }
 });
 
 test("nonsymmetric templates encode generated row-pattern constraints", () => {
