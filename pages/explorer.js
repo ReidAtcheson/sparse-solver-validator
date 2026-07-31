@@ -1,5 +1,9 @@
 "use strict";
 
+const blake3 = typeof module !== "undefined" && module.exports
+  ? require("./blake3.js")
+  : globalThis.SsvBlake3;
+
 const TRIDIAGONAL_FAMILY = "seeded-symmetric-tridiagonal-v1";
 const DIA_FAMILY = "seeded-symmetric-dia-laplacian-v1";
 const NONSYMMETRIC_FAMILY = "seeded-nonsymmetric-row-sparse-v1";
@@ -7,7 +11,14 @@ const SEEDED_RHS_FAMILY = "seeded-periodic-dyadic-v1";
 const MAX_SAFE_MANTISSA = 9007199254740991;
 const MAX_DIA_OFFSETS = 16;
 const MAX_NONSYMMETRIC_ROW_NONZEROS = 32;
-const LOCAL_SEED = "0101010101010101010101010101010101010101010101010101010101010101";
+const DEFAULT_INSTANCE_SEED = "0101010101010101010101010101010101010101010101010101010101010101";
+const SUBSEED_DERIVATION_CONTEXT = "sparse-solve/problem-subseed/v1";
+const UNBIASED_STREAM_CONTEXT = "sparse-solve/unbiased-u64-stream/v1";
+const MATRIX_VALUES_LABEL = "matrix/seeded-symmetric-tridiagonal-v1/off-diagonal-values";
+const DIA_MATRIX_VALUES_LABEL = "matrix/seeded-symmetric-dia-laplacian-v1/edge-values";
+const NONSYMMETRIC_STRUCTURE_LABEL = "matrix/seeded-nonsymmetric-row-sparse-v1/structure";
+const NONSYMMETRIC_OFF_DIAGONAL_VALUES_LABEL = "matrix/seeded-nonsymmetric-row-sparse-v1/off-diagonal-values";
+const NONSYMMETRIC_DIAGONAL_VALUES_LABEL = "matrix/seeded-nonsymmetric-row-sparse-v1/diagonal-values";
 
 function parseOffsets(value) {
   if (!value.trim()) return [];
@@ -27,6 +38,9 @@ function validationError(p) {
     return "Select a registered matrix family.";
   }
   if (p.rhs !== SEEDED_RHS_FAMILY) return "Select a registered right-hand-side family.";
+  if (typeof p.seed !== "string" || !/^[0-9a-f]{64}$/.test(p.seed)) {
+    return "The instance seed must be exactly 64 lowercase hexadecimal characters.";
+  }
 
   const commonIntegers = [
     p.dimension,
@@ -173,7 +187,7 @@ function rhsSpec(p) {
 function problemTemplate(p, kind) {
   const randomness = kind === "challenge"
     ? { kind: "challenge-derived-v1", derivation: "blake3-xof-v1" }
-    : { kind: "literal-v1", seed: LOCAL_SEED };
+    : { kind: "literal-v1", seed: p.seed };
   return {
     schema: "sparse-solve/problem-template/v1",
     randomness,
@@ -181,6 +195,238 @@ function problemTemplate(p, kind) {
     rhs: rhsSpec(p),
     requested_outputs: [{ kind: "squared-l2-residual-v1" }],
   };
+}
+
+// This is an exact browser mirror of the frozen Rust seed derivation and
+// bounded matrix generators. Cross-language test vectors protect the wire
+// semantics; do not replace these streams with a presentation-only PRNG.
+function deriveSubseed(seed, label) {
+  const labelBytes = blake3.textEncoder.encode(label);
+  const input = blake3.concatenate(
+    seed,
+    blake3.u64LittleEndian(BigInt(labelBytes.length)),
+    labelBytes,
+  );
+  return blake3.deriveKey(SUBSEED_DERIVATION_CONTEXT, input, 32);
+}
+
+class UniformStream {
+  constructor(seed) {
+    this.reader = blake3.deriveKeyReader(UNBIASED_STREAM_CONTEXT, seed);
+  }
+
+  nextU64() {
+    const bytes = this.reader.read(8);
+    let value = 0n;
+    for (let index = 0; index < bytes.length; index += 1) {
+      value |= BigInt(bytes[index]) << BigInt(8 * index);
+    }
+    return value;
+  }
+
+  sampleBelow(bound) {
+    if (typeof bound !== "bigint" || bound <= 0n || bound >= (1n << 64n)) {
+      throw new RangeError("the unbiased sampler bound must fit a positive u64");
+    }
+    const rejectionThreshold = ((1n << 64n) - bound) % bound;
+    for (;;) {
+      const candidate = this.nextU64();
+      if (candidate >= rejectionThreshold) return candidate % bound;
+    }
+  }
+}
+
+function negativeMantissaTable(seed, count, minimum, maximum) {
+  const minimumMagnitude = BigInt(minimum);
+  const width = BigInt(maximum) - minimumMagnitude + 1n;
+  const stream = new UniformStream(seed);
+  return Array.from(
+    { length: count },
+    () => -(minimumMagnitude + stream.sampleBelow(width)),
+  );
+}
+
+function sampleNonzeroMantissa(stream, minimum, maximum) {
+  const low = BigInt(minimum);
+  const high = BigInt(maximum);
+  const containsZero = low <= 0n && high >= 0n;
+  const width = high - low + 1n - (containsZero ? 1n : 0n);
+  const sample = stream.sampleBelow(width);
+  if (!containsZero) return low + sample;
+  const negativeValues = -low;
+  return sample < negativeValues ? low + sample : 1n + sample - negativeValues;
+}
+
+function signedOffsetFromPopulationIndex(index, halfBandwidth) {
+  const half = BigInt(halfBandwidth);
+  return Number(index < half ? index - half : index - half + 1n);
+}
+
+function sampledSignedOffsets(stream, halfBandwidth, count) {
+  const population = 2n * BigInt(halfBandwidth);
+  const selected = [];
+  for (let upper = population - BigInt(count); upper < population; upper += 1n) {
+    const candidate = signedOffsetFromPopulationIndex(
+      stream.sampleBelow(upper + 1n),
+      halfBandwidth,
+    );
+    selected.push(selected.includes(candidate)
+      ? signedOffsetFromPopulationIndex(upper, halfBandwidth)
+      : candidate);
+  }
+  selected.sort((left, right) => left - right);
+  return selected;
+}
+
+function nextPowerOfTwo(value) {
+  let result = 1;
+  while (result < value) result *= 2;
+  return result;
+}
+
+function matrixEntry(row, column, mantissa) {
+  return { row, column, mantissa };
+}
+
+function actualizeTridiagonal(p, instanceSeed) {
+  const period = 2 ** p.periodBits;
+  const activeTableLength = Math.min(period, p.dimension - 1);
+  const table = negativeMantissaTable(
+    deriveSubseed(instanceSeed, MATRIX_VALUES_LABEL),
+    activeTableLength,
+    p.minimum,
+    p.maximum,
+  );
+  const edge = (index) => table[index & (period - 1)];
+  const entries = [];
+  for (let row = 0; row < p.dimension; row += 1) {
+    let diagonal = BigInt(p.margin);
+    if (row > 0) {
+      const value = edge(row - 1);
+      entries.push(matrixEntry(row, row - 1, value));
+      diagonal -= value;
+    }
+    if (row + 1 < p.dimension) diagonal -= edge(row);
+    entries.push(matrixEntry(row, row, diagonal));
+    if (row + 1 < p.dimension) entries.push(matrixEntry(row, row + 1, edge(row)));
+  }
+  return { entries, fractionalBits: p.fractionalBits };
+}
+
+function actualizeDia(p, instanceSeed) {
+  const period = 2 ** p.periodBits;
+  const familySeed = deriveSubseed(instanceSeed, DIA_MATRIX_VALUES_LABEL);
+  const edges = p.offsets.map((offset, index) => {
+    const label = `edge-diagonal/${index}/offset/${offset}`;
+    const activeTableLength = Math.min(period, p.dimension - offset);
+    return {
+      offset,
+      table: negativeMantissaTable(
+        deriveSubseed(familySeed, label),
+        activeTableLength,
+        p.minimum,
+        p.maximum,
+      ),
+    };
+  });
+  const edgeValue = (edge, index) => edge.table[index & (period - 1)];
+  const entries = [];
+  for (let row = 0; row < p.dimension; row += 1) {
+    let diagonal = BigInt(p.margin);
+    const rowEntries = [];
+    for (const edge of edges) {
+      if (row >= edge.offset) {
+        const value = edgeValue(edge, row - edge.offset);
+        rowEntries.push(matrixEntry(row, row - edge.offset, value));
+        diagonal -= value;
+      }
+      if (row + edge.offset < p.dimension) diagonal -= edgeValue(edge, row);
+    }
+    rowEntries.push(matrixEntry(row, row, diagonal));
+    for (const edge of edges) {
+      if (row + edge.offset < p.dimension) {
+        rowEntries.push(matrixEntry(row, row + edge.offset, edgeValue(edge, row)));
+      }
+    }
+    rowEntries.sort((left, right) => left.column - right.column);
+    entries.push(...rowEntries);
+  }
+  return { entries, fractionalBits: p.fractionalBits };
+}
+
+function actualizeNonsymmetric(p, instanceSeed) {
+  const requestedPeriod = 2 ** p.periodBits;
+  const period = Math.min(requestedPeriod, nextPowerOfTwo(p.dimension));
+  const offDiagonalCount = p.maximumRowNonzeros - 1;
+
+  const structureStream = new UniformStream(
+    deriveSubseed(instanceSeed, NONSYMMETRIC_STRUCTURE_LABEL),
+  );
+  const patterns = Array.from(
+    { length: period },
+    () => sampledSignedOffsets(structureStream, p.maximumHalfBandwidth, offDiagonalCount),
+  );
+
+  const offDiagonalStream = new UniformStream(
+    deriveSubseed(instanceSeed, NONSYMMETRIC_OFF_DIAGONAL_VALUES_LABEL),
+  );
+  const offDiagonalValues = Array.from(
+    { length: period * offDiagonalCount },
+    () => sampleNonzeroMantissa(
+      offDiagonalStream,
+      p.coefficientMinimum,
+      p.coefficientMaximum,
+    ),
+  );
+
+  const diagonalStream = new UniformStream(
+    deriveSubseed(instanceSeed, NONSYMMETRIC_DIAGONAL_VALUES_LABEL),
+  );
+  const diagonalValues = Array.from(
+    { length: period },
+    () => sampleNonzeroMantissa(
+      diagonalStream,
+      p.coefficientMinimum,
+      p.coefficientMaximum,
+    ),
+  );
+
+  const entries = [];
+  for (let row = 0; row < p.dimension; row += 1) {
+    const pattern = row & (period - 1);
+    const rowEntries = [matrixEntry(row, row, diagonalValues[pattern])];
+    for (let index = 0; index < offDiagonalCount; index += 1) {
+      const column = row + patterns[pattern][index];
+      if (column >= 0 && column < p.dimension) {
+        rowEntries.push(matrixEntry(
+          row,
+          column,
+          offDiagonalValues[pattern * offDiagonalCount + index],
+        ));
+      }
+    }
+    rowEntries.sort((left, right) => left.column - right.column);
+    entries.push(...rowEntries);
+  }
+  return { entries, fractionalBits: p.fractionalBits };
+}
+
+function actualizeMatrix(p) {
+  const instanceSeed = blake3.hexToBytes(p.seed);
+  if (instanceSeed.length !== 32) throw new RangeError("an instance seed must contain 32 bytes");
+  if (p.family === TRIDIAGONAL_FAMILY) return actualizeTridiagonal(p, instanceSeed);
+  if (p.family === DIA_FAMILY) return actualizeDia(p, instanceSeed);
+  if (p.family === NONSYMMETRIC_FAMILY) return actualizeNonsymmetric(p, instanceSeed);
+  throw new RangeError("cannot actualize an unregistered matrix family");
+}
+
+function randomSeedHex(randomSource) {
+  if (!randomSource || typeof randomSource.getRandomValues !== "function") {
+    throw new Error("secure browser randomness is unavailable");
+  }
+  const seed = new Uint8Array(32);
+  randomSource.getRandomValues(seed);
+  return blake3.bytesToHex(seed);
 }
 
 function structuralNonzeros(p) {
@@ -275,6 +521,8 @@ function initialize() {
   const hostedCode = document.querySelector("#hosted-code");
   const templateCode = document.querySelector("#template-code");
   const templateKind = document.querySelector("#template-kind");
+  const seedInput = document.querySelector("#instance-seed");
+  const newSeedButton = document.querySelector("#new-seed");
   const hostInputs = ["service-url", "issuer", "key-id", "public-key"]
     .map((id) => document.querySelector(`#${id}`));
   const privateService = document.querySelector("#private-service");
@@ -289,8 +537,6 @@ function initialize() {
   const marginLabel = document.querySelector("#margin-label");
   const minimumLabel = document.querySelector("#minimum-label");
   const maximumLabel = document.querySelector("#maximum-label");
-  const offDiagonalLegend = document.querySelector("#off-diagonal-legend");
-  const offDiagonalSwatch = document.querySelector(".swatch.off-diagonal");
   const plotNote = document.querySelector("#plot-note");
 
   function numberValue(id) {
@@ -300,6 +546,7 @@ function initialize() {
   function parameters() {
     return {
       family: document.querySelector("#family").value,
+      seed: seedInput.value.trim(),
       dimension: numberValue("dimension"),
       offsets: parseOffsets(document.querySelector("#offsets").value),
       periodBits: numberValue("period-bits"),
@@ -340,12 +587,10 @@ function initialize() {
     marginLabel.textContent = dia ? "Diagonal shift" : "Dominance margin";
     minimumLabel.textContent = dia ? "Minimum edge weight" : "Minimum magnitude";
     maximumLabel.textContent = dia ? "Maximum edge weight" : "Maximum magnitude";
-    offDiagonalLegend.textContent = nonsymmetric ? "eligible off-diagonal" : "off-diagonal";
-    offDiagonalSwatch.classList.toggle("eligible", nonsymmetric);
     document.querySelector("#maximum-half-bandwidth").max = String(p.dimension - 1);
   }
 
-  function drawPlot(p) {
+  function drawPlot(p, matrix) {
     const size = canvas.width;
     const padding = 20;
     const plotSize = size - (2 * padding);
@@ -355,45 +600,36 @@ function initialize() {
     context.fillRect(0, 0, size, size);
 
     const dotSize = Math.max(1.5, Math.min(cell * 0.72, 9));
-    const drawEntry = (row, column, color) => {
-      context.fillStyle = color;
+    const maximumMagnitude = matrix.entries.reduce((maximum, entry) => {
+      const magnitude = entry.mantissa < 0n ? -entry.mantissa : entry.mantissa;
+      return magnitude > maximum ? magnitude : maximum;
+    }, 0n);
+    const drawEntry = (entry) => {
+      const magnitude = entry.mantissa < 0n ? -entry.mantissa : entry.mantissa;
+      const relativeMagnitude = maximumMagnitude === 0n
+        ? 1
+        : Number(magnitude) / Number(maximumMagnitude);
+      const alpha = 0.32 + 0.68 * Math.sqrt(relativeMagnitude);
+      context.fillStyle = entry.mantissa > 0n
+        ? `rgba(23, 35, 61, ${alpha})`
+        : `rgba(228, 88, 38, ${alpha})`;
       context.fillRect(
-        padding + (column + 0.5) * cell - dotSize / 2,
-        padding + (row + 0.5) * cell - dotSize / 2,
+        padding + (entry.column + 0.5) * cell - dotSize / 2,
+        padding + (entry.row + 0.5) * cell - dotSize / 2,
         dotSize,
         dotSize,
       );
     };
     const nonsymmetric = p.family === NONSYMMETRIC_FAMILY;
     const offsets = matrixOffsets(p);
-    for (let row = 0; row < p.dimension; row += 1) {
-      if (nonsymmetric) {
-        const first = Math.max(0, row - p.maximumHalfBandwidth);
-        const last = Math.min(p.dimension - 1, row + p.maximumHalfBandwidth);
-        for (let column = first; column <= last; column += 1) {
-          if (column !== row) drawEntry(row, column, "#efb39d");
-        }
-      } else {
-        for (const offset of offsets) {
-          if (row >= offset) drawEntry(row, row - offset, "#e45826");
-        }
-      }
-      drawEntry(row, row, "#17233d");
-      if (!nonsymmetric) {
-        for (const offset of offsets) {
-          if (row + offset < p.dimension) drawEntry(row, row + offset, "#e45826");
-        }
-      }
-    }
+    matrix.entries.forEach(drawEntry);
     context.strokeStyle = "#aeb6c5";
     context.strokeRect(padding + 0.5, padding + 0.5, plotSize - 1, plotSize - 1);
 
-    const nonzeros = structuralNonzeros(p);
+    const nonzeros = matrix.entries.length;
     const density = (100 * nonzeros / (p.dimension * p.dimension)).toFixed(1);
     document.querySelector("#plot-title").textContent = `${p.dimension} × ${p.dimension}`;
-    document.querySelector("#plot-summary").textContent = nonsymmetric
-      ? `at most ${nonzeros} structural nonzeros · at most ${density}% density`
-      : `${nonzeros} structural nonzeros · ${density}% density`;
+    document.querySelector("#plot-summary").textContent = `${nonzeros} structural nonzeros · ${density}% density`;
     const familyDescription = p.family === DIA_FAMILY
       ? `symmetric DIA matrix with positive offsets ${offsets.join(", ")}`
       : nonsymmetric
@@ -401,15 +637,20 @@ function initialize() {
         : "symmetric tridiagonal matrix";
     canvas.setAttribute(
       "aria-label",
-      nonsymmetric
-        ? `${p.dimension} by ${p.dimension} ${familyDescription} eligible sparsity envelope`
-        : `${p.dimension} by ${p.dimension} ${familyDescription} spy plot with ${nonzeros} structural nonzeros`,
+      `${p.dimension} by ${p.dimension} actualized ${familyDescription} with ${nonzeros} structural nonzeros`,
     );
-    plotNote.textContent = p.family === DIA_FAMILY
-      ? `Positive offsets ${offsets.join(", ")} are mirrored; boundary edges truncate without wrapping.`
+    const mantissas = matrix.entries.map((entry) => entry.mantissa);
+    const minimumMantissa = mantissas.reduce((minimum, value) => (value < minimum ? value : minimum));
+    const maximumMantissa = mantissas.reduce((maximum, value) => (value > maximum ? value : maximum));
+    const familyNote = p.family === DIA_FAMILY
+      ? `Positive offsets ${offsets.join(", ")} are mirrored and boundary edges truncate.`
       : nonsymmetric
-        ? `The plot shows the eligible bandwidth envelope, not realized entries. The finalized seed chooses at most ${p.maximumRowNonzeros} entries per row, including a required diagonal; boundaries truncate without wrapping. Its MLE uses ${Math.min(2 ** p.periodBits, p.dimension) * p.maximumRowNonzeros} public pattern terms.`
-        : "Rows run top to bottom; columns run left to right. Values vary with the finalized seed, but this family’s sparsity pattern does not.";
+        ? `The seed chose these entries subject to the ${p.maximumRowNonzeros}-per-row cap and required diagonal; its MLE uses ${Math.min(2 ** p.periodBits, p.dimension) * p.maximumRowNonzeros} public pattern terms.`
+        : "The pattern is fixed, while the seed chooses its edge weights and resulting diagonal values.";
+    const challengeNote = templateKind.value === "challenge"
+      ? " The server challenge will derive a different final instance seed."
+      : " This is the exact matrix in the local literal-seed template.";
+    plotNote.textContent = `Actualized from seed ${p.seed.slice(0, 12)}…; navy is positive and orange is negative, with intensity showing relative magnitude. Mantissas span ${minimumMantissa} to ${maximumMantissa} at 2^-${matrix.fractionalBits}. ${familyNote}${challengeNote}`;
   }
 
   function update() {
@@ -419,7 +660,15 @@ function initialize() {
     formError.hidden = !error;
     formError.textContent = error;
     if (error) return;
-    drawPlot(p);
+    let matrix;
+    try {
+      matrix = actualizeMatrix(p);
+    } catch (actualizationError) {
+      formError.hidden = false;
+      formError.textContent = `Unable to actualize this matrix: ${actualizationError.message}`;
+      return;
+    }
+    drawPlot(p, matrix);
     localCode.textContent = localWorkflow();
     const [serviceUrl, issuer, keyId, publicKey] = hostInputs.map((input) => input.value.trim());
     hostedCode.textContent = hostedWorkflow({
@@ -436,6 +685,15 @@ function initialize() {
   templateKind.addEventListener("change", update);
   hostInputs.forEach((input) => input.addEventListener("input", update));
   privateService.addEventListener("change", update);
+  newSeedButton.addEventListener("click", () => {
+    try {
+      seedInput.value = randomSeedHex(globalThis.crypto);
+      update();
+    } catch (error) {
+      formError.hidden = false;
+      formError.textContent = error.message;
+    }
+  });
 
   document.querySelectorAll("[role=tab]").forEach((tab) => {
     tab.addEventListener("click", () => {
@@ -477,6 +735,7 @@ function initialize() {
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
+    DEFAULT_INSTANCE_SEED,
     DIA_FAMILY,
     MAX_DIA_OFFSETS,
     MAX_NONSYMMETRIC_ROW_NONZEROS,
@@ -484,12 +743,15 @@ if (typeof module !== "undefined" && module.exports) {
     NONSYMMETRIC_FAMILY,
     SEEDED_RHS_FAMILY,
     TRIDIAGONAL_FAMILY,
+    actualizeMatrix,
+    deriveSubseed,
     hostedWorkflow,
     localWorkflow,
     matrixOffsets,
     matrixSpec,
     parseOffsets,
     problemTemplate,
+    randomSeedHex,
     rhsSpec,
     solverHandoff,
     structuralNonzeros,

@@ -6,6 +6,7 @@
     <meta name="description" content="Generate and validate sparse linear-system proofs.">
     <title>Sparse Solver Validator</title>
     <link rel="stylesheet" href="styles.css">
+    <script src="blake3.js" defer></script>
     <script src="explorer.js" defer></script>
   </head>
   <body>
@@ -65,11 +66,11 @@ curl --fail --silent --show-error \
           <div>
             <p class="eyebrow">Interactive tool</p>
             <h2 id="explorer-heading">Problem Explorer</h2>
-            <p>Choose matrix and RHS generators, inspect the sparsity pattern, then connect your solver to the validation workflow.</p>
+            <p>Choose matrix and RHS generators, actualize the matrix from a reproducible seed, then connect your solver to the validation workflow.</p>
           </div>
           <div class="legend" aria-label="Spy plot legend">
-            <span><i class="swatch diagonal"></i> diagonal</span>
-            <span><i class="swatch off-diagonal"></i> <span id="off-diagonal-legend">off-diagonal</span></span>
+            <span><i class="swatch positive"></i> positive</span>
+            <span><i class="swatch negative"></i> negative</span>
           </div>
         </div>
 
@@ -83,6 +84,18 @@ curl --fail --silent --show-error \
                 <option value="seeded-nonsymmetric-row-sparse-v1">Seeded nonsymmetric row-sparse v1</option>
               </select>
             </label>
+
+            <div class="seed-control">
+              <label>
+                Preview and local instance seed
+                <input id="instance-seed" name="instanceSeed" type="text" value="0101010101010101010101010101010101010101010101010101010101010101" minlength="64" maxlength="64" inputmode="text" autocomplete="off" autocapitalize="none" spellcheck="false">
+              </label>
+              <button id="new-seed" type="button">New seed</button>
+            </div>
+            <p class="control-note seed-note">
+              Exactly 64 lowercase hexadecimal characters. The plot is exact for the local
+              template; a signed server challenge derives its own final seed.
+            </p>
 
             <label id="offsets-control" hidden>
               Positive offsets
@@ -192,8 +205,8 @@ curl --fail --silent --show-error \
               <strong id="plot-title">16 × 16</strong>
               <span id="plot-summary">46 structural nonzeros · 18.0% density</span>
             </div>
-            <canvas id="spy-plot" width="640" height="640" aria-label="Matrix sparsity spy plot"></canvas>
-            <p id="plot-note" class="plot-note">Rows run top to bottom; columns run left to right. Values vary with the finalized seed, but this family’s sparsity pattern does not.</p>
+            <canvas id="spy-plot" width="640" height="640" aria-label="Actualized matrix plot"></canvas>
+            <p id="plot-note" class="plot-note">The matrix is being actualized from the selected seed.</p>
           </div>
         </div>
 

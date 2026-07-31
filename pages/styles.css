@@ -77,15 +77,18 @@ pre {
 .eyebrow { text-transform: uppercase; letter-spacing: .12em; font-size: .72rem; font-weight: 700; }
 .legend { display: flex; gap: 16px; font-size: .8rem; white-space: nowrap; }
 .swatch { display: inline-block; width: 9px; height: 9px; margin-right: 4px; border-radius: 2px; }
-.swatch.diagonal { background: #fff; }
-.swatch.off-diagonal { background: #ff8052; }
-.swatch.off-diagonal.eligible { background: #efb39d; }
+.swatch.positive { background: #d7def0; }
+.swatch.negative { background: #ff8052; }
 
 .explorer-grid { display: grid; grid-template-columns: minmax(250px, 330px) 1fr; }
 .controls { padding: 24px; border-right: 1px solid var(--line); background: #fff; }
 .controls label, .host-config label, .template-actions label { display: grid; gap: 5px; font-size: .78rem; font-weight: 700; color: #343a49; }
 .controls > label, .control-row { margin-bottom: 16px; }
 .control-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.seed-control { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 8px; margin-bottom: 8px; }
+.seed-control input { font: .72rem/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.seed-control button { padding: 8px 12px; border: 1px solid var(--accent); border-radius: 4px; color: #fff; background: var(--accent); cursor: pointer; }
+.seed-note { overflow-wrap: anywhere; }
 input, select, button { font: inherit; }
 input, select {
   width: 100%;
@@ -145,5 +148,6 @@ footer { margin-top: 48px; padding: 18px 0 40px; border-top: 1px solid var(--lin
 
 @media (max-width: 420px) {
   .control-row { grid-template-columns: 1fr; }
+  .seed-control { grid-template-columns: 1fr; }
   .legend { flex-direction: column; gap: 3px; }
 }
