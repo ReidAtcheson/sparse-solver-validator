@@ -2,6 +2,7 @@
 
 const TRIDIAGONAL_FAMILY = "seeded-symmetric-tridiagonal-v1";
 const DIA_FAMILY = "seeded-symmetric-dia-laplacian-v1";
+const SEEDED_RHS_FAMILY = "seeded-periodic-dyadic-v1";
 const MAX_SAFE_MANTISSA = 9007199254740991;
 const MAX_DIA_OFFSETS = 16;
 const LOCAL_SEED = "0101010101010101010101010101010101010101010101010101010101010101";
@@ -22,8 +23,20 @@ function validationError(p) {
   if (p.family !== TRIDIAGONAL_FAMILY && p.family !== DIA_FAMILY) {
     return "Select a registered matrix family.";
   }
+  if (p.rhs !== SEEDED_RHS_FAMILY) return "Select a registered right-hand-side family.";
 
-  const integers = [p.dimension, p.periodBits, p.fractionalBits, p.margin, p.minimum, p.maximum];
+  const integers = [
+    p.dimension,
+    p.periodBits,
+    p.fractionalBits,
+    p.margin,
+    p.minimum,
+    p.maximum,
+    p.rhsPeriodBits,
+    p.rhsFractionalBits,
+    p.rhsMinimum,
+    p.rhsMaximum,
+  ];
   if (!integers.every(Number.isSafeInteger)) return "All generator parameters must be integers.";
   if (p.dimension < 2 || p.dimension > 128) return "Visualization dimension must be between 2 and 128.";
   if (p.periodBits < 0 || p.periodBits > 16) return "Period bits must be between 0 and 16.";
@@ -31,6 +44,19 @@ function validationError(p) {
   if (p.minimum < 1 || p.minimum > p.maximum) return "Magnitudes must satisfy 1 ≤ minimum ≤ maximum.";
   if (p.maximum > MAX_SAFE_MANTISSA || p.margin < 1 || p.margin > MAX_SAFE_MANTISSA) {
     return "Mantissas must fit exactly in binary64.";
+  }
+  if (p.rhsPeriodBits < 0 || p.rhsPeriodBits > 16) {
+    return "RHS period bits must be between 0 and 16.";
+  }
+  if (p.rhsFractionalBits < 0 || p.rhsFractionalBits > 52) {
+    return "RHS fractional bits must be between 0 and 52.";
+  }
+  if (p.rhsMinimum > p.rhsMaximum) {
+    return "RHS mantissas must satisfy minimum ≤ maximum.";
+  }
+  if (Math.abs(p.rhsMinimum) > MAX_SAFE_MANTISSA
+      || Math.abs(p.rhsMaximum) > MAX_SAFE_MANTISSA) {
+    return "RHS mantissas must fit exactly in binary64.";
   }
 
   if (p.family === DIA_FAMILY) {
@@ -88,6 +114,16 @@ function matrixSpec(p) {
   };
 }
 
+function rhsSpec(p) {
+  return {
+    kind: p.rhs,
+    period_bits: p.rhsPeriodBits,
+    fractional_bits: p.rhsFractionalBits,
+    minimum_mantissa: String(p.rhsMinimum),
+    maximum_mantissa: String(p.rhsMaximum),
+  };
+}
+
 function problemTemplate(p, kind) {
   const randomness = kind === "challenge"
     ? { kind: "challenge-derived-v1", derivation: "blake3-xof-v1" }
@@ -96,7 +132,7 @@ function problemTemplate(p, kind) {
     schema: "sparse-solve/problem-template/v1",
     randomness,
     matrix: matrixSpec(p),
-    rhs: { kind: p.rhs },
+    rhs: rhsSpec(p),
     requested_outputs: [{ kind: "squared-l2-residual-v1" }],
   };
 }
@@ -104,6 +140,81 @@ function problemTemplate(p, kind) {
 function structuralNonzeros(p) {
   return p.dimension + matrixOffsets(p)
     .reduce((total, offset) => total + (2 * (p.dimension - offset)), 0);
+}
+
+function solverHandoff() {
+  return `cargo run -p sparse-problem -- export \\
+  --problem /tmp/problem.json \\
+  --matrix /tmp/A.mtx \\
+  --rhs /tmp/b.mtx
+
+# Solve A x = b here with any sparse solver.
+# Write /tmp/x.json in this prover input format (the values shown are only a
+# three-entry example; provide exactly one finite binary64 decimal string per unknown):
+# {"schema":"sparse-solve/solution/binary64-v1","values":["1.0","-2.5","0"]}`;
+}
+
+function localWorkflow() {
+  return `# Save the Local template from this explorer as /tmp/template.json.
+cargo run -p sparse-problem -- finalize-local \\
+  --template /tmp/template.json \\
+  --problem /tmp/problem.json
+
+${solverHandoff()}
+
+cargo run --release -p sparse-prover -- prove \\
+  --problem /tmp/problem.json \\
+  --validation examples/direct-validation.json \\
+  --solution /tmp/x.json \\
+  --proof /tmp/validation.proof
+
+cargo run --release -p sparse-validator -- verify \\
+  --proof /tmp/validation.proof \\
+  --allow-literal`;
+}
+
+function hostedWorkflow({ serviceUrl, issuer, keyId, publicKey, privateService }) {
+  const authOption = privateService
+    ? ` --header="Authorization: Bearer $(gcloud auth print-identity-token)"`
+    : "";
+  return `# Save the Server template from this explorer as /tmp/template.json.
+export SERVICE_URL="${serviceUrl}"
+
+# The service signs fresh issued-at and expiry timestamps into this challenge.
+curl --fail --silent --show-error${authOption} \\
+  -H 'content-type: application/json' \\
+  --data-binary @/tmp/template.json \\
+  "\${SERVICE_URL}/v1/challenges" \\
+  -o /tmp/challenge.json
+
+cargo run -p sparse-problem -- finalize-challenge \\
+  --template /tmp/template.json \\
+  --challenge /tmp/challenge.json \\
+  --public-key "${publicKey}" \\
+  --issuer "${issuer}" \\
+  --key-id "${keyId}" \\
+  --problem /tmp/problem.json
+
+${solverHandoff()}
+
+cargo run --release -p sparse-prover -- prove \\
+  --problem /tmp/problem.json \\
+  --validation examples/direct-validation.json \\
+  --solution /tmp/x.json \\
+  --challenge /tmp/challenge.json \\
+  --proof /tmp/validation.proof
+
+curl --fail --silent --show-error${authOption} \\
+  -H 'content-type: application/octet-stream' \\
+  --data-binary @/tmp/validation.proof \\
+  "\${SERVICE_URL}/v1/validate" \\
+  -o /tmp/certificate.json
+
+cargo run -p sparse-validator -- verify-certificate \\
+  --certificate /tmp/certificate.json \\
+  --public-key "${publicKey}" \\
+  --issuer "${issuer}" \\
+  --key-id "${keyId}"`;
 }
 
 function initialize() {
@@ -141,6 +252,10 @@ function initialize() {
       minimum: numberValue("minimum"),
       maximum: numberValue("maximum"),
       rhs: document.querySelector("#rhs").value,
+      rhsPeriodBits: numberValue("rhs-period-bits"),
+      rhsFractionalBits: numberValue("rhs-fractional-bits"),
+      rhsMinimum: numberValue("rhs-minimum"),
+      rhsMaximum: numberValue("rhs-maximum"),
     };
   }
 
@@ -205,76 +320,6 @@ function initialize() {
       : "Rows run top to bottom; columns run left to right. Values vary with the finalized seed, but this family’s sparsity pattern does not.";
   }
 
-  function localWorkflow() {
-    return `# Save the Local template from this explorer as /tmp/template.json.
-cargo run -p sparse-problem -- finalize-local \\
-  --template /tmp/template.json \\
-  --problem /tmp/problem.json
-
-# Replace this fixture helper with your solver for a real workflow.
-cargo run -p sparse-problem -- manufactured-solution \\
-  --problem /tmp/problem.json \\
-  --solution /tmp/x.json
-
-cargo run --release -p sparse-prover -- prove \\
-  --problem /tmp/problem.json \\
-  --validation examples/direct-validation.json \\
-  --solution /tmp/x.json \\
-  --proof /tmp/validation.proof
-
-cargo run --release -p sparse-validator -- verify \\
-  --proof /tmp/validation.proof \\
-  --allow-literal`;
-  }
-
-  function hostedWorkflow() {
-    const [serviceUrl, issuer, keyId, publicKey] = hostInputs.map((input) => input.value.trim());
-    const authOption = privateService.checked
-      ? ` --header="Authorization: Bearer $(gcloud auth print-identity-token)"`
-      : "";
-    return `# Save the Server template from this explorer as /tmp/template.json.
-export SERVICE_URL="${serviceUrl}"
-
-# The service signs fresh issued-at and expiry timestamps into this challenge.
-curl --fail --silent --show-error${authOption} \\
-  -H 'content-type: application/json' \\
-  --data-binary @/tmp/template.json \\
-  "\${SERVICE_URL}/v1/challenges" \\
-  -o /tmp/challenge.json
-
-cargo run -p sparse-problem -- finalize-challenge \\
-  --template /tmp/template.json \\
-  --challenge /tmp/challenge.json \\
-  --public-key "${publicKey}" \\
-  --issuer "${issuer}" \\
-  --key-id "${keyId}" \\
-  --problem /tmp/problem.json
-
-# Replace this fixture helper with your solver for a real workflow.
-cargo run -p sparse-problem -- manufactured-solution \\
-  --problem /tmp/problem.json \\
-  --solution /tmp/x.json
-
-cargo run --release -p sparse-prover -- prove \\
-  --problem /tmp/problem.json \\
-  --validation examples/direct-validation.json \\
-  --solution /tmp/x.json \\
-  --challenge /tmp/challenge.json \\
-  --proof /tmp/validation.proof
-
-curl --fail --silent --show-error${authOption} \\
-  -H 'content-type: application/octet-stream' \\
-  --data-binary @/tmp/validation.proof \\
-  "\${SERVICE_URL}/v1/validate" \\
-  -o /tmp/certificate.json
-
-cargo run -p sparse-validator -- verify-certificate \\
-  --certificate /tmp/certificate.json \\
-  --public-key "${publicKey}" \\
-  --issuer "${issuer}" \\
-  --key-id "${keyId}"`;
-  }
-
   function update() {
     const p = parameters();
     updateFamilyControls(p);
@@ -284,7 +329,14 @@ cargo run -p sparse-validator -- verify-certificate \\
     if (error) return;
     drawPlot(p);
     localCode.textContent = localWorkflow();
-    hostedCode.textContent = hostedWorkflow();
+    const [serviceUrl, issuer, keyId, publicKey] = hostInputs.map((input) => input.value.trim());
+    hostedCode.textContent = hostedWorkflow({
+      serviceUrl,
+      issuer,
+      keyId,
+      publicKey,
+      privateService: privateService.checked,
+    });
     templateCode.textContent = `${JSON.stringify(problemTemplate(p, templateKind.value), null, 2)}\n`;
   }
 
@@ -336,11 +388,16 @@ if (typeof module !== "undefined" && module.exports) {
     DIA_FAMILY,
     MAX_DIA_OFFSETS,
     MAX_SAFE_MANTISSA,
+    SEEDED_RHS_FAMILY,
     TRIDIAGONAL_FAMILY,
+    hostedWorkflow,
+    localWorkflow,
     matrixOffsets,
     matrixSpec,
     parseOffsets,
     problemTemplate,
+    rhsSpec,
+    solverHandoff,
     structuralNonzeros,
     validationError,
   };

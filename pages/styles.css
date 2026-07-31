@@ -106,6 +106,12 @@ small { color: var(--muted); font-weight: 400; }
 .plot-note { margin: 12px auto 0; max-width: 540px; color: var(--muted); font-size: .75rem; }
 
 .output-panel { border-top: 1px solid var(--line); background: #fff; }
+.solver-handoff { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(260px, .75fr); gap: 20px; padding: 20px; border-bottom: 1px solid var(--line); background: #f8f9fc; }
+.solver-handoff h3 { margin: 0 0 8px; font-size: 1rem; }
+.solver-handoff p { margin-bottom: 8px; color: #4b5261; font-size: .82rem; }
+.solver-handoff p:last-child { margin-bottom: 0; }
+.solver-handoff .example-label { margin-bottom: 4px; color: #343a49; font-weight: 700; }
+.solver-handoff pre { padding: 10px; font-size: .72rem; }
 .tabs { display: flex; padding: 0 20px; border-bottom: 1px solid var(--line); background: #eef0f4; }
 .tabs button { padding: 12px 16px; border: 0; border-bottom: 3px solid transparent; background: transparent; color: #4b5261; cursor: pointer; }
 .tabs button[aria-selected="true"] { border-bottom-color: var(--accent); color: var(--accent-dark); font-weight: 700; }
@@ -130,6 +136,7 @@ footer { margin-top: 48px; padding: 18px 0 40px; border-top: 1px solid var(--lin
   .explorer-grid { grid-template-columns: 1fr; }
   .controls { border-right: 0; border-bottom: 1px solid var(--line); }
   .host-config { grid-template-columns: 1fr; }
+  .solver-handoff { grid-template-columns: 1fr; }
   .tabs { padding: 0; overflow-x: auto; }
   .tabs button { flex: 1; white-space: nowrap; }
 }

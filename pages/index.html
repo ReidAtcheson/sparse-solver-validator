@@ -64,8 +64,8 @@ curl --fail --silent --show-error \
         <div class="explorer-intro">
           <div>
             <p class="eyebrow">Interactive tool</p>
-            <h2 id="explorer-heading">Matrix Explorer</h2>
-            <p>Choose a generator, inspect its sparsity pattern, then copy a runnable workflow.</p>
+            <h2 id="explorer-heading">Problem Explorer</h2>
+            <p>Choose matrix and RHS generators, inspect the sparsity pattern, then connect your solver to the validation workflow.</p>
           </div>
           <div class="legend" aria-label="Spy plot legend">
             <span><i class="swatch diagonal"></i> diagonal</span>
@@ -125,11 +125,35 @@ curl --fail --silent --show-error \
             </div>
 
             <label>
-              Right-hand side
+              Right-hand-side family
               <select id="rhs" name="rhs">
-                <option value="manufactured-ones-v1">Manufactured ones (x = 1)</option>
+                <option value="seeded-periodic-dyadic-v1">Seeded periodic dyadic v1</option>
               </select>
+              <small>Generated from a seed stream domain-separated from the matrix</small>
             </label>
+
+            <div class="control-row">
+              <label>
+                RHS period bits
+                <input id="rhs-period-bits" name="rhsPeriodBits" type="number" min="0" max="16" value="4">
+                <small>The generated table has 2<sup>k</sup> entries</small>
+              </label>
+              <label>
+                RHS fractional bits
+                <input id="rhs-fractional-bits" name="rhsFractionalBits" type="number" min="0" max="52" value="8">
+              </label>
+            </div>
+
+            <div class="control-row">
+              <label>
+                Minimum RHS mantissa
+                <input id="rhs-minimum" name="rhsMinimum" type="number" min="-9007199254740991" max="9007199254740991" value="-16">
+              </label>
+              <label>
+                Maximum RHS mantissa
+                <input id="rhs-maximum" name="rhsMaximum" type="number" min="-9007199254740991" max="9007199254740991" value="19">
+              </label>
+            </div>
 
             <p id="form-error" class="form-error" role="alert" hidden></p>
           </form>
@@ -145,6 +169,29 @@ curl --fail --silent --show-error \
         </div>
 
         <div class="output-panel">
+          <section class="solver-handoff" aria-labelledby="solver-handoff-heading">
+            <div>
+              <h3 id="solver-handoff-heading">Solve your system here</h3>
+              <p>
+                The finalized generator defines <var>A</var> and <var>b</var> without embedding a
+                known solution. Export the Matrix Market files, solve <var>Ax</var> = <var>b</var>
+                with your solver, and pass its solution JSON to <code>sparse-prover</code>.
+              </p>
+              <p>
+                <code>values</code> must contain exactly one finite binary64 decimal string per
+                unknown. JSON numbers, NaN, infinity, negative zero, and subnormal values are not
+                accepted.
+              </p>
+            </div>
+            <div>
+              <p class="example-label">Three-entry format example</p>
+              <pre><code>{
+  "schema": "sparse-solve/solution/binary64-v1",
+  "values": ["1.0", "-2.5", "0"]
+}</code></pre>
+            </div>
+          </section>
+
           <div class="tabs" role="tablist" aria-label="Generated output">
             <button type="button" role="tab" aria-selected="true" aria-controls="local-panel" id="local-tab" data-tab="local">Local</button>
             <button type="button" role="tab" aria-selected="false" aria-controls="hosted-panel" id="hosted-tab" data-tab="hosted">Server validated</button>
