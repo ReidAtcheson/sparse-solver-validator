@@ -14,6 +14,14 @@ const NONSYMMETRIC_OFF_DIAGONAL_VALUES_LABEL: &str =
     "matrix/seeded-nonsymmetric-row-sparse-v1/off-diagonal-values";
 const NONSYMMETRIC_DIAGONAL_VALUES_LABEL: &str =
     "matrix/seeded-nonsymmetric-row-sparse-v1/diagonal-values";
+const PROJECTED_NONSYMMETRIC_PROJECTIONS_LABEL: &str =
+    "matrix/seeded-nonsymmetric-row-sparse-v2/projections";
+const PROJECTED_NONSYMMETRIC_STRUCTURE_LABEL: &str =
+    "matrix/seeded-nonsymmetric-row-sparse-v2/structure";
+const PROJECTED_NONSYMMETRIC_OFF_DIAGONAL_VALUES_LABEL: &str =
+    "matrix/seeded-nonsymmetric-row-sparse-v2/off-diagonal-values";
+const PROJECTED_NONSYMMETRIC_DIAGONAL_VALUES_LABEL: &str =
+    "matrix/seeded-nonsymmetric-row-sparse-v2/diagonal-values";
 const RHS_VALUES_LABEL: &str = "rhs/seeded-periodic-dyadic-v1/values";
 const UNBIASED_STREAM_CONTEXT: &str = "sparse-solve/unbiased-u64-stream/v1";
 
@@ -40,7 +48,8 @@ pub struct GeneratorCertificate {
     ///
     /// This is the table period for the legacy tridiagonal family and the sum
     /// of active per-offset patterns for the DIA family. For generated sparse
-    /// rows it is the active row-pattern count times the requested row width.
+    /// rows it is the active row-pattern count times the requested row width;
+    /// projected rows report every per-slot lookup-table pattern.
     pub matrix_period: usize,
     pub coefficient_fractional_bits: u8,
     pub minimum_off_diagonal_magnitude_mantissa: u64,
@@ -71,7 +80,7 @@ pub trait SparseMatrix {
     fn row(&self, row: usize) -> Option<Self::Row<'_>>;
 }
 
-/// A validated, compiled problem backed only by bounded periodic tables.
+/// A validated, compiled problem backed only by bounded generator tables.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GeneratedProblem {
     problem_digest: ProblemDigest,
@@ -86,6 +95,7 @@ pub(crate) enum CompiledMatrixFamily {
     Tridiagonal(PeriodicSymmetricTridiagonal),
     SymmetricDiaLaplacian(PeriodicSymmetricDiaLaplacian),
     NonsymmetricRowSparse(PeriodicNonsymmetricRowSparse),
+    ProjectedNonsymmetricRowSparse(ProjectedNonsymmetricRowSparse),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,6 +140,25 @@ pub(crate) struct PeriodicNonsymmetricRowSparse {
     pub(crate) dimension: usize,
     pub(crate) fractional_bits: u8,
     pub(crate) off_diagonals_per_pattern: usize,
+    pub(crate) signed_offsets: Box<[i32]>,
+    pub(crate) off_diagonal_mantissas: Box<[i64]>,
+    pub(crate) diagonal_mantissas: Box<[i64]>,
+}
+
+/// Sparse rows selected by independent projections of the row-index bits.
+///
+/// Tables are slot-major. Slot zero is the required diagonal; every remaining
+/// slot owns one projection, one signed-offset table, and one coefficient
+/// table. Offset slots draw from disjoint increasing buckets, so their realized
+/// columns are duplicate-free and ordered for every row. `projection_bits`
+/// stores least-significant row-bit positions in pattern-bit order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectedNonsymmetricRowSparse {
+    pub(crate) dimension: usize,
+    pub(crate) fractional_bits: u8,
+    pub(crate) pattern_bits: usize,
+    pub(crate) row_width: usize,
+    pub(crate) projection_bits: Box<[u8]>,
     pub(crate) signed_offsets: Box<[i32]>,
     pub(crate) off_diagonal_mantissas: Box<[i64]>,
     pub(crate) diagonal_mantissas: Box<[i64]>,
@@ -187,6 +216,7 @@ enum MatrixRowInner<'a> {
     Tridiagonal(TridiagonalMatrixRow),
     SymmetricDiaLaplacian(DiaMatrixRow<'a>),
     NonsymmetricRowSparse(NonsymmetricMatrixRow<'a>),
+    ProjectedNonsymmetricRowSparse(ProjectedNonsymmetricMatrixRow<'a>),
 }
 
 #[derive(Clone, Debug)]
@@ -380,6 +410,84 @@ impl<'a> NonsymmetricMatrixRow<'a> {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ProjectedNonsymmetricMatrixRow<'a> {
+    matrix: &'a ProjectedNonsymmetricRowSparse,
+    row: usize,
+    valid_start: usize,
+    diagonal_position: usize,
+    front: usize,
+    back: usize,
+}
+
+impl<'a> ProjectedNonsymmetricMatrixRow<'a> {
+    fn new(matrix: &'a ProjectedNonsymmetricRowSparse, row: usize) -> Self {
+        let minimum_offset = -i64::try_from(row).expect("validated row fits i64");
+        let maximum_offset =
+            i64::try_from(matrix.dimension - row).expect("validated dimension fits i64");
+        let mut valid_start = 0;
+        while valid_start < matrix.off_diagonal_slots()
+            && i64::from(matrix.row_signed_offset(row, valid_start)) < minimum_offset
+        {
+            valid_start += 1;
+        }
+        let mut diagonal_slot = valid_start;
+        while diagonal_slot < matrix.off_diagonal_slots()
+            && matrix.row_signed_offset(row, diagonal_slot) < 0
+        {
+            diagonal_slot += 1;
+        }
+        let mut valid_end = diagonal_slot;
+        while valid_end < matrix.off_diagonal_slots()
+            && i64::from(matrix.row_signed_offset(row, valid_end)) < maximum_offset
+        {
+            valid_end += 1;
+        }
+        let diagonal_position = diagonal_slot - valid_start;
+        Self {
+            matrix,
+            row,
+            valid_start,
+            diagonal_position,
+            front: 0,
+            back: valid_end - valid_start + 1,
+        }
+    }
+
+    fn entry_at(&self, position: usize) -> MatrixEntry {
+        if position == self.diagonal_position {
+            let pattern = self.matrix.row_pattern(self.row, 0);
+            return MatrixEntry {
+                column: self.row,
+                value: Dyadic::new(
+                    self.matrix.diagonal_mantissas[pattern],
+                    self.matrix.fractional_bits,
+                ),
+            };
+        }
+        let slot = if position < self.diagonal_position {
+            self.valid_start + position
+        } else {
+            self.valid_start + position - 1
+        };
+        let table_index = self.matrix.row_off_diagonal_table_index(self.row, slot);
+        let signed_offset = self.matrix.signed_offsets[table_index];
+        let column = self
+            .row
+            .checked_add_signed(
+                isize::try_from(signed_offset).expect("validated signed offset fits isize"),
+            )
+            .expect("row constructor filtered boundary offsets");
+        MatrixEntry {
+            column,
+            value: Dyadic::new(
+                self.matrix.off_diagonal_mantissas[table_index],
+                self.matrix.fractional_bits,
+            ),
+        }
+    }
+}
+
 impl MatrixRow<'_> {
     fn tridiagonal(matrix: &PeriodicSymmetricTridiagonal, row: usize) -> Self {
         Self {
@@ -396,6 +504,17 @@ impl MatrixRow<'_> {
     fn nonsymmetric(matrix: &PeriodicNonsymmetricRowSparse, row: usize) -> MatrixRow<'_> {
         MatrixRow {
             inner: MatrixRowInner::NonsymmetricRowSparse(NonsymmetricMatrixRow::new(matrix, row)),
+        }
+    }
+
+    fn projected_nonsymmetric(
+        matrix: &ProjectedNonsymmetricRowSparse,
+        row: usize,
+    ) -> MatrixRow<'_> {
+        MatrixRow {
+            inner: MatrixRowInner::ProjectedNonsymmetricRowSparse(
+                ProjectedNonsymmetricMatrixRow::new(matrix, row),
+            ),
         }
     }
 }
@@ -508,6 +627,42 @@ impl ExactSizeIterator for NonsymmetricMatrixRow<'_> {
 
 impl FusedIterator for NonsymmetricMatrixRow<'_> {}
 
+impl Iterator for ProjectedNonsymmetricMatrixRow<'_> {
+    type Item = MatrixEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.front == self.back {
+            return None;
+        }
+        let entry = self.entry_at(self.front);
+        self.front += 1;
+        Some(entry)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl DoubleEndedIterator for ProjectedNonsymmetricMatrixRow<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.front == self.back {
+            return None;
+        }
+        self.back -= 1;
+        Some(self.entry_at(self.back))
+    }
+}
+
+impl ExactSizeIterator for ProjectedNonsymmetricMatrixRow<'_> {
+    fn len(&self) -> usize {
+        self.back - self.front
+    }
+}
+
+impl FusedIterator for ProjectedNonsymmetricMatrixRow<'_> {}
+
 impl Iterator for MatrixRow<'_> {
     type Item = MatrixEntry;
 
@@ -516,6 +671,7 @@ impl Iterator for MatrixRow<'_> {
             MatrixRowInner::Tridiagonal(row) => row.next(),
             MatrixRowInner::SymmetricDiaLaplacian(row) => row.next(),
             MatrixRowInner::NonsymmetricRowSparse(row) => row.next(),
+            MatrixRowInner::ProjectedNonsymmetricRowSparse(row) => row.next(),
         }
     }
 
@@ -531,6 +687,7 @@ impl DoubleEndedIterator for MatrixRow<'_> {
             MatrixRowInner::Tridiagonal(row) => row.next_back(),
             MatrixRowInner::SymmetricDiaLaplacian(row) => row.next_back(),
             MatrixRowInner::NonsymmetricRowSparse(row) => row.next_back(),
+            MatrixRowInner::ProjectedNonsymmetricRowSparse(row) => row.next_back(),
         }
     }
 }
@@ -541,6 +698,7 @@ impl ExactSizeIterator for MatrixRow<'_> {
             MatrixRowInner::Tridiagonal(row) => row.len(),
             MatrixRowInner::SymmetricDiaLaplacian(row) => row.len(),
             MatrixRowInner::NonsymmetricRowSparse(row) => row.len(),
+            MatrixRowInner::ProjectedNonsymmetricRowSparse(row) => row.len(),
         }
     }
 }
@@ -685,11 +843,12 @@ impl GeneratedProblem {
         self.rhs(row).map(Dyadic::to_f64)
     }
 
-    /// Flat periodic matrix values in compiled-family order.
+    /// Flat generated matrix values in compiled-family order.
     ///
     /// The legacy tridiagonal has one table. DIA families concatenate one
     /// table per increasing positive-offset descriptor. The nonsymmetric
-    /// family stores pattern-major off-diagonal values; its diagonal table is
+    /// v1 nonsymmetric rows store pattern-major off-diagonal values, while v2
+    /// stores slot-major projected values. Their diagonal tables are
     /// intentionally separate and not returned here.
     #[must_use]
     pub fn off_diagonal_periodic_mantissas(&self) -> &[i64] {
@@ -754,12 +913,50 @@ impl PeriodicNonsymmetricRowSparse {
     }
 }
 
+impl ProjectedNonsymmetricRowSparse {
+    pub(crate) fn pattern_count(&self) -> usize {
+        self.diagonal_mantissas.len()
+    }
+
+    pub(crate) fn off_diagonal_slots(&self) -> usize {
+        self.row_width - 1
+    }
+
+    pub(crate) fn slot_projection(&self, slot: usize) -> &[u8] {
+        let start = slot * self.pattern_bits;
+        &self.projection_bits[start..start + self.pattern_bits]
+    }
+
+    pub(crate) fn row_pattern(&self, row: usize, slot: usize) -> usize {
+        self.slot_projection(slot).iter().enumerate().fold(
+            0_usize,
+            |pattern, (pattern_bit, &row_bit)| {
+                pattern | (((row >> usize::from(row_bit)) & 1) << pattern_bit)
+            },
+        )
+    }
+
+    pub(crate) fn off_diagonal_table_index(&self, slot: usize, pattern: usize) -> usize {
+        slot * self.pattern_count() + pattern
+    }
+
+    fn row_off_diagonal_table_index(&self, row: usize, slot: usize) -> usize {
+        let pattern = self.row_pattern(row, slot + 1);
+        self.off_diagonal_table_index(slot, pattern)
+    }
+
+    fn row_signed_offset(&self, row: usize, slot: usize) -> i32 {
+        self.signed_offsets[self.row_off_diagonal_table_index(row, slot)]
+    }
+}
+
 impl CompiledMatrixFamily {
     pub(crate) fn dimension(&self) -> usize {
         match self {
             Self::Tridiagonal(matrix) => matrix.dimension,
             Self::SymmetricDiaLaplacian(matrix) => matrix.dimension,
             Self::NonsymmetricRowSparse(matrix) => matrix.dimension,
+            Self::ProjectedNonsymmetricRowSparse(matrix) => matrix.dimension,
         }
     }
 
@@ -768,6 +965,9 @@ impl CompiledMatrixFamily {
             Self::Tridiagonal(matrix) => MatrixRow::tridiagonal(matrix, row),
             Self::SymmetricDiaLaplacian(matrix) => MatrixRow::dia(matrix, row),
             Self::NonsymmetricRowSparse(matrix) => MatrixRow::nonsymmetric(matrix, row),
+            Self::ProjectedNonsymmetricRowSparse(matrix) => {
+                MatrixRow::projected_nonsymmetric(matrix, row)
+            }
         }
     }
 
@@ -776,6 +976,7 @@ impl CompiledMatrixFamily {
             Self::Tridiagonal(_) => 1,
             Self::SymmetricDiaLaplacian(_) => 2,
             Self::NonsymmetricRowSparse(_) => 3,
+            Self::ProjectedNonsymmetricRowSparse(_) => 4,
         }
     }
 
@@ -788,6 +989,7 @@ impl CompiledMatrixFamily {
             Self::Tridiagonal(_) => certificate.matrix_period.min(padded_dimension),
             Self::SymmetricDiaLaplacian(_) => certificate.matrix_period,
             Self::NonsymmetricRowSparse(_) => certificate.matrix_period,
+            Self::ProjectedNonsymmetricRowSparse(_) => certificate.matrix_period,
         }
     }
 
@@ -802,7 +1004,7 @@ impl CompiledMatrixFamily {
                     .expect("validated diagonal shift fits i64"),
                 matrix.fractional_bits,
             )),
-            Self::NonsymmetricRowSparse(_) => None,
+            Self::NonsymmetricRowSparse(_) | Self::ProjectedNonsymmetricRowSparse(_) => None,
         }
     }
 
@@ -811,6 +1013,7 @@ impl CompiledMatrixFamily {
             Self::Tridiagonal(matrix) => &matrix.off_diagonal_mantissas,
             Self::SymmetricDiaLaplacian(matrix) => &matrix.off_diagonal_mantissas,
             Self::NonsymmetricRowSparse(matrix) => &matrix.off_diagonal_mantissas,
+            Self::ProjectedNonsymmetricRowSparse(matrix) => &matrix.off_diagonal_mantissas,
         }
     }
 }
@@ -1171,7 +1374,235 @@ fn compile_matrix(
             };
             Ok((CompiledMatrixFamily::NonsymmetricRowSparse(matrix), facts))
         }
+        MatrixSpec::SeededNonsymmetricRowSparseV2 { .. } => {
+            compile_projected_nonsymmetric(spec, instance_seed)
+        }
     }
+}
+
+fn compile_projected_nonsymmetric(
+    spec: &MatrixSpec,
+    instance_seed: InstanceSeed,
+) -> Result<(CompiledMatrixFamily, MatrixFacts), ProblemError> {
+    let MatrixSpec::SeededNonsymmetricRowSparseV2 {
+        dimension,
+        boundary,
+        row_pattern_bits,
+        maximum_half_bandwidth,
+        maximum_nonzeros_per_row,
+        fractional_bits,
+        minimum_mantissa,
+        maximum_mantissa,
+    } = spec
+    else {
+        unreachable!("projected compiler called for another matrix family")
+    };
+    let dimension = usize::try_from(*dimension).map_err(|_| {
+        ProblemError::IntegerOverflow("compiled projected nonsymmetric matrix dimension")
+    })?;
+    let maximum_half_bandwidth = usize::try_from(*maximum_half_bandwidth).map_err(|_| {
+        ProblemError::IntegerOverflow("compiled projected nonsymmetric half bandwidth")
+    })?;
+    let row_width = usize::from(*maximum_nonzeros_per_row);
+    let off_diagonal_slots = row_width - 1;
+    let row_index_bits = dimension.next_power_of_two().ilog2() as usize;
+    let pattern_bits = usize::from(*row_pattern_bits).min(row_index_bits);
+    let pattern_count = 1_usize << pattern_bits;
+    let total_off_diagonals =
+        pattern_count
+            .checked_mul(off_diagonal_slots)
+            .ok_or(ProblemError::IntegerOverflow(
+                "compiled projected nonsymmetric table entries",
+            ))?;
+
+    let projection_seed = derive_subseed(instance_seed, PROJECTED_NONSYMMETRIC_PROJECTIONS_LABEL);
+    let mut projection_stream = UniformStream::new(projection_seed);
+    let mut row_bit_permutation = Vec::new();
+    row_bit_permutation
+        .try_reserve_exact(row_index_bits)
+        .map_err(|_| ProblemError::AllocationFailed)?;
+    for bit in 0..row_index_bits {
+        row_bit_permutation.push(u8::try_from(bit).expect("validated row bit fits u8"));
+    }
+    for upper in (1..row_index_bits).rev() {
+        let selected = usize::try_from(
+            projection_stream
+                .sample_below(u64::try_from(upper + 1).expect("row-index bit count fits u64")),
+        )
+        .expect("sampled row-index bit fits usize");
+        row_bit_permutation.swap(upper, selected);
+    }
+    let projection_elements =
+        row_width
+            .checked_mul(pattern_bits)
+            .ok_or(ProblemError::IntegerOverflow(
+                "compiled projected row-bit positions",
+            ))?;
+    let mut projection_bits = Vec::new();
+    projection_bits
+        .try_reserve_exact(projection_elements)
+        .map_err(|_| ProblemError::AllocationFailed)?;
+    for slot in 0..row_width {
+        let window_start = slot * pattern_bits;
+        let rotation = slot % pattern_bits;
+        for pattern_bit in 0..pattern_bits {
+            let within_window = (pattern_bit + rotation) % pattern_bits;
+            projection_bits
+                .push(row_bit_permutation[(window_start + within_window) % row_index_bits]);
+        }
+    }
+    debug_assert!((0..row_index_bits).all(|bit| {
+        projection_bits
+            .iter()
+            .any(|&projected| usize::from(projected) == bit)
+    }));
+
+    let buckets = projected_offset_buckets(maximum_half_bandwidth, off_diagonal_slots)?;
+    let structure_seed = derive_subseed(instance_seed, PROJECTED_NONSYMMETRIC_STRUCTURE_LABEL);
+    let mut structure_stream = UniformStream::new(structure_seed);
+    let mut signed_offsets = Vec::new();
+    signed_offsets
+        .try_reserve_exact(total_off_diagonals)
+        .map_err(|_| ProblemError::AllocationFailed)?;
+    for bucket in &buckets {
+        for _ in 0..pattern_count {
+            let population_index = bucket.start + structure_stream.sample_below(bucket.len);
+            signed_offsets.push(signed_offset_from_population_index(
+                population_index,
+                maximum_half_bandwidth,
+            ));
+        }
+    }
+
+    let off_diagonal_seed = derive_subseed(
+        instance_seed,
+        PROJECTED_NONSYMMETRIC_OFF_DIAGONAL_VALUES_LABEL,
+    );
+    let mut off_diagonal_stream = UniformStream::new(off_diagonal_seed);
+    let mut off_diagonal_mantissas = Vec::new();
+    off_diagonal_mantissas
+        .try_reserve_exact(total_off_diagonals)
+        .map_err(|_| ProblemError::AllocationFailed)?;
+    for _ in 0..total_off_diagonals {
+        off_diagonal_mantissas.push(sample_nonzero_mantissa(
+            &mut off_diagonal_stream,
+            *minimum_mantissa,
+            *maximum_mantissa,
+        ));
+    }
+
+    let diagonal_seed = derive_subseed(instance_seed, PROJECTED_NONSYMMETRIC_DIAGONAL_VALUES_LABEL);
+    let mut diagonal_stream = UniformStream::new(diagonal_seed);
+    let mut diagonal_mantissas = Vec::new();
+    diagonal_mantissas
+        .try_reserve_exact(pattern_count)
+        .map_err(|_| ProblemError::AllocationFailed)?;
+    for _ in 0..pattern_count {
+        diagonal_mantissas.push(sample_nonzero_mantissa(
+            &mut diagonal_stream,
+            *minimum_mantissa,
+            *maximum_mantissa,
+        ));
+    }
+
+    let mut structural_nonzeros = dimension;
+    for slot in 0..off_diagonal_slots {
+        let projection_start = (slot + 1) * pattern_bits;
+        let projection = &projection_bits[projection_start..projection_start + pattern_bits];
+        for pattern in 0..pattern_count {
+            let table_index = slot * pattern_count + pattern;
+            structural_nonzeros = structural_nonzeros
+                .checked_add(projected_offset_count(
+                    dimension,
+                    row_index_bits,
+                    projection,
+                    pattern,
+                    signed_offsets[table_index],
+                ))
+                .ok_or(ProblemError::IntegerOverflow(
+                    "compiled projected nonsymmetric structural nonzeros",
+                ))?;
+        }
+    }
+
+    let maximum_off_diagonal = off_diagonal_mantissas
+        .iter()
+        .map(|value| value.unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    let minimum_off_diagonal = off_diagonal_mantissas
+        .iter()
+        .map(|value| value.unsigned_abs())
+        .min()
+        .unwrap_or(0);
+    let maximum_diagonal = diagonal_mantissas
+        .iter()
+        .map(|value| value.unsigned_abs())
+        .max()
+        .expect("validated projected nonsymmetric pattern table is nonempty");
+    let maximum_absolute_row_sum_mantissa_bound = maximum_off_diagonal
+        .checked_mul(
+            u64::try_from(off_diagonal_slots).expect("validated projected row width fits u64"),
+        )
+        .and_then(|value| value.checked_add(maximum_diagonal))
+        .ok_or(ProblemError::IntegerOverflow(
+            "compiled projected nonsymmetric row-sum bound",
+        ))?;
+    let bandwidth_source_bound = maximum_half_bandwidth
+        .checked_mul(2)
+        .expect("validated projected half bandwidth source bound fits usize");
+    let possible_off_diagonal_sources = (dimension - 1).min(bandwidth_source_bound);
+    let maximum_absolute_column_sum_mantissa_bound = maximum_off_diagonal
+        .checked_mul(
+            u64::try_from(possible_off_diagonal_sources)
+                .expect("validated projected column-source count fits u64"),
+        )
+        .and_then(|value| value.checked_add(maximum_diagonal))
+        .ok_or(ProblemError::IntegerOverflow(
+            "compiled projected nonsymmetric column-sum bound",
+        ))?;
+    let matrix_period =
+        pattern_count
+            .checked_mul(row_width)
+            .ok_or(ProblemError::IntegerOverflow(
+                "compiled projected nonsymmetric public evaluation terms",
+            ))?;
+    let positive_diagonal = diagonal_mantissas.iter().all(|value| *value > 0);
+    let nonpositive_off_diagonal = off_diagonal_mantissas.iter().all(|value| *value < 0);
+    let matrix = ProjectedNonsymmetricRowSparse {
+        dimension,
+        fractional_bits: *fractional_bits,
+        pattern_bits,
+        row_width,
+        projection_bits: projection_bits.into_boxed_slice(),
+        signed_offsets: signed_offsets.into_boxed_slice(),
+        off_diagonal_mantissas: off_diagonal_mantissas.into_boxed_slice(),
+        diagonal_mantissas: diagonal_mantissas.into_boxed_slice(),
+    };
+    let facts = MatrixFacts {
+        dimension,
+        structural_nonzeros,
+        maximum_nonzeros_per_row: *maximum_nonzeros_per_row,
+        maximum_half_bandwidth,
+        matrix_period,
+        coefficient_fractional_bits: *fractional_bits,
+        minimum_off_diagonal_magnitude_mantissa: minimum_off_diagonal,
+        maximum_off_diagonal_magnitude_mantissa: maximum_off_diagonal,
+        maximum_diagonal_mantissa_bound: maximum_diagonal,
+        maximum_absolute_row_sum_mantissa_bound,
+        maximum_absolute_column_sum_mantissa_bound,
+        strict_diagonal_dominance_margin_mantissa: 0,
+        symmetric: false,
+        positive_diagonal,
+        nonpositive_off_diagonal,
+        strictly_row_diagonally_dominant: false,
+        nonsingular_m_matrix: false,
+        boundary: *boundary,
+    };
+    Ok((
+        CompiledMatrixFamily::ProjectedNonsymmetricRowSparse(matrix),
+        facts,
+    ))
 }
 
 impl GeneratedRhs {
@@ -1249,6 +1680,141 @@ fn compile_rhs(
             })
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OffsetBucket {
+    start: u64,
+    len: u64,
+}
+
+/// Builds increasing, disjoint offset buckets for projected row slots.
+///
+/// The `+1` bucket is always present when an off-diagonal was requested. This
+/// prevents a residue-class decomposition caused by every generated offset
+/// sharing a nontrivial divisor. Remaining slots cover balanced partitions of
+/// the negative offsets and, when capacity permits, positive offsets above one.
+fn projected_offset_buckets(
+    half_bandwidth: usize,
+    off_diagonal_slots: usize,
+) -> Result<Vec<OffsetBucket>, ProblemError> {
+    if off_diagonal_slots == 0 {
+        return Ok(Vec::new());
+    }
+    debug_assert!(half_bandwidth > 0);
+    debug_assert!(off_diagonal_slots <= 2 * half_bandwidth);
+
+    let remaining_slots = off_diagonal_slots - 1;
+    let positive_capacity = half_bandwidth - 1;
+    let minimum_negative_slots = remaining_slots.saturating_sub(positive_capacity);
+    let maximum_negative_slots = remaining_slots.min(half_bandwidth);
+    let balanced_negative_slots = remaining_slots.div_ceil(2);
+    let negative_slots =
+        balanced_negative_slots.clamp(minimum_negative_slots, maximum_negative_slots);
+    let positive_slots = remaining_slots - negative_slots;
+
+    let mut buckets = Vec::new();
+    buckets
+        .try_reserve_exact(off_diagonal_slots)
+        .map_err(|_| ProblemError::AllocationFailed)?;
+    append_offset_partition(&mut buckets, 0, half_bandwidth, negative_slots);
+    buckets.push(OffsetBucket {
+        start: u64::try_from(half_bandwidth).expect("validated half bandwidth fits u64"),
+        len: 1,
+    });
+    append_offset_partition(
+        &mut buckets,
+        half_bandwidth + 1,
+        positive_capacity,
+        positive_slots,
+    );
+    debug_assert_eq!(buckets.len(), off_diagonal_slots);
+    Ok(buckets)
+}
+
+fn append_offset_partition(
+    buckets: &mut Vec<OffsetBucket>,
+    population_start: usize,
+    population_len: usize,
+    parts: usize,
+) {
+    if parts == 0 {
+        return;
+    }
+    debug_assert!(parts <= population_len);
+    let base_len = population_len / parts;
+    let longer_parts = population_len % parts;
+    let mut start = population_start;
+    for part in 0..parts {
+        let len = base_len + usize::from(part < longer_parts);
+        buckets.push(OffsetBucket {
+            start: u64::try_from(start).expect("validated offset bucket start fits u64"),
+            len: u64::try_from(len).expect("validated offset bucket length fits u64"),
+        });
+        start += len;
+    }
+    debug_assert_eq!(start, population_start + population_len);
+}
+
+fn projected_offset_count(
+    dimension: usize,
+    row_index_bits: usize,
+    projection: &[u8],
+    pattern: usize,
+    signed_offset: i32,
+) -> usize {
+    let (lower, upper) = if signed_offset < 0 {
+        (
+            usize::try_from(signed_offset.unsigned_abs())
+                .expect("validated projected offset magnitude fits usize"),
+            dimension,
+        )
+    } else {
+        (
+            0,
+            dimension
+                - usize::try_from(signed_offset)
+                    .expect("validated projected nonnegative offset fits usize"),
+        )
+    };
+    projected_index_count(upper, row_index_bits, projection, pattern)
+        - projected_index_count(lower, row_index_bits, projection, pattern)
+}
+
+/// Counts bounded indices selected by one arbitrary row-bit projection.
+///
+/// The two states track the borrow from subtracting `limit`, least-significant
+/// bit first. This is the integer counterpart of the public-MLE digit program
+/// and runs in `O(log(dimension) * projection.len())` without visiting rows.
+fn projected_index_count(
+    limit: usize,
+    row_index_bits: usize,
+    projection: &[u8],
+    pattern: usize,
+) -> usize {
+    let domain = 1_usize << row_index_bits;
+    debug_assert!(limit <= domain);
+    debug_assert!(pattern < (1_usize << projection.len()));
+    let mut states = [1_usize, 0_usize];
+    for bit in 0..row_index_bits {
+        let limit_bit = (limit >> bit) & 1;
+        let required_bit = projection
+            .iter()
+            .position(|&projected| usize::from(projected) == bit)
+            .map(|pattern_bit| (pattern >> pattern_bit) & 1);
+        let mut next = [0_usize; 2];
+        for (borrow_in, count) in states.into_iter().enumerate() {
+            for index_bit in 0..=1 {
+                if required_bit.is_some_and(|required| index_bit != required) {
+                    continue;
+                }
+                let borrow_out = usize::from(index_bit < limit_bit + borrow_in);
+                next[borrow_out] += count;
+            }
+        }
+        states = next;
+    }
+    states[usize::from(limit < domain)]
 }
 
 /// Appends one uniformly sampled subset of nonzero signed offsets, sorted by
@@ -1423,6 +1989,8 @@ impl UniformStream {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::{
         DiagonalConstruction, MatrixSpec, OffDiagonalValues, ProblemSchema, ProblemTemplate,
@@ -1497,6 +2065,23 @@ mod tests {
         }
     }
 
+    fn projected_nonsymmetric_matrix(
+        dimension: u64,
+        maximum_half_bandwidth: u64,
+        maximum_nonzeros_per_row: u8,
+    ) -> MatrixSpec {
+        MatrixSpec::SeededNonsymmetricRowSparseV2 {
+            dimension,
+            boundary: BoundaryRule::TruncateV1,
+            row_pattern_bits: 3,
+            maximum_half_bandwidth,
+            maximum_nonzeros_per_row,
+            fractional_bits: 8,
+            minimum_mantissa: -256,
+            maximum_mantissa: 256,
+        }
+    }
+
     fn seeded_rhs() -> RhsSpec {
         RhsSpec::SeededPeriodicDyadicV1 {
             period_bits: 3,
@@ -1523,6 +2108,12 @@ mod tests {
     fn nonsymmetric_generated(seed_byte: u8) -> GeneratedProblem {
         let mut template = template(seed_byte, seeded_rhs());
         template.matrix = nonsymmetric_matrix(37, 5, 7);
+        template.finalize_literal().unwrap().compile().unwrap()
+    }
+
+    fn projected_nonsymmetric_generated(seed_byte: u8) -> GeneratedProblem {
+        let mut template = template(seed_byte, seeded_rhs());
+        template.matrix = projected_nonsymmetric_matrix(37, 5, 7);
         template.finalize_literal().unwrap().compile().unwrap()
     }
 
@@ -1694,6 +2285,145 @@ mod tests {
         assert!(!certificate.symmetric);
         assert!(!certificate.strictly_row_diagonally_dominant);
         assert!(!certificate.nonsingular_m_matrix);
+    }
+
+    #[test]
+    fn projected_rows_cover_row_bits_without_a_shared_short_period() {
+        let problem = projected_nonsymmetric_generated(29);
+        let matrix = match &problem.matrix {
+            CompiledMatrixFamily::ProjectedNonsymmetricRowSparse(matrix) => matrix,
+            _ => unreachable!(),
+        };
+        let row_index_bits = problem.dimension().next_power_of_two().ilog2() as usize;
+        assert_eq!(matrix.pattern_bits, 3);
+        assert_eq!(matrix.row_width, 7);
+        assert!((0..row_index_bits).all(|bit| {
+            matrix
+                .projection_bits
+                .iter()
+                .any(|&projected| usize::from(projected) == bit)
+        }));
+        assert!(
+            matrix
+                .projection_bits
+                .chunks_exact(matrix.pattern_bits)
+                .all(
+                    |projection| projection.iter().copied().collect::<HashSet<_>>().len()
+                        == projection.len()
+                )
+        );
+
+        let padded_dimension = problem.dimension().next_power_of_two();
+        let row_pattern_tuples = (0..padded_dimension)
+            .map(|row| {
+                (0..matrix.row_width)
+                    .map(|slot| matrix.row_pattern(row, slot))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(row_pattern_tuples.len(), padded_dimension);
+
+        let mut enumerated_nonzeros = 0_usize;
+        for row_index in 0..problem.dimension() {
+            let row = problem.row(row_index).unwrap().collect::<Vec<_>>();
+            enumerated_nonzeros += row.len();
+            assert!(row.len() <= matrix.row_width);
+            assert!(row.windows(2).all(|pair| pair[0].column < pair[1].column));
+            assert_eq!(
+                row.iter().filter(|entry| entry.column == row_index).count(),
+                1
+            );
+            assert!(row.iter().all(|entry| entry.value.mantissa() != 0));
+            assert!(
+                row.iter()
+                    .all(|entry| entry.column.abs_diff(row_index) <= 5)
+            );
+            if row_index + 1 < problem.dimension() {
+                assert!(row.iter().any(|entry| entry.column == row_index + 1));
+            }
+            let reverse = problem.row(row_index).unwrap().rev().collect::<Vec<_>>();
+            assert_eq!(reverse, row.iter().rev().copied().collect::<Vec<_>>());
+        }
+        assert_eq!(enumerated_nonzeros, problem.structural_nonzeros());
+
+        let certificate = problem.certificate();
+        assert_eq!(certificate.maximum_nonzeros_per_row, 7);
+        assert_eq!(certificate.maximum_half_bandwidth, 5);
+        assert!(!certificate.symmetric);
+        assert!(!certificate.strictly_row_diagonally_dominant);
+        assert!(!certificate.nonsingular_m_matrix);
+    }
+
+    #[test]
+    fn projected_index_counter_matches_complete_enumeration() {
+        let projection = [4, 1, 3];
+        for limit in 0..=32 {
+            for pattern in 0..8 {
+                let expected = (0..limit)
+                    .filter(|&index| {
+                        projection
+                            .iter()
+                            .enumerate()
+                            .all(|(pattern_bit, &row_bit)| {
+                                ((index >> row_bit) & 1) == ((pattern >> pattern_bit) & 1)
+                            })
+                    })
+                    .count();
+                assert_eq!(
+                    projected_index_count(limit, 5, &projection, pattern),
+                    expected,
+                    "limit={limit}, pattern={pattern}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn projected_offset_buckets_are_ordered_disjoint_and_include_unit_bridge() {
+        for half_bandwidth in 1..=8 {
+            for slots in 1..=2 * half_bandwidth {
+                let buckets = projected_offset_buckets(half_bandwidth, slots).unwrap();
+                assert_eq!(buckets.len(), slots);
+                assert!(buckets.iter().all(|bucket| bucket.len > 0));
+                assert!(
+                    buckets
+                        .windows(2)
+                        .all(|pair| { pair[0].start + pair[0].len <= pair[1].start })
+                );
+                assert!(buckets.iter().any(|bucket| {
+                    bucket.start == u64::try_from(half_bandwidth).unwrap() && bucket.len == 1
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn projected_browser_vector_freezes_cross_language_generation() {
+        let mut value = template(1, seeded_rhs());
+        value.matrix = MatrixSpec::SeededNonsymmetricRowSparseV2 {
+            dimension: 8,
+            boundary: BoundaryRule::TruncateV1,
+            row_pattern_bits: 2,
+            maximum_half_bandwidth: 3,
+            maximum_nonzeros_per_row: 5,
+            fractional_bits: 8,
+            minimum_mantissa: -256,
+            maximum_mantissa: 256,
+        };
+        let problem = value.finalize_literal().unwrap().compile().unwrap();
+        let signature = problem
+            .rows()
+            .enumerate()
+            .flat_map(|(row, entries)| {
+                entries
+                    .map(move |entry| format!("{row},{},{}", entry.column, entry.value.mantissa()))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            signature,
+            "0,0,-181\n0,1,-88\n0,3,-10\n1,0,202\n1,1,-32\n1,2,-139\n1,4,-10\n2,0,255\n2,1,-10\n2,2,97\n2,3,18\n2,4,168\n3,1,255\n3,2,202\n3,3,172\n3,4,-45\n3,5,168\n4,1,112\n4,3,100\n4,4,-181\n4,5,-88\n4,7,-28\n5,2,112\n5,4,-173\n5,5,-32\n5,6,-139\n6,3,-214\n6,5,100\n6,6,97\n6,7,18\n7,4,-214\n7,6,-173\n7,7,172"
+        );
     }
 
     #[test]

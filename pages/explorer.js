@@ -7,7 +7,9 @@ let blake3 = typeof module !== "undefined" && module.exports
 const TRIDIAGONAL_FAMILY = "seeded-symmetric-tridiagonal-v1";
 const DIA_FAMILY = "seeded-symmetric-dia-laplacian-v1";
 const NONSYMMETRIC_FAMILY = "seeded-nonsymmetric-row-sparse-v1";
+const PROJECTED_NONSYMMETRIC_FAMILY = "seeded-nonsymmetric-row-sparse-v2";
 const SEEDED_RHS_FAMILY = "seeded-periodic-dyadic-v1";
+const MAX_VISUALIZATION_DIMENSION = 1024;
 const MAX_SAFE_MANTISSA = 9007199254740991;
 const MAX_DIA_OFFSETS = 16;
 const MAX_NONSYMMETRIC_ROW_NONZEROS = 32;
@@ -19,6 +21,10 @@ const DIA_MATRIX_VALUES_LABEL = "matrix/seeded-symmetric-dia-laplacian-v1/edge-v
 const NONSYMMETRIC_STRUCTURE_LABEL = "matrix/seeded-nonsymmetric-row-sparse-v1/structure";
 const NONSYMMETRIC_OFF_DIAGONAL_VALUES_LABEL = "matrix/seeded-nonsymmetric-row-sparse-v1/off-diagonal-values";
 const NONSYMMETRIC_DIAGONAL_VALUES_LABEL = "matrix/seeded-nonsymmetric-row-sparse-v1/diagonal-values";
+const PROJECTED_NONSYMMETRIC_PROJECTIONS_LABEL = "matrix/seeded-nonsymmetric-row-sparse-v2/projections";
+const PROJECTED_NONSYMMETRIC_STRUCTURE_LABEL = "matrix/seeded-nonsymmetric-row-sparse-v2/structure";
+const PROJECTED_NONSYMMETRIC_OFF_DIAGONAL_VALUES_LABEL = "matrix/seeded-nonsymmetric-row-sparse-v2/off-diagonal-values";
+const PROJECTED_NONSYMMETRIC_DIAGONAL_VALUES_LABEL = "matrix/seeded-nonsymmetric-row-sparse-v2/diagonal-values";
 
 function parseOffsets(value) {
   if (!value.trim()) return [];
@@ -33,8 +39,17 @@ function matrixOffsets(p) {
   return p.family === TRIDIAGONAL_FAMILY ? [1] : [];
 }
 
+function isNonsymmetricFamily(family) {
+  return family === NONSYMMETRIC_FAMILY || family === PROJECTED_NONSYMMETRIC_FAMILY;
+}
+
 function validationError(p) {
-  if (![TRIDIAGONAL_FAMILY, DIA_FAMILY, NONSYMMETRIC_FAMILY].includes(p.family)) {
+  if (![
+    TRIDIAGONAL_FAMILY,
+    DIA_FAMILY,
+    NONSYMMETRIC_FAMILY,
+    PROJECTED_NONSYMMETRIC_FAMILY,
+  ].includes(p.family)) {
     return "Select a registered matrix family.";
   }
   if (p.rhs !== SEEDED_RHS_FAMILY) return "Select a registered right-hand-side family.";
@@ -51,13 +66,15 @@ function validationError(p) {
     p.rhsMinimum,
     p.rhsMaximum,
   ];
-  const familyIntegers = p.family === NONSYMMETRIC_FAMILY
+  const familyIntegers = isNonsymmetricFamily(p.family)
     ? [p.maximumHalfBandwidth, p.maximumRowNonzeros, p.coefficientMinimum, p.coefficientMaximum]
     : [p.margin, p.minimum, p.maximum];
   if (![...commonIntegers, ...familyIntegers].every(Number.isSafeInteger)) {
     return "All generator parameters must be integers.";
   }
-  if (p.dimension < 2 || p.dimension > 128) return "Visualization dimension must be between 2 and 128.";
+  if (p.dimension < 2 || p.dimension > MAX_VISUALIZATION_DIMENSION) {
+    return `Visualization dimension must be between 2 and ${MAX_VISUALIZATION_DIMENSION}.`;
+  }
   if (p.periodBits < 0 || p.periodBits > 16) return "Period bits must be between 0 and 16.";
   if (p.fractionalBits < 0 || p.fractionalBits > 52) return "Fractional bits must be between 0 and 52.";
   if (p.rhsPeriodBits < 0 || p.rhsPeriodBits > 16) {
@@ -74,7 +91,7 @@ function validationError(p) {
     return "RHS mantissas must fit exactly in binary64.";
   }
 
-  if (p.family === NONSYMMETRIC_FAMILY) {
+  if (isNonsymmetricFamily(p.family)) {
     if (p.maximumHalfBandwidth < 0 || p.maximumHalfBandwidth >= p.dimension) {
       return "Maximum half bandwidth must be nonnegative and smaller than the dimension.";
     }
@@ -94,6 +111,13 @@ function validationError(p) {
     }
     if (p.coefficientMinimum === 0 && p.coefficientMaximum === 0) {
       return "The coefficient range must contain a nonzero value.";
+    }
+    if (p.family === PROJECTED_NONSYMMETRIC_FAMILY) {
+      const rowIndexBits = Math.log2(nextPowerOfTwo(p.dimension));
+      const projectedBits = Math.min(p.periodBits, rowIndexBits);
+      if (projectedBits * p.maximumRowNonzeros < rowIndexBits) {
+        return "The row-slot projections must collectively cover every padded row-index bit.";
+      }
     }
     return "";
   }
@@ -126,7 +150,7 @@ function validationError(p) {
 }
 
 function matrixSpec(p) {
-  if (p.family === NONSYMMETRIC_FAMILY) {
+  if (isNonsymmetricFamily(p.family)) {
     return {
       kind: p.family,
       dimension: p.dimension,
@@ -411,12 +435,145 @@ function actualizeNonsymmetric(p, instanceSeed) {
   return { entries, fractionalBits: p.fractionalBits };
 }
 
+function projectedRowBits(instanceSeed, rowIndexBits, patternBits, rowWidth) {
+  const stream = new UniformStream(
+    deriveSubseed(instanceSeed, PROJECTED_NONSYMMETRIC_PROJECTIONS_LABEL),
+  );
+  const permutation = Array.from({ length: rowIndexBits }, (_, bit) => bit);
+  for (let upper = rowIndexBits - 1; upper > 0; upper -= 1) {
+    const selected = Number(stream.sampleBelow(BigInt(upper + 1)));
+    [permutation[upper], permutation[selected]] = [permutation[selected], permutation[upper]];
+  }
+  return Array.from({ length: rowWidth }, (_, slot) => {
+    const windowStart = slot * patternBits;
+    const rotation = slot % patternBits;
+    return Array.from({ length: patternBits }, (_, patternBit) => {
+      const withinWindow = (patternBit + rotation) % patternBits;
+      return permutation[(windowStart + withinWindow) % rowIndexBits];
+    });
+  });
+}
+
+function appendOffsetPartition(buckets, populationStart, populationLength, parts) {
+  if (parts === 0) return;
+  const baseLength = Math.floor(populationLength / parts);
+  const longerParts = populationLength % parts;
+  let start = populationStart;
+  for (let part = 0; part < parts; part += 1) {
+    const length = baseLength + (part < longerParts ? 1 : 0);
+    buckets.push({ start, length });
+    start += length;
+  }
+}
+
+function projectedOffsetBuckets(halfBandwidth, offDiagonalSlots) {
+  if (offDiagonalSlots === 0) return [];
+  const remainingSlots = offDiagonalSlots - 1;
+  const positiveCapacity = halfBandwidth - 1;
+  const minimumNegativeSlots = Math.max(0, remainingSlots - positiveCapacity);
+  const maximumNegativeSlots = Math.min(remainingSlots, halfBandwidth);
+  const balancedNegativeSlots = Math.ceil(remainingSlots / 2);
+  const negativeSlots = Math.max(
+    minimumNegativeSlots,
+    Math.min(balancedNegativeSlots, maximumNegativeSlots),
+  );
+  const positiveSlots = remainingSlots - negativeSlots;
+  const buckets = [];
+  appendOffsetPartition(buckets, 0, halfBandwidth, negativeSlots);
+  buckets.push({ start: halfBandwidth, length: 1 });
+  appendOffsetPartition(
+    buckets,
+    halfBandwidth + 1,
+    positiveCapacity,
+    positiveSlots,
+  );
+  return buckets;
+}
+
+function projectedPattern(row, projection) {
+  return projection.reduce((pattern, rowBit, patternBit) => {
+    const bit = Math.floor(row / (2 ** rowBit)) % 2;
+    return pattern + bit * (2 ** patternBit);
+  }, 0);
+}
+
+function actualizeProjectedNonsymmetric(p, instanceSeed) {
+  const rowIndexBits = Math.log2(nextPowerOfTwo(p.dimension));
+  const patternBits = Math.min(p.periodBits, rowIndexBits);
+  const patternCount = 2 ** patternBits;
+  const offDiagonalSlots = p.maximumRowNonzeros - 1;
+  const projections = projectedRowBits(
+    instanceSeed,
+    rowIndexBits,
+    patternBits,
+    p.maximumRowNonzeros,
+  );
+
+  const buckets = projectedOffsetBuckets(p.maximumHalfBandwidth, offDiagonalSlots);
+  const structureStream = new UniformStream(
+    deriveSubseed(instanceSeed, PROJECTED_NONSYMMETRIC_STRUCTURE_LABEL),
+  );
+  const signedOffsets = buckets.map((bucket) => Array.from(
+    { length: patternCount },
+    () => signedOffsetFromPopulationIndex(
+      BigInt(bucket.start) + structureStream.sampleBelow(BigInt(bucket.length)),
+      p.maximumHalfBandwidth,
+    ),
+  ));
+
+  const offDiagonalStream = new UniformStream(
+    deriveSubseed(instanceSeed, PROJECTED_NONSYMMETRIC_OFF_DIAGONAL_VALUES_LABEL),
+  );
+  const offDiagonalValues = Array.from(
+    { length: patternCount * offDiagonalSlots },
+    () => sampleNonzeroMantissa(
+      offDiagonalStream,
+      p.coefficientMinimum,
+      p.coefficientMaximum,
+    ),
+  );
+  const diagonalStream = new UniformStream(
+    deriveSubseed(instanceSeed, PROJECTED_NONSYMMETRIC_DIAGONAL_VALUES_LABEL),
+  );
+  const diagonalValues = Array.from(
+    { length: patternCount },
+    () => sampleNonzeroMantissa(
+      diagonalStream,
+      p.coefficientMinimum,
+      p.coefficientMaximum,
+    ),
+  );
+
+  const entries = [];
+  for (let row = 0; row < p.dimension; row += 1) {
+    const diagonalPattern = projectedPattern(row, projections[0]);
+    const rowEntries = [matrixEntry(row, row, diagonalValues[diagonalPattern])];
+    for (let slot = 0; slot < offDiagonalSlots; slot += 1) {
+      const pattern = projectedPattern(row, projections[slot + 1]);
+      const column = row + signedOffsets[slot][pattern];
+      if (column >= 0 && column < p.dimension) {
+        rowEntries.push(matrixEntry(
+          row,
+          column,
+          offDiagonalValues[slot * patternCount + pattern],
+        ));
+      }
+    }
+    rowEntries.sort((left, right) => left.column - right.column);
+    entries.push(...rowEntries);
+  }
+  return { entries, fractionalBits: p.fractionalBits };
+}
+
 function actualizeMatrix(p) {
   const instanceSeed = blake3.hexToBytes(p.seed);
   if (instanceSeed.length !== 32) throw new RangeError("an instance seed must contain 32 bytes");
   if (p.family === TRIDIAGONAL_FAMILY) return actualizeTridiagonal(p, instanceSeed);
   if (p.family === DIA_FAMILY) return actualizeDia(p, instanceSeed);
   if (p.family === NONSYMMETRIC_FAMILY) return actualizeNonsymmetric(p, instanceSeed);
+  if (p.family === PROJECTED_NONSYMMETRIC_FAMILY) {
+    return actualizeProjectedNonsymmetric(p, instanceSeed);
+  }
   throw new RangeError("cannot actualize an unregistered matrix family");
 }
 
@@ -429,7 +586,7 @@ function nextSeedHex(seed) {
 }
 
 function structuralNonzeros(p) {
-  if (p.family === NONSYMMETRIC_FAMILY) {
+  if (isNonsymmetricFamily(p.family)) {
     return p.dimension * Math.min(p.dimension, p.maximumRowNonzeros);
   }
   return p.dimension + matrixOffsets(p)
@@ -567,7 +724,8 @@ function initialize() {
 
   function updateFamilyControls(p) {
     const dia = p.family === DIA_FAMILY;
-    const nonsymmetric = p.family === NONSYMMETRIC_FAMILY;
+    const nonsymmetric = isNonsymmetricFamily(p.family);
+    const projected = p.family === PROJECTED_NONSYMMETRIC_FAMILY;
     offsetsControl.hidden = !dia;
     marginControl.hidden = nonsymmetric;
     structuredRangeControls.hidden = nonsymmetric;
@@ -576,10 +734,13 @@ function initialize() {
     nonsymmetricNote.hidden = !nonsymmetric;
     periodLabel.textContent = dia
       ? "Edge period bits"
-      : nonsymmetric ? "Row pattern bits" : "Period bits";
+      : projected ? "Projection bits per entry slot"
+        : nonsymmetric ? "Row pattern bits" : "Period bits";
     periodHint.textContent = dia
       ? "One shared period and range; each offset table is seeded independently"
-      : nonsymmetric
+      : projected
+        ? "Seed-derived slot projections jointly cover the padded row index"
+        : nonsymmetric
         ? "The generated sparsity and values repeat after 2^k rows"
         : "";
     periodHint.hidden = !dia && !nonsymmetric;
@@ -619,7 +780,8 @@ function initialize() {
         dotSize,
       );
     };
-    const nonsymmetric = p.family === NONSYMMETRIC_FAMILY;
+    const nonsymmetric = isNonsymmetricFamily(p.family);
+    const projected = p.family === PROJECTED_NONSYMMETRIC_FAMILY;
     const offsets = matrixOffsets(p);
     matrix.entries.forEach(drawEntry);
     context.strokeStyle = "#aeb6c5";
@@ -631,7 +793,9 @@ function initialize() {
     document.querySelector("#plot-summary").textContent = `${nonzeros} structural nonzeros · ${density}% density`;
     const familyDescription = p.family === DIA_FAMILY
       ? `symmetric DIA matrix with positive offsets ${offsets.join(", ")}`
-      : nonsymmetric
+      : projected
+        ? `nonsymmetric projected-pattern matrix with half bandwidth ${p.maximumHalfBandwidth}`
+        : nonsymmetric
         ? `nonsymmetric generated-pattern matrix with half bandwidth ${p.maximumHalfBandwidth}`
         : "symmetric tridiagonal matrix";
     canvas.setAttribute(
@@ -643,7 +807,9 @@ function initialize() {
     const maximumMantissa = mantissas.reduce((maximum, value) => (value > maximum ? value : maximum));
     const familyNote = p.family === DIA_FAMILY
       ? `Positive offsets ${offsets.join(", ")} are mirrored and boundary edges truncate.`
-      : nonsymmetric
+      : projected
+        ? `Each entry slot uses a separate row-bit projection; together they cover all row bits. Its MLE uses ${(2 ** Math.min(p.periodBits, Math.log2(nextPowerOfTwo(p.dimension)))) * p.maximumRowNonzeros} public pattern terms.`
+        : nonsymmetric
         ? `The seed chose these entries subject to the ${p.maximumRowNonzeros}-per-row cap and required diagonal; its MLE uses ${Math.min(2 ** p.periodBits, p.dimension) * p.maximumRowNonzeros} public pattern terms.`
         : "The pattern is fixed, while the seed chooses its edge weights and resulting diagonal values.";
     const challengeNote = templateKind.value === "challenge"
@@ -739,7 +905,9 @@ if (typeof module !== "undefined" && module.exports) {
     MAX_DIA_OFFSETS,
     MAX_NONSYMMETRIC_ROW_NONZEROS,
     MAX_SAFE_MANTISSA,
+    MAX_VISUALIZATION_DIMENSION,
     NONSYMMETRIC_FAMILY,
+    PROJECTED_NONSYMMETRIC_FAMILY,
     SEEDED_RHS_FAMILY,
     TRIDIAGONAL_FAMILY,
     actualizeMatrix,
@@ -766,7 +934,7 @@ function initializeWhenReady() {
   }
 
   const dependency = document.createElement("script");
-  dependency.src = "blake3.js?v=2";
+  dependency.src = "blake3.js?v=3";
   dependency.addEventListener("load", () => {
     blake3 = globalThis.SsvBlake3;
     if (blake3) {

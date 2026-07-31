@@ -113,6 +113,17 @@ The registered matrix families are:
   diagonal and off-diagonal mantissas are nonzero dyadic values in `[-1,1]`.
   The family makes no symmetry, dominance, definiteness, or nonsingularity
   claim.
+- `seeded-nonsymmetric-row-sparse-v2`: each required diagonal or off-diagonal
+  entry slot owns a `2^p` table selected by a seed-derived projection of `p`
+  padded row-index bits. The slot projections jointly cover every row-index
+  bit, so their tuple has no forced short period. Off-diagonal slots use
+  increasing disjoint signed-offset buckets and include a singleton `+1`
+  bucket whenever an off-diagonal is requested. This preserves sorted,
+  duplicate-free, truncated rows and prevents a common-divisor block split.
+  A carry/borrow digit program evaluates each projected masked shift in
+  `O(log(n))`, for `O(K * 2^p * log(n))` public evaluation work. As with v1,
+  the family makes no symmetry, dominance, definiteness, or nonsingularity
+  claim.
 
 All families truncate boundary entries instead of wrapping. The DIA family
 derives each mirrored pair and both diagonal contributions from one edge value.
@@ -139,17 +150,18 @@ enumerating rows or RHS entries. It exposes the same reviewed operation plan to
 Field192 and binary64 interpreters, reports exact public coefficient bounds, and
 returns deterministic work and binary64 roundoff diagnostics. The exact
 relation plan derives its alignment and no-wrap bounds from that metadata.
-Validation manifests cap matrix and RHS periodic terms before proving or
+Validation manifests cap matrix and RHS generator-table terms before proving or
 verification; hosted deployments impose independent ceilings that a manifest
 cannot raise.
 
 For the tridiagonal family, matrix endpoint work is `O(P_A log n)`. For DIA it
 is `O((sum_d min(P_d, n-d)) log n)`, using a constant-state binary
-carry/borrow evaluator for arbitrary positive offsets. The nonsymmetric family
-uses the same automaton for signed row offsets in `O(min(P,n) K log n)`, where
-`K` includes the diagonal. Its row-pattern repetition is required by the
-current succinct evaluator; independently hashing every row would reintroduce
-a verifier scan. RHS endpoint work is `O(P_b log n)`. A family without such a
+carry/borrow evaluator for arbitrary positive offsets. Nonsymmetric v1 uses the
+same automaton for signed row offsets in `O(min(P,n) K log n)`, where `K`
+includes the diagonal. V2 replaces the shared periodic constraint with
+per-slot projected row-bit constraints and costs `O(2^p K log n)`. Both retain
+bounded lookup structure; independently hashing every row would reintroduce a
+verifier scan. RHS endpoint work is `O(P_b log n)`. A family without such a
 dimension-succinct capability is not eligible for the succinct profiles merely
 because it has a sparse row iterator.
 

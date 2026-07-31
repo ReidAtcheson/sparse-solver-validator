@@ -6,9 +6,9 @@
     <meta name="description" content="Generate and validate sparse linear-system proofs.">
     <title>Sparse Solver Validator</title>
     <!-- Bump the shared version whenever explorer assets or their DOM contract change. -->
-    <link rel="stylesheet" href="styles.css?v=2">
-    <script src="blake3.js?v=2" defer></script>
-    <script src="explorer.js?v=2" defer></script>
+    <link rel="stylesheet" href="styles.css?v=3">
+    <script src="blake3.js?v=3" defer></script>
+    <script src="explorer.js?v=3" defer></script>
   </head>
   <body>
     <header>
@@ -83,6 +83,7 @@ curl --fail --silent --show-error \
                 <option value="seeded-symmetric-tridiagonal-v1">Seeded symmetric tridiagonal v1</option>
                 <option value="seeded-symmetric-dia-laplacian-v1">Seeded symmetric DIA Laplacian v1</option>
                 <option value="seeded-nonsymmetric-row-sparse-v1">Seeded nonsymmetric row-sparse v1</option>
+                <option value="seeded-nonsymmetric-row-sparse-v2">Seeded nonsymmetric projected row-sparse v2</option>
               </select>
             </label>
 
@@ -107,8 +108,8 @@ curl --fail --silent --show-error \
             <div class="control-row">
               <label>
                 Dimension
-                <input id="dimension" name="dimension" type="number" min="2" max="128" value="16">
-                <small>2–128 for visualization</small>
+                <input id="dimension" name="dimension" type="number" min="2" max="1024" value="16">
+                <small>2–1024 for visualization</small>
               </label>
               <label>
                 <span id="period-label">Period bits</span>

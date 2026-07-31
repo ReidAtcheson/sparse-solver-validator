@@ -164,6 +164,27 @@ pub enum MatrixSpec {
         #[serde(with = "decimal_i64")]
         maximum_mantissa: i64,
     },
+    /// Independently projected sparse-row slots with mixed-sign dyadic values.
+    ///
+    /// Each entry slot selects a bounded lookup-table pattern from a different
+    /// seed-derived projection of the row-index bits. The projections jointly
+    /// cover the padded row index, so the family has no forced short row period.
+    /// Off-diagonal slots use disjoint ordered offset buckets, including a unit
+    /// offset, which keeps every realized row sorted and duplicate-free without
+    /// requiring row-sized compiled storage.
+    #[serde(rename = "seeded-nonsymmetric-row-sparse-v2")]
+    SeededNonsymmetricRowSparseV2 {
+        dimension: u64,
+        boundary: BoundaryRule,
+        row_pattern_bits: u8,
+        maximum_half_bandwidth: u64,
+        maximum_nonzeros_per_row: u8,
+        fractional_bits: u8,
+        #[serde(with = "decimal_i64")]
+        minimum_mantissa: i64,
+        #[serde(with = "decimal_i64")]
+        maximum_mantissa: i64,
+    },
 }
 
 impl MatrixSpec {
@@ -172,7 +193,8 @@ impl MatrixSpec {
         match self {
             Self::SeededSymmetricTridiagonalV1 { dimension, .. }
             | Self::SeededSymmetricDiaLaplacianV1 { dimension, .. }
-            | Self::SeededNonsymmetricRowSparseV1 { dimension, .. } => *dimension,
+            | Self::SeededNonsymmetricRowSparseV1 { dimension, .. }
+            | Self::SeededNonsymmetricRowSparseV2 { dimension, .. } => *dimension,
         }
     }
 }
@@ -303,6 +325,10 @@ pub enum ProblemError {
     GeneratedCoefficientOutsideUnitInterval,
     #[error("the generated matrix coefficient range must contain a nonzero value")]
     GeneratedCoefficientRangeOnlyZero,
+    #[error(
+        "row-slot projections provide {available} bit positions but must cover all {required} padded row-index bits"
+    )]
+    InsufficientNonsymmetricProjectionCoverage { required: u32, available: u32 },
     #[error("the strict diagonal-dominance margin must be positive")]
     ZeroDominanceMargin,
     #[error(
@@ -656,6 +682,26 @@ impl CanonicalEncode for MatrixSpec {
                 encoder.write_i64(*minimum_mantissa);
                 encoder.write_i64(*maximum_mantissa);
             }
+            Self::SeededNonsymmetricRowSparseV2 {
+                dimension,
+                boundary,
+                row_pattern_bits,
+                maximum_half_bandwidth,
+                maximum_nonzeros_per_row,
+                fractional_bits,
+                minimum_mantissa,
+                maximum_mantissa,
+            } => {
+                encoder.write_u16(4);
+                encoder.write_u64(*dimension);
+                boundary.encode(encoder);
+                encoder.write_u8(*row_pattern_bits);
+                encoder.write_u64(*maximum_half_bandwidth);
+                encoder.write_u8(*maximum_nonzeros_per_row);
+                encoder.write_u8(*fractional_bits);
+                encoder.write_i64(*minimum_mantissa);
+                encoder.write_i64(*maximum_mantissa);
+            }
         }
     }
 }
@@ -828,6 +874,15 @@ fn validate_common(
             minimum_mantissa,
             maximum_mantissa,
             ..
+        }
+        | MatrixSpec::SeededNonsymmetricRowSparseV2 {
+            row_pattern_bits,
+            maximum_half_bandwidth,
+            maximum_nonzeros_per_row,
+            fractional_bits,
+            minimum_mantissa,
+            maximum_mantissa,
+            ..
         } => {
             validate_period_and_scale(*row_pattern_bits, *fractional_bits)?;
             if *maximum_half_bandwidth >= matrix.dimension() {
@@ -856,6 +911,17 @@ fn validate_common(
             }
             if *minimum_mantissa == 0 && *maximum_mantissa == 0 {
                 return Err(ProblemError::GeneratedCoefficientRangeOnlyZero);
+            }
+            if matches!(matrix, MatrixSpec::SeededNonsymmetricRowSparseV2 { .. }) {
+                let required = matrix.dimension().next_power_of_two().ilog2();
+                let projected_bits = u32::from(*row_pattern_bits).min(required);
+                let available = projected_bits * u32::from(*maximum_nonzeros_per_row);
+                if available < required {
+                    return Err(ProblemError::InsufficientNonsymmetricProjectionCoverage {
+                        required,
+                        available,
+                    });
+                }
             }
             dimension
                 .checked_mul(usize::from(*maximum_nonzeros_per_row))
@@ -941,6 +1007,16 @@ fn matrix_public_evaluation_terms(matrix: &MatrixSpec) -> Result<u64, ProblemErr
             .checked_mul(u64::from(*maximum_nonzeros_per_row))
             .ok_or(ProblemError::IntegerOverflow(
                 "nonsymmetric public evaluation terms",
+            )),
+        MatrixSpec::SeededNonsymmetricRowSparseV2 {
+            row_pattern_bits,
+            maximum_nonzeros_per_row,
+            ..
+        } => (1_u64 << *row_pattern_bits)
+            .min(matrix.dimension().next_power_of_two())
+            .checked_mul(u64::from(*maximum_nonzeros_per_row))
+            .ok_or(ProblemError::IntegerOverflow(
+                "projected nonsymmetric public evaluation terms",
             )),
     }
 }
@@ -1117,6 +1193,19 @@ mod tests {
         }
     }
 
+    fn projected_nonsymmetric_matrix(dimension: u64) -> MatrixSpec {
+        MatrixSpec::SeededNonsymmetricRowSparseV2 {
+            dimension,
+            boundary: BoundaryRule::TruncateV1,
+            row_pattern_bits: 3,
+            maximum_half_bandwidth: 5,
+            maximum_nonzeros_per_row: 7,
+            fractional_bits: 8,
+            minimum_mantissa: -256,
+            maximum_mantissa: 256,
+        }
+    }
+
     fn template() -> ProblemTemplate {
         ProblemTemplate {
             schema: TemplateSchema::V1,
@@ -1207,6 +1296,28 @@ mod tests {
     }
 
     #[test]
+    fn projected_nonsymmetric_schema_round_trips_as_a_distinct_family() {
+        let mut template = template();
+        template.matrix = projected_nonsymmetric_matrix(19);
+        template.rhs = RhsSpec::SeededPeriodicDyadicV1 {
+            period_bits: 2,
+            fractional_bits: 8,
+            minimum_mantissa: -32,
+            maximum_mantissa: 31,
+        };
+        let json = template.to_pretty_json().unwrap();
+        assert!(json.contains("\"kind\": \"seeded-nonsymmetric-row-sparse-v2\""));
+        assert_eq!(
+            ProblemTemplate::from_json_slice(json.as_bytes()).unwrap(),
+            template
+        );
+
+        let mut legacy = template.clone();
+        legacy.matrix = nonsymmetric_matrix(19);
+        assert_ne!(template.digest().unwrap(), legacy.digest().unwrap());
+    }
+
+    #[test]
     fn public_evaluation_terms_are_known_before_compilation() {
         let mut template = template();
         template.matrix = matrix(6);
@@ -1274,6 +1385,27 @@ mod tests {
         let generated = template.finalize_literal().unwrap().compile().unwrap();
         let metadata = generated.public_evaluation_plan().metadata();
         assert_eq!(metadata.evaluator_version, 3);
+        assert_eq!(metadata.matrix_period_terms, 56);
+    }
+
+    #[test]
+    fn projected_nonsymmetric_public_terms_cover_every_slot_table() {
+        let mut template = template();
+        template.matrix = projected_nonsymmetric_matrix(19);
+        template.rhs = RhsSpec::SeededPeriodicDyadicV1 {
+            period_bits: 2,
+            fractional_bits: 8,
+            minimum_mantissa: -4,
+            maximum_mantissa: 7,
+        };
+        let expected = PublicEvaluationTerms {
+            matrix_period_terms: 8 * 7,
+            rhs_period_terms: 4,
+        };
+        assert_eq!(template.public_evaluation_terms().unwrap(), expected);
+        let generated = template.finalize_literal().unwrap().compile().unwrap();
+        let metadata = generated.public_evaluation_plan().metadata();
+        assert_eq!(metadata.evaluator_version, 4);
         assert_eq!(metadata.matrix_period_terms, 56);
     }
 
@@ -1482,5 +1614,29 @@ mod tests {
             value.validate(),
             Err(ProblemError::GeneratedCoefficientRangeOnlyZero)
         ));
+
+        value.matrix = projected_nonsymmetric_matrix(1_024);
+        let MatrixSpec::SeededNonsymmetricRowSparseV2 {
+            row_pattern_bits, ..
+        } = &mut value.matrix
+        else {
+            unreachable!()
+        };
+        *row_pattern_bits = 1;
+        assert!(matches!(
+            value.validate(),
+            Err(ProblemError::InsufficientNonsymmetricProjectionCoverage {
+                required: 10,
+                available: 7,
+            })
+        ));
+        let MatrixSpec::SeededNonsymmetricRowSparseV2 {
+            row_pattern_bits, ..
+        } = &mut value.matrix
+        else {
+            unreachable!()
+        };
+        *row_pattern_bits = 2;
+        assert!(value.validate().is_ok());
     }
 }
