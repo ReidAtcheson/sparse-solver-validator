@@ -7,7 +7,10 @@ const {
   DIA_FAMILY,
   MAX_DIA_OFFSETS,
   MAX_SAFE_MANTISSA,
+  SEEDED_RHS_FAMILY,
   TRIDIAGONAL_FAMILY,
+  hostedWorkflow,
+  localWorkflow,
   matrixSpec,
   parseOffsets,
   problemTemplate,
@@ -25,7 +28,11 @@ function parameters(overrides = {}) {
     margin: 32,
     minimum: 8,
     maximum: 24,
-    rhs: "manufactured-ones-v1",
+    rhs: SEEDED_RHS_FAMILY,
+    rhsPeriodBits: 4,
+    rhsFractionalBits: 8,
+    rhsMinimum: -16,
+    rhsMaximum: 19,
     ...overrides,
   };
 }
@@ -88,6 +95,53 @@ test("DIA templates preserve noncontiguous offsets and exact string mantissas", 
     derivation: "blake3-xof-v1",
   });
   assert.equal(template.matrix.kind, DIA_FAMILY);
+});
+
+test("templates use a separately parameterized seeded RHS", () => {
+  const template = problemTemplate(parameters(), "literal");
+  assert.deepEqual(template.rhs, {
+    kind: SEEDED_RHS_FAMILY,
+    period_bits: 4,
+    fractional_bits: 8,
+    minimum_mantissa: "-16",
+    maximum_mantissa: "19",
+  });
+  assert.notEqual(template.rhs.kind, "manufactured-ones-v1");
+});
+
+test("seeded RHS parameters are validated at the registered schema boundary", () => {
+  assert.match(validationError(parameters({ rhs: "manufactured-ones-v1" })), /registered/);
+  assert.match(validationError(parameters({ rhsPeriodBits: 17 })), /RHS period bits/);
+  assert.match(validationError(parameters({ rhsFractionalBits: 53 })), /RHS fractional bits/);
+  assert.match(
+    validationError(parameters({ rhsMinimum: 2, rhsMaximum: 1 })),
+    /minimum ≤ maximum/,
+  );
+  assert.match(
+    validationError(parameters({ rhsMinimum: -MAX_SAFE_MANTISSA - 1 })),
+    /integers/,
+  );
+});
+
+test("workflows export generated systems and hand solver output to the prover", () => {
+  const local = localWorkflow();
+  assert.match(local, /sparse-problem -- export/);
+  assert.match(local, /Solve A x = b here/);
+  assert.match(local, /sparse-solve\/solution\/binary64-v1/);
+  assert.match(local, /--solution \/tmp\/x\.json/);
+  assert.doesNotMatch(local, /manufactured-solution/);
+
+  const hosted = hostedWorkflow({
+    serviceUrl: "https://validator.example",
+    issuer: "issuer",
+    keyId: "key-v1",
+    publicKey: "/tmp/validator.pub",
+    privateService: true,
+  });
+  assert.match(hosted, /sparse-problem -- export/);
+  assert.match(hosted, /Solve A x = b here/);
+  assert.match(hosted, /Authorization: Bearer/);
+  assert.doesNotMatch(hosted, /manufactured-solution/);
 });
 
 test("DIA offset validation matches the registered schema boundary", () => {
