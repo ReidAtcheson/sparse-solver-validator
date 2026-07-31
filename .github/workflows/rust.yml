@@ -28,6 +28,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Test matrix explorer
+        run: node --test tests/pages/explorer.test.js
+
       - name: Install pinned Rust toolchain
         run: rustup toolchain install --no-self-update
 
