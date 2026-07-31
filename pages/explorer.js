@@ -1,6 +1,6 @@
 "use strict";
 
-const blake3 = typeof module !== "undefined" && module.exports
+let blake3 = typeof module !== "undefined" && module.exports
   ? require("./blake3.js")
   : globalThis.SsvBlake3;
 
@@ -420,13 +420,12 @@ function actualizeMatrix(p) {
   throw new RangeError("cannot actualize an unregistered matrix family");
 }
 
-function randomSeedHex(randomSource) {
-  if (!randomSource || typeof randomSource.getRandomValues !== "function") {
-    throw new Error("secure browser randomness is unavailable");
+function nextSeedHex(seed) {
+  if (typeof seed !== "string" || !/^[0-9a-f]{64}$/.test(seed)) {
+    throw new TypeError("an instance seed must be exactly 64 lowercase hexadecimal characters");
   }
-  const seed = new Uint8Array(32);
-  randomSource.getRandomValues(seed);
-  return blake3.bytesToHex(seed);
+  const next = (BigInt(`0x${seed}`) + 1n) & ((1n << 256n) - 1n);
+  return next.toString(16).padStart(64, "0");
 }
 
 function structuralNonzeros(p) {
@@ -546,7 +545,7 @@ function initialize() {
   function parameters() {
     return {
       family: document.querySelector("#family").value,
-      seed: seedInput.value.trim(),
+      seed: seedInput ? seedInput.value.trim() : DEFAULT_INSTANCE_SEED,
       dimension: numberValue("dimension"),
       offsets: parseOffsets(document.querySelector("#offsets").value),
       periodBits: numberValue("period-bits"),
@@ -685,15 +684,15 @@ function initialize() {
   templateKind.addEventListener("change", update);
   hostInputs.forEach((input) => input.addEventListener("input", update));
   privateService.addEventListener("change", update);
-  newSeedButton.addEventListener("click", () => {
-    try {
-      seedInput.value = randomSeedHex(globalThis.crypto);
+  if (newSeedButton && seedInput) {
+    newSeedButton.addEventListener("click", () => {
+      const current = /^[0-9a-f]{64}$/.test(seedInput.value.trim())
+        ? seedInput.value.trim()
+        : DEFAULT_INSTANCE_SEED;
+      seedInput.value = nextSeedHex(current);
       update();
-    } catch (error) {
-      formError.hidden = false;
-      formError.textContent = error.message;
-    }
-  });
+    });
+  }
 
   document.querySelectorAll("[role=tab]").forEach((tab) => {
     tab.addEventListener("click", () => {
@@ -746,12 +745,13 @@ if (typeof module !== "undefined" && module.exports) {
     actualizeMatrix,
     deriveSubseed,
     hostedWorkflow,
+    initialize,
     localWorkflow,
     matrixOffsets,
     matrixSpec,
     parseOffsets,
     problemTemplate,
-    randomSeedHex,
+    nextSeedHex,
     rhsSpec,
     solverHandoff,
     structuralNonzeros,
@@ -759,4 +759,32 @@ if (typeof module !== "undefined" && module.exports) {
   };
 }
 
-if (typeof document !== "undefined") initialize();
+function initializeWhenReady() {
+  if (blake3) {
+    initialize();
+    return;
+  }
+
+  const dependency = document.createElement("script");
+  dependency.src = "blake3.js?v=2";
+  dependency.addEventListener("load", () => {
+    blake3 = globalThis.SsvBlake3;
+    if (blake3) {
+      initialize();
+    } else {
+      showDependencyError();
+    }
+  });
+  dependency.addEventListener("error", showDependencyError);
+  document.head.append(dependency);
+}
+
+function showDependencyError() {
+  const formError = document.querySelector("#form-error");
+  if (formError) {
+    formError.hidden = false;
+    formError.textContent = "Unable to load the matrix preview generator. Refresh the page.";
+  }
+}
+
+if (typeof document !== "undefined") initializeWhenReady();
