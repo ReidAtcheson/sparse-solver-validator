@@ -18,7 +18,12 @@ use std::fmt::Debug;
 
 use thiserror::Error;
 
-use crate::GeneratedProblem;
+use crate::{
+    GeneratedProblem,
+    generator::{
+        CompiledMatrixFamily, PeriodicSymmetricDiaLaplacian, PeriodicSymmetricTridiagonal,
+    },
+};
 
 /// The one registered Boolean-coordinate convention.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -268,14 +273,17 @@ impl SuccinctPublicEvaluator for PublicEvaluationPlan<'_> {
         let padded_dimension = self.problem.dimension().next_power_of_two();
         let variables = padded_dimension.ilog2() as usize;
         PublicEvaluationMetadata {
-            evaluator_version: 1,
+            evaluator_version: self.problem.matrix.evaluator_version(),
             domain: MleDomain {
                 logical_dimension: self.problem.dimension(),
                 padded_dimension,
                 variables,
                 coordinate_order: BooleanCoordinateOrder::MostSignificantFirst,
             },
-            matrix_period_terms: certificate.matrix_period.min(padded_dimension),
+            matrix_period_terms: self
+                .problem
+                .matrix
+                .public_matrix_terms(certificate, padded_dimension),
             rhs_period_terms: certificate.rhs_period.min(padded_dimension),
             exact_bounds: self.problem.exact_arithmetic_bounds(),
         }
@@ -340,20 +348,35 @@ fn evaluate_matrix<I: MleInterpreter>(
     row_point: &[I::Scalar],
     column_point: &[I::Scalar],
 ) -> Result<MleEvaluation<I::Scalar>, MleEvaluationError> {
-    let variables = problem.dimension().next_power_of_two().ilog2() as usize;
+    match &problem.matrix {
+        CompiledMatrixFamily::Tridiagonal(matrix) => {
+            evaluate_tridiagonal_matrix(matrix, interpreter, row_point, column_point)
+        }
+        CompiledMatrixFamily::SymmetricDiaLaplacian(matrix) => {
+            evaluate_dia_matrix(matrix, interpreter, row_point, column_point)
+        }
+    }
+}
+
+fn evaluate_tridiagonal_matrix<I: MleInterpreter>(
+    matrix: &PeriodicSymmetricTridiagonal,
+    interpreter: &I,
+    row_point: &[I::Scalar],
+    column_point: &[I::Scalar],
+) -> Result<MleEvaluation<I::Scalar>, MleEvaluationError> {
+    let variables = matrix.dimension.next_power_of_two().ilog2() as usize;
     check_point("row", row_point, variables)?;
     check_point("column", column_point, variables)?;
     let mut arithmetic = Arithmetic::new(interpreter);
-    let dimension = problem.dimension();
-    let certificate = problem.certificate();
-    let margin = i64::try_from(certificate.strict_diagonal_dominance_margin_mantissa)
-        .expect("validated dominance margin fits i64");
+    let dimension = matrix.dimension;
+    let margin =
+        i64::try_from(matrix.margin_mantissa).expect("validated dominance margin fits i64");
     let active_diagonal =
         bounded_equal_indices(&mut arithmetic, row_point, column_point, dimension);
     let margin = arithmetic.embed_i64(margin);
     let mut result = arithmetic.mul(margin, active_diagonal);
 
-    let table = problem.off_diagonal_periodic_mantissas();
+    let table = &matrix.off_diagonal_mantissas;
     let period_bits = variables.min(table.len().ilog2() as usize);
     let period = 1_usize << period_bits;
     let high_variables = variables - period_bits;
@@ -411,7 +434,95 @@ fn evaluate_matrix<I: MleInterpreter>(
 
     Ok(MleEvaluation {
         value: result,
-        fractional_bits: certificate.coefficient_fractional_bits,
+        fractional_bits: matrix.fractional_bits,
+        work: arithmetic.work,
+    })
+}
+
+fn evaluate_dia_matrix<I: MleInterpreter>(
+    matrix: &PeriodicSymmetricDiaLaplacian,
+    interpreter: &I,
+    row_point: &[I::Scalar],
+    column_point: &[I::Scalar],
+) -> Result<MleEvaluation<I::Scalar>, MleEvaluationError> {
+    let variables = matrix.dimension.next_power_of_two().ilog2() as usize;
+    check_point("row", row_point, variables)?;
+    check_point("column", column_point, variables)?;
+    let mut arithmetic = Arithmetic::new(interpreter);
+    let active_diagonal =
+        bounded_equal_indices(&mut arithmetic, row_point, column_point, matrix.dimension);
+    let shift = arithmetic.embed_i64(
+        i64::try_from(matrix.diagonal_shift_mantissa).expect("validated diagonal shift fits i64"),
+    );
+    let mut result = arithmetic.mul(shift, active_diagonal);
+
+    for edge in &matrix.edges {
+        let anchor_limit = matrix.dimension - edge.positive_offset;
+        let table = matrix.edge_table(edge);
+        let period_bits = variables.min(table.len().ilog2() as usize);
+        let active_patterns = table.len().min(anchor_limit);
+        for (pattern, &edge_mantissa) in table.iter().take(active_patterns).enumerate() {
+            let lower_diagonal = periodic_shift_pair_indices(
+                &mut arithmetic,
+                row_point,
+                column_point,
+                PeriodicShiftPair {
+                    anchor_limit,
+                    pattern,
+                    period_bits,
+                    left_shift: 0,
+                    right_shift: 0,
+                },
+            );
+            let forward = periodic_shift_pair_indices(
+                &mut arithmetic,
+                row_point,
+                column_point,
+                PeriodicShiftPair {
+                    anchor_limit,
+                    pattern,
+                    period_bits,
+                    left_shift: 0,
+                    right_shift: edge.positive_offset,
+                },
+            );
+            let reverse = periodic_shift_pair_indices(
+                &mut arithmetic,
+                row_point,
+                column_point,
+                PeriodicShiftPair {
+                    anchor_limit,
+                    pattern,
+                    period_bits,
+                    left_shift: edge.positive_offset,
+                    right_shift: 0,
+                },
+            );
+            let upper_diagonal = periodic_shift_pair_indices(
+                &mut arithmetic,
+                row_point,
+                column_point,
+                PeriodicShiftPair {
+                    anchor_limit,
+                    pattern,
+                    period_bits,
+                    left_shift: edge.positive_offset,
+                    right_shift: edge.positive_offset,
+                },
+            );
+            let off_diagonal_sum = arithmetic.add(forward, reverse);
+            let without_lower = arithmetic.sub(off_diagonal_sum, lower_diagonal);
+            let edge_basis = arithmetic.sub(without_lower, upper_diagonal);
+            let edge_mantissa = arithmetic.embed_i64(edge_mantissa);
+            let contribution = arithmetic.mul(edge_mantissa, edge_basis);
+            result = arithmetic.add(result, contribution);
+            arithmetic.work.periodic_terms += 1;
+        }
+    }
+
+    Ok(MleEvaluation {
+        value: result,
+        fractional_bits: matrix.fractional_bits,
         work: arithmetic.work,
     })
 }
@@ -558,6 +669,81 @@ fn bounded_equal_indices<I: MleInterpreter>(
         states = next;
     }
     states[1]
+}
+
+/// Evaluates one periodic DIA edge-orbit relation without scanning anchors.
+///
+/// The summed anchor `i` is restricted by `i < anchor_limit` and by its low
+/// `period_bits`. The two equality weights select `i + left_shift` and
+/// `i + right_shift`. A constant-size least-significant-bit-first automaton
+/// tracks both addition carries and the borrow proving the anchor bound, so
+/// work is linear in the Boolean-domain bit count for each active pattern.
+#[derive(Clone, Copy)]
+struct PeriodicShiftPair {
+    anchor_limit: usize,
+    pattern: usize,
+    period_bits: usize,
+    left_shift: usize,
+    right_shift: usize,
+}
+
+fn periodic_shift_pair_indices<I: MleInterpreter>(
+    arithmetic: &mut Arithmetic<'_, I>,
+    left: &[I::Scalar],
+    right: &[I::Scalar],
+    relation: PeriodicShiftPair,
+) -> I::Scalar {
+    debug_assert_eq!(left.len(), right.len());
+    debug_assert!(relation.period_bits <= left.len());
+    debug_assert!(relation.pattern < (1_usize << relation.period_bits));
+    let domain = 1_usize << left.len();
+    debug_assert!(relation.anchor_limit < domain);
+    debug_assert!(relation.left_shift < domain);
+    debug_assert!(relation.right_shift < domain);
+
+    let mut states = [arithmetic.zero(); 8];
+    states[shift_state_index(0, 0, 0)] = arithmetic.one();
+    for bit in 0..left.len() {
+        let coordinate = left.len() - 1 - bit;
+        let limit_bit = (relation.anchor_limit >> bit) & 1;
+        let left_shift_bit = (relation.left_shift >> bit) & 1;
+        let right_shift_bit = (relation.right_shift >> bit) & 1;
+        let mut next = [arithmetic.zero(); 8];
+        for left_carry in 0..=1 {
+            for right_carry in 0..=1 {
+                for borrow_in in 0..=1 {
+                    let state = states[shift_state_index(left_carry, right_carry, borrow_in)];
+                    for anchor_bit in 0..=1 {
+                        if bit < relation.period_bits
+                            && anchor_bit != ((relation.pattern >> bit) & 1)
+                        {
+                            continue;
+                        }
+                        let left_sum = anchor_bit + left_shift_bit + left_carry;
+                        let left_bit = left_sum & 1;
+                        let left_carry_out = left_sum >> 1;
+                        let right_sum = anchor_bit + right_shift_bit + right_carry;
+                        let right_bit = right_sum & 1;
+                        let right_carry_out = right_sum >> 1;
+                        let borrow_out = usize::from(anchor_bit < limit_bit + borrow_in);
+                        let left_weight = bit_weight(arithmetic, left[coordinate], left_bit);
+                        let right_weight = bit_weight(arithmetic, right[coordinate], right_bit);
+                        let pair = arithmetic.mul(left_weight, right_weight);
+                        let term = arithmetic.mul(state, pair);
+                        let destination =
+                            shift_state_index(left_carry_out, right_carry_out, borrow_out);
+                        next[destination] = arithmetic.add(next[destination], term);
+                    }
+                }
+            }
+        }
+        states = next;
+    }
+    states[shift_state_index(0, 0, 1)]
+}
+
+const fn shift_state_index(left_carry: usize, right_carry: usize, borrow: usize) -> usize {
+    (left_carry << 2) | (right_carry << 1) | borrow
 }
 
 fn bounded_successor_indices<I: MleInterpreter>(
@@ -834,7 +1020,8 @@ mod tests {
     use super::*;
     use crate::{
         BoundaryRule, DiagonalConstruction, InstanceSeed, MatrixSpec, OffDiagonalValues,
-        ProblemTemplate, RequestedOutput, RhsSpec, TemplateRandomness, TemplateSchema,
+        ProblemTemplate, RequestedOutput, RhsSpec, SymmetricDiaEdge, TemplateRandomness,
+        TemplateSchema,
     };
 
     const TEST_PRIME: u64 = (1_u64 << 61) - 1;
@@ -913,6 +1100,31 @@ mod tests {
             .unwrap()
             .compile()
             .unwrap()
+    }
+
+    fn dia_generated(dimension: u64, rhs: RhsSpec) -> GeneratedProblem {
+        let mut template = template(dimension, rhs);
+        template.matrix = MatrixSpec::SeededSymmetricDiaLaplacianV1 {
+            dimension,
+            boundary: BoundaryRule::TruncateV1,
+            fractional_bits: 8,
+            diagonal_shift_mantissa: 16,
+            edge_diagonals: vec![
+                SymmetricDiaEdge {
+                    positive_offset: 1,
+                    period_bits: 2,
+                    minimum_weight_mantissa: 1,
+                    maximum_weight_mantissa: 7,
+                },
+                SymmetricDiaEdge {
+                    positive_offset: 3,
+                    period_bits: 1,
+                    minimum_weight_mantissa: 2,
+                    maximum_weight_mantissa: 9,
+                },
+            ],
+        };
+        template.finalize_literal().unwrap().compile().unwrap()
     }
 
     fn seeded_rhs() -> RhsSpec {
@@ -1017,6 +1229,34 @@ mod tests {
                     problem.certificate().rhs_fractional_bits
                 );
             }
+        }
+    }
+
+    #[test]
+    fn dia_evaluators_match_complete_scans_for_arbitrary_offsets() {
+        for dimension in [5, 8, 19, 33] {
+            let problem = dia_generated(dimension, seeded_rhs());
+            let plan = problem.public_evaluation_plan();
+            let variables = plan.metadata().domain.variables;
+            let row = test_point(variables, 7);
+            let column = test_point(variables, 11);
+            let matrix = plan
+                .evaluate_matrix_mle(&TestInterpreter, &row, &column)
+                .unwrap();
+            let rhs = plan.evaluate_rhs_mle(&TestInterpreter, &row).unwrap();
+            assert_eq!(
+                matrix.value,
+                scan_matrix(&TestInterpreter, &problem, &row, &column),
+                "DIA matrix mismatch at dimension {dimension}"
+            );
+            assert_eq!(
+                rhs.value,
+                scan_rhs(&TestInterpreter, &problem, &row),
+                "DIA RHS mismatch at dimension {dimension}"
+            );
+            assert_eq!(matrix.work.periodic_terms, 6);
+            assert_eq!(plan.metadata().evaluator_version, 2);
+            assert_eq!(plan.metadata().matrix_period_terms, 6);
         }
     }
 
@@ -1211,6 +1451,27 @@ mod tests {
     }
 
     #[test]
+    fn dia_binary64_interpreter_bounds_its_difference_from_a_complete_scan() {
+        let problem = dia_generated(19, seeded_rhs());
+        let plan = problem.public_evaluation_plan();
+        let variables = plan.metadata().domain.variables;
+        let row = (0..variables)
+            .map(|coordinate| (coordinate as f64 + 1.0) / 16.0)
+            .collect::<Vec<_>>();
+        let column = (0..variables)
+            .map(|coordinate| (2.0 * coordinate as f64 + 1.0) / 32.0)
+            .collect::<Vec<_>>();
+        let matrix = plan.evaluate_matrix_mle_f64(&row, &column).unwrap();
+        let scanned = tracked_scan_matrix(&problem, &row, &column);
+        let gap = (matrix.value - scanned.value).abs();
+        assert!(
+            gap <= matrix.roundoff.forward_absolute_error_bound
+                + scanned.roundoff.forward_absolute_error_bound,
+            "DIA matrix interval mismatch: gap={gap:e}"
+        );
+    }
+
+    #[test]
     fn work_depends_on_period_and_log_dimension_not_nnz() {
         let problem = generated(1 << 20, seeded_rhs());
         let plan = problem.public_evaluation_plan();
@@ -1227,6 +1488,22 @@ mod tests {
         assert!(rhs.work.arithmetic_operations() < 2_000);
         assert_eq!(metadata.matrix_period_terms, 8);
         assert_eq!(metadata.rhs_period_terms, 4);
+    }
+
+    #[test]
+    fn dia_work_depends_on_edge_patterns_and_log_dimension() {
+        let problem = dia_generated(1 << 20, seeded_rhs());
+        let plan = problem.public_evaluation_plan();
+        let metadata = plan.metadata();
+        let row = vec![TestInterpreter.embed_i64(2); metadata.domain.variables];
+        let column = vec![TestInterpreter.embed_i64(3); metadata.domain.variables];
+        let matrix = plan
+            .evaluate_matrix_mle(&TestInterpreter, &row, &column)
+            .unwrap();
+        assert_eq!(matrix.work.periodic_terms, 6);
+        assert_eq!(metadata.matrix_period_terms, 6);
+        assert!(matrix.work.arithmetic_operations() < 100_000);
+        assert!(problem.structural_nonzeros() > 3_000_000);
     }
 
     #[test]
