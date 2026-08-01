@@ -6,15 +6,26 @@
 //! per tree height plus `O(q log N)` temporary authentication data; a verifier
 //! retains only the canonical joint frontier for the caller-derived indices.
 //!
-//! Hash domains, logical-shape binding, padding, index order, and frontier
-//! order are frozen from `fast-validation/src/merkle.rs` at research revision
-//! `be8b67b74da54d162df2e6e0a9d813779959bb60`.
+//! The per-value V5 hash domains, logical-shape binding, padding, index order,
+//! and frontier order are frozen from `fast-validation/src/merkle.rs` at
+//! research revision `be8b67b74da54d162df2e6e0a9d813779959bb60`.
+//! The separately domain-separated V6 layout commits 32 adjacent evaluations
+//! per leaf and opens selected chunks in full.
 
 use thiserror::Error;
 
 const COMPLEX_LEAF_DOMAIN: &[u8] = b"sparse-solution/fast-validation/merkle/complex-leaf/v2";
 const COMPLEX_PADDING_DOMAIN: &[u8] = b"sparse-solution/fast-validation/merkle/complex-padding/v2";
 const COMPLEX_NODE_DOMAIN: &[u8] = b"sparse-solution/fast-validation/merkle/complex-node/v2";
+const COMPLEX_CHUNK_LEAF_DOMAIN: &[u8] =
+    b"sparse-solution/fast-validation/merkle/complex-chunk-leaf/v1";
+const COMPLEX_CHUNK_PADDING_DOMAIN: &[u8] =
+    b"sparse-solution/fast-validation/merkle/complex-chunk-padding/v1";
+const COMPLEX_CHUNK_NODE_DOMAIN: &[u8] =
+    b"sparse-solution/fast-validation/merkle/complex-chunk-node/v1";
+
+/// Number of adjacent complex evaluations authenticated by one chunked leaf.
+pub const COMPLEX_VALUES_PER_CHUNK: usize = 32;
 
 /// A BLAKE3 Merkle root.
 pub type MerkleRoot = [u8; 32];
@@ -333,6 +344,344 @@ pub fn verify_complex_multiproof(
     Ok(hash_count)
 }
 
+/// Computes a root with 32 adjacent complex evaluations per Merkle leaf.
+///
+/// The iterator's exact length and every value index are bound into the tree.
+/// A final short chunk is canonical; synthetic leaves pad only the chunk count
+/// to a power of two. Production unit-circle domains are powers of two, so
+/// they have either one short leaf or no synthetic padding.
+pub(crate) fn streaming_chunked_complex_root_iter<I>(
+    tree_label: &[u8],
+    mut value_bits: I,
+) -> Result<MerkleRoot, MerkleError>
+where
+    I: ExactSizeIterator<Item = [u64; 2]>,
+{
+    let value_count = value_bits.len();
+    let chunk_count = complex_chunk_count(value_count)?;
+    let padded_chunk_count = padded_leaf_count(chunk_count)?;
+    let tree_height = padded_chunk_count.ilog2() as usize;
+    let mut reduction: Vec<Option<StreamingNode>> = vec![None; tree_height + 1];
+    let mut chunk = [[0_u64; 2]; COMPLEX_VALUES_PER_CHUNK];
+
+    for chunk_index in 0..padded_chunk_count {
+        let hash = if chunk_index < chunk_count {
+            let chunk_len = complex_chunk_len(value_count, chunk_index)?;
+            for slot in &mut chunk[..chunk_len] {
+                *slot = value_bits
+                    .next()
+                    .expect("exact-size complex iterator ended inside a chunk");
+            }
+            hash_complex_chunk_leaf(tree_label, value_count, chunk_index, &chunk[..chunk_len])
+        } else {
+            hash_complex_chunk_padding(tree_label, value_count, chunk_index)
+        };
+        let mut node = StreamingNode {
+            hash,
+            node_index: chunk_index,
+            selected_range: None,
+        };
+        let mut height = 0_usize;
+        while let Some(left) = reduction[height].take() {
+            let parent_index = node.node_index / 2;
+            node = StreamingNode {
+                hash: hash_complex_chunk_node(
+                    tree_label,
+                    value_count,
+                    height + 1,
+                    parent_index,
+                    &left.hash,
+                    &node.hash,
+                ),
+                node_index: parent_index,
+                selected_range: None,
+            };
+            height += 1;
+        }
+        reduction[height] = Some(node);
+    }
+    debug_assert!(value_bits.next().is_none());
+    let root = reduction[tree_height]
+        .take()
+        .expect("power-of-two chunk reduction must produce one root")
+        .hash;
+    debug_assert!(reduction.into_iter().all(|node| node.is_none()));
+    Ok(root)
+}
+
+/// Constructs a chunked compact multiproof without recomputing its root.
+///
+/// Every selected chunk is emitted in full and in increasing chunk order.
+/// This deliberately exchanges proof bytes for fewer short-message hashes.
+pub(crate) fn streaming_chunked_complex_multiproof_iter<I>(
+    tree_label: &[u8],
+    mut value_bits: I,
+    selected_indices: &[usize],
+) -> Result<ComplexMultiProof, MerkleError>
+where
+    I: ExactSizeIterator<Item = [u64; 2]>,
+{
+    let value_count = value_bits.len();
+    let selected_chunks = selected_complex_chunks(value_count, selected_indices)?;
+    let chunk_count = complex_chunk_count(value_count)?;
+    let padded_chunk_count = padded_leaf_count(chunk_count)?;
+    let expected_frontier = complex_multiproof_frontier_positions(chunk_count, &selected_chunks)?;
+    let tree_height = padded_chunk_count.ilog2() as usize;
+    let mut reduction: Vec<Option<SelectiveStreamingNode>> = vec![None; tree_height + 1];
+    let mut discovered_frontier = Vec::with_capacity(expected_frontier.len());
+    let expected_values = chunked_complex_opening_value_len(value_count, selected_indices)?;
+    let mut selected_values = Vec::with_capacity(expected_values);
+    let mut selected_cursor = 0_usize;
+    let mut chunk = [[0_u64; 2]; COMPLEX_VALUES_PER_CHUNK];
+
+    for chunk_index in 0..padded_chunk_count {
+        let selected = selected_chunks.get(selected_cursor) == Some(&chunk_index);
+        let hash = if chunk_index < chunk_count {
+            let chunk_len = complex_chunk_len(value_count, chunk_index)?;
+            for slot in &mut chunk[..chunk_len] {
+                *slot = value_bits
+                    .next()
+                    .expect("exact-size complex iterator ended inside a chunk");
+            }
+            if selected {
+                selected_values.extend_from_slice(&chunk[..chunk_len]);
+                selected_cursor += 1;
+                None
+            } else {
+                Some(hash_complex_chunk_leaf(
+                    tree_label,
+                    value_count,
+                    chunk_index,
+                    &chunk[..chunk_len],
+                ))
+            }
+        } else {
+            Some(hash_complex_chunk_padding(
+                tree_label,
+                value_count,
+                chunk_index,
+            ))
+        };
+        let mut node = SelectiveStreamingNode {
+            hash,
+            node_index: chunk_index,
+        };
+        let mut height = 0_usize;
+        while let Some(left) = reduction[height].take() {
+            let parent_hash = match (left.hash, node.hash) {
+                (Some(left_hash), Some(right_hash)) => Some(hash_complex_chunk_node(
+                    tree_label,
+                    value_count,
+                    height + 1,
+                    node.node_index / 2,
+                    &left_hash,
+                    &right_hash,
+                )),
+                (None, Some(right_hash)) => {
+                    discovered_frontier.push((
+                        FrontierPosition {
+                            level: height,
+                            index: node.node_index,
+                        },
+                        right_hash,
+                    ));
+                    None
+                }
+                (Some(left_hash), None) => {
+                    discovered_frontier.push((
+                        FrontierPosition {
+                            level: height,
+                            index: left.node_index,
+                        },
+                        left_hash,
+                    ));
+                    None
+                }
+                (None, None) => None,
+            };
+            node = SelectiveStreamingNode {
+                hash: parent_hash,
+                node_index: node.node_index / 2,
+            };
+            height += 1;
+        }
+        reduction[height] = Some(node);
+    }
+    debug_assert!(value_bits.next().is_none());
+    debug_assert_eq!(selected_cursor, selected_chunks.len());
+    debug_assert_eq!(selected_values.len(), expected_values);
+    debug_assert_eq!(
+        reduction[tree_height]
+            .take()
+            .expect("power-of-two chunk reduction must produce one root")
+            .hash,
+        None
+    );
+    discovered_frontier.sort_unstable_by_key(|(position, _)| (position.level, position.index));
+    debug_assert_eq!(
+        discovered_frontier
+            .iter()
+            .map(|(position, _)| *position)
+            .collect::<Vec<_>>(),
+        expected_frontier
+    );
+    Ok(ComplexMultiProof {
+        value_bits: selected_values,
+        frontier: discovered_frontier
+            .into_iter()
+            .map(|(_, hash)| hash)
+            .collect(),
+    })
+}
+
+/// Returns the chunked proof's exact number of revealed complex values.
+pub(crate) fn chunked_complex_opening_value_len(
+    value_count: usize,
+    expected_indices: &[usize],
+) -> Result<usize, MerkleError> {
+    selected_complex_chunks(value_count, expected_indices)?
+        .into_iter()
+        .try_fold(0_usize, |total, chunk_index| {
+            total
+                .checked_add(complex_chunk_len(value_count, chunk_index)?)
+                .ok_or(MerkleError::LeafCountOverflow)
+        })
+}
+
+/// Returns the chunked proof's exact number of frontier hashes.
+#[cfg(test)]
+pub(crate) fn chunked_complex_multiproof_frontier_len(
+    value_count: usize,
+    expected_indices: &[usize],
+) -> Result<usize, MerkleError> {
+    let chunks = selected_complex_chunks(value_count, expected_indices)?;
+    Ok(complex_multiproof_frontier_positions(complex_chunk_count(value_count)?, &chunks)?.len())
+}
+
+/// Verifies a compact proof whose leaves contain 32 adjacent values.
+pub(crate) fn verify_chunked_complex_multiproof(
+    tree_label: &[u8],
+    value_count: usize,
+    root: &MerkleRoot,
+    expected_indices: &[usize],
+    proof: &ComplexMultiProof,
+) -> Result<usize, MerkleError> {
+    let selected_chunks = selected_complex_chunks(value_count, expected_indices)?;
+    let expected_value_count = chunked_complex_opening_value_len(value_count, expected_indices)?;
+    if proof.value_bits.len() != expected_value_count {
+        return Err(MerkleError::OpeningValueCount {
+            expected: expected_value_count,
+            actual: proof.value_bits.len(),
+        });
+    }
+    let chunk_count = complex_chunk_count(value_count)?;
+    let frontier_positions = complex_multiproof_frontier_positions(chunk_count, &selected_chunks)?;
+    if proof.frontier.len() != frontier_positions.len() {
+        return Err(MerkleError::FrontierCount {
+            expected: frontier_positions.len(),
+            actual: proof.frontier.len(),
+        });
+    }
+
+    let mut value_cursor = 0_usize;
+    let mut nodes = Vec::with_capacity(selected_chunks.len());
+    for &chunk_index in &selected_chunks {
+        let chunk_len = complex_chunk_len(value_count, chunk_index)?;
+        let end = value_cursor
+            .checked_add(chunk_len)
+            .ok_or(MerkleError::LeafCountOverflow)?;
+        nodes.push((
+            chunk_index,
+            hash_complex_chunk_leaf(
+                tree_label,
+                value_count,
+                chunk_index,
+                &proof.value_bits[value_cursor..end],
+            ),
+        ));
+        value_cursor = end;
+    }
+    debug_assert_eq!(value_cursor, proof.value_bits.len());
+
+    let tree_height = padded_leaf_count(chunk_count)?.ilog2() as usize;
+    let mut hash_count = nodes.len();
+    let mut frontier_cursor = 0_usize;
+    for level in 0..tree_height {
+        let mut parents = Vec::with_capacity(nodes.len().div_ceil(2));
+        let mut cursor = 0_usize;
+        while cursor < nodes.len() {
+            let (node_index, node_hash) = nodes[cursor];
+            let selected_sibling = nodes
+                .get(cursor + 1)
+                .filter(|(next_index, _)| node_index & 1 == 0 && *next_index == node_index + 1);
+            let (left, right, consumed) = if let Some(&(_, sibling_hash)) = selected_sibling {
+                (node_hash, sibling_hash, 2)
+            } else {
+                let position = frontier_positions[frontier_cursor];
+                debug_assert_eq!(position.level, level);
+                debug_assert_eq!(position.index, node_index ^ 1);
+                let sibling_hash = proof.frontier[frontier_cursor];
+                frontier_cursor += 1;
+                if node_index & 1 == 0 {
+                    (node_hash, sibling_hash, 1)
+                } else {
+                    (sibling_hash, node_hash, 1)
+                }
+            };
+            let parent_index = node_index / 2;
+            parents.push((
+                parent_index,
+                hash_complex_chunk_node(
+                    tree_label,
+                    value_count,
+                    level + 1,
+                    parent_index,
+                    &left,
+                    &right,
+                ),
+            ));
+            hash_count += 1;
+            cursor += consumed;
+        }
+        nodes = parents;
+    }
+    debug_assert_eq!(frontier_cursor, proof.frontier.len());
+    if nodes.len() != 1 || &nodes[0].1 != root {
+        return Err(MerkleError::RootMismatch);
+    }
+    Ok(hash_count)
+}
+
+/// Reads one authenticated value from a previously verified chunked proof.
+pub(crate) fn chunked_complex_opened_value_bits(
+    value_count: usize,
+    expected_indices: &[usize],
+    proof: &ComplexMultiProof,
+    index: usize,
+) -> Result<[u64; 2], MerkleError> {
+    validate_index(index, value_count)?;
+    let selected_chunks = selected_complex_chunks(value_count, expected_indices)?;
+    let chunk_index = index / COMPLEX_VALUES_PER_CHUNK;
+    let chunk_position = selected_chunks.binary_search(&chunk_index).map_err(|_| {
+        MerkleError::OpeningIndexMismatch {
+            expected: index,
+            actual: index,
+        }
+    })?;
+    let value_position = chunk_position
+        .checked_mul(COMPLEX_VALUES_PER_CHUNK)
+        .and_then(|position| position.checked_add(index % COMPLEX_VALUES_PER_CHUNK))
+        .ok_or(MerkleError::LeafCountOverflow)?;
+    proof
+        .value_bits
+        .get(value_position)
+        .copied()
+        .ok_or(MerkleError::OpeningValueCount {
+            expected: chunked_complex_opening_value_len(value_count, expected_indices)?,
+            actual: proof.value_bits.len(),
+        })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ComplexOpening {
     index: usize,
@@ -640,6 +989,98 @@ fn padded_leaf_count(leaf_count: usize) -> Result<usize, MerkleError> {
     leaf_count
         .checked_next_power_of_two()
         .ok_or(MerkleError::LeafCountOverflow)
+}
+
+fn complex_chunk_count(value_count: usize) -> Result<usize, MerkleError> {
+    if value_count == 0 {
+        return Err(MerkleError::EmptyTree);
+    }
+    Ok(value_count.div_ceil(COMPLEX_VALUES_PER_CHUNK))
+}
+
+fn complex_chunk_len(value_count: usize, chunk_index: usize) -> Result<usize, MerkleError> {
+    let start = chunk_index
+        .checked_mul(COMPLEX_VALUES_PER_CHUNK)
+        .ok_or(MerkleError::LeafCountOverflow)?;
+    if start >= value_count {
+        return Err(MerkleError::IndexOutOfBounds {
+            index: start,
+            leaf_count: value_count,
+        });
+    }
+    Ok((value_count - start).min(COMPLEX_VALUES_PER_CHUNK))
+}
+
+fn selected_complex_chunks(
+    value_count: usize,
+    expected_indices: &[usize],
+) -> Result<Vec<usize>, MerkleError> {
+    validate_multiproof_indices(expected_indices, value_count)?;
+    let mut chunks = Vec::with_capacity(expected_indices.len());
+    for &index in expected_indices {
+        let chunk = index / COMPLEX_VALUES_PER_CHUNK;
+        if chunks.last() != Some(&chunk) {
+            chunks.push(chunk);
+        }
+    }
+    Ok(chunks)
+}
+
+fn hash_complex_chunk_leaf(
+    tree_label: &[u8],
+    value_count: usize,
+    chunk_index: usize,
+    value_bits: &[[u64; 2]],
+) -> MerkleRoot {
+    debug_assert!(!value_bits.is_empty());
+    debug_assert!(value_bits.len() <= COMPLEX_VALUES_PER_CHUNK);
+    let mut packed = [0_u8; 16 * COMPLEX_VALUES_PER_CHUNK];
+    for (output, [real_bits, imaginary_bits]) in
+        packed.chunks_exact_mut(16).zip(value_bits.iter().copied())
+    {
+        output[..8].copy_from_slice(&real_bits.to_le_bytes());
+        output[8..].copy_from_slice(&imaginary_bits.to_le_bytes());
+    }
+    let mut hasher = blake3::Hasher::new();
+    update_field(&mut hasher, COMPLEX_CHUNK_LEAF_DOMAIN);
+    update_field(&mut hasher, tree_label);
+    update_usize(&mut hasher, value_count);
+    update_usize(&mut hasher, chunk_index);
+    update_usize(&mut hasher, value_bits.len());
+    hasher.update(&packed[..16 * value_bits.len()]);
+    *hasher.finalize().as_bytes()
+}
+
+fn hash_complex_chunk_padding(
+    tree_label: &[u8],
+    value_count: usize,
+    chunk_index: usize,
+) -> MerkleRoot {
+    let mut hasher = blake3::Hasher::new();
+    update_field(&mut hasher, COMPLEX_CHUNK_PADDING_DOMAIN);
+    update_field(&mut hasher, tree_label);
+    update_usize(&mut hasher, value_count);
+    update_usize(&mut hasher, chunk_index);
+    *hasher.finalize().as_bytes()
+}
+
+fn hash_complex_chunk_node(
+    tree_label: &[u8],
+    value_count: usize,
+    level: usize,
+    index: usize,
+    left: &MerkleRoot,
+    right: &MerkleRoot,
+) -> MerkleRoot {
+    let mut hasher = blake3::Hasher::new();
+    update_field(&mut hasher, COMPLEX_CHUNK_NODE_DOMAIN);
+    update_field(&mut hasher, tree_label);
+    update_usize(&mut hasher, value_count);
+    update_usize(&mut hasher, level);
+    update_usize(&mut hasher, index);
+    hasher.update(left);
+    hasher.update(right);
+    *hasher.finalize().as_bytes()
 }
 
 fn hash_complex_leaf(
@@ -953,6 +1394,80 @@ mod tests {
                 index: 3,
                 leaf_count: 3,
             })
+        );
+    }
+
+    #[test]
+    fn chunked_roots_and_multiproofs_round_trip_across_chunk_boundaries() {
+        for value_count in 1_usize..=97 {
+            let values = (0..value_count)
+                .map(|index| {
+                    [
+                        (index as f64 + 0.375).to_bits(),
+                        (17.0 - index as f64 * 0.25).to_bits(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let selected = (0..value_count)
+                .filter(|index| {
+                    *index == 0
+                        || *index + 1 == value_count
+                        || *index == 31
+                        || *index == 32
+                        || *index % 19 == 0
+                })
+                .collect::<Vec<_>>();
+            let root = streaming_chunked_complex_root_iter(LABEL, values.iter().copied()).unwrap();
+            let proof =
+                streaming_chunked_complex_multiproof_iter(LABEL, values.iter().copied(), &selected)
+                    .unwrap();
+            assert_eq!(
+                proof.value_bits.len(),
+                chunked_complex_opening_value_len(value_count, &selected).unwrap()
+            );
+            assert_eq!(
+                proof.frontier.len(),
+                chunked_complex_multiproof_frontier_len(value_count, &selected).unwrap()
+            );
+            verify_chunked_complex_multiproof(LABEL, value_count, &root, &selected, &proof)
+                .unwrap();
+            for &index in &selected {
+                assert_eq!(
+                    chunked_complex_opened_value_bits(value_count, &selected, &proof, index)
+                        .unwrap(),
+                    values[index]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_openings_bind_unqueried_values_in_revealed_chunks() {
+        let values = (0..64)
+            .map(|index| [(index as f64).to_bits(), (index as f64 + 0.5).to_bits()])
+            .collect::<Vec<_>>();
+        let selected = vec![3, 40];
+        let root = streaming_chunked_complex_root_iter(LABEL, values.iter().copied()).unwrap();
+        let proof =
+            streaming_chunked_complex_multiproof_iter(LABEL, values.iter().copied(), &selected)
+                .unwrap();
+        assert_eq!(proof.value_bits.len(), 64);
+        assert!(proof.frontier.is_empty());
+
+        let mut changed = proof.clone();
+        changed.value_bits[17][0] ^= 1;
+        assert_eq!(
+            verify_chunked_complex_multiproof(LABEL, 64, &root, &selected, &changed),
+            Err(MerkleError::RootMismatch)
+        );
+    }
+
+    #[test]
+    fn chunked_and_single_value_tree_domains_are_distinct() {
+        let values = complex_values();
+        assert_ne!(
+            streaming_chunked_complex_root_iter(LABEL, values.iter().copied()).unwrap(),
+            streaming_complex_root(LABEL, &values).unwrap()
         );
     }
 }

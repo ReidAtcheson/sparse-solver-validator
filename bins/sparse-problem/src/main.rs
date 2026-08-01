@@ -84,6 +84,17 @@ enum Command {
         #[arg(long)]
         solution: PathBuf,
     },
+    /// Solve an SPD generated problem with unpreconditioned conjugate gradients.
+    CgSolution {
+        #[arg(long)]
+        problem: PathBuf,
+        #[arg(long)]
+        solution: PathBuf,
+        #[arg(long, default_value_t = 1.0e-12)]
+        relative_tolerance: f64,
+        #[arg(long)]
+        maximum_iterations: Option<usize>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -121,6 +132,12 @@ fn main() -> Result<()> {
         Command::ManufacturedSolution { problem, solution } => {
             manufactured_solution(&problem, &solution)
         }
+        Command::CgSolution {
+            problem,
+            solution,
+            relative_tolerance,
+            maximum_iterations,
+        } => cg_solution(&problem, &solution, relative_tolerance, maximum_iterations),
     }
 }
 
@@ -183,6 +200,110 @@ fn write_problem(problem: &FinalizedProblem, path: &Path) -> Result<()> {
     println!("problem_digest={}", problem.digest()?);
     println!("instance_seed={}", problem.instance_seed());
     println!("problem_file={}", path.display());
+    Ok(())
+}
+
+fn cg_solution(
+    problem_path: &Path,
+    solution_path: &Path,
+    relative_tolerance: f64,
+    maximum_iterations: Option<usize>,
+) -> Result<()> {
+    if !relative_tolerance.is_finite() || relative_tolerance <= 0.0 {
+        bail!("relative tolerance must be finite and positive");
+    }
+    let problem = load_problem(problem_path)?;
+    let generated = problem.compile()?;
+    let dimension = generated.dimension();
+    let iteration_limit = maximum_iterations.unwrap_or(
+        dimension
+            .checked_mul(4)
+            .context("default CG iteration limit overflow")?,
+    );
+    if iteration_limit == 0 {
+        bail!("maximum CG iterations must be positive");
+    }
+
+    fn dot(left: &[f64], right: &[f64]) -> f64 {
+        left.iter()
+            .zip(right)
+            .map(|(&left, &right)| left * right)
+            .sum()
+    }
+
+    let mut x = vec![0.0; dimension];
+    let mut residual = (0..dimension)
+        .map(|row| {
+            generated
+                .rhs_f64(row)
+                .context("generated RHS row is missing")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut direction = residual.clone();
+    let mut image = vec![0.0; dimension];
+    let initial_squared_norm = dot(&residual, &residual);
+    let target_squared_norm = initial_squared_norm * relative_tolerance * relative_tolerance;
+    let mut squared_norm = initial_squared_norm;
+    let mut iterations = 0_usize;
+
+    while squared_norm > target_squared_norm && iterations < iteration_limit {
+        for (row_index, row) in generated.rows().enumerate() {
+            image[row_index] = row
+                .map(|entry| entry.value.to_f64() * direction[entry.column])
+                .sum();
+        }
+        let denominator = dot(&direction, &image);
+        if !denominator.is_finite() || denominator <= 0.0 {
+            bail!("CG encountered a non-positive or non-finite curvature");
+        }
+        let step = squared_norm / denominator;
+        for ((x_value, residual_value), (&direction_value, &image_value)) in x
+            .iter_mut()
+            .zip(&mut residual)
+            .zip(direction.iter().zip(&image))
+        {
+            *x_value += step * direction_value;
+            *residual_value -= step * image_value;
+        }
+        let next_squared_norm = dot(&residual, &residual);
+        iterations += 1;
+        if next_squared_norm <= target_squared_norm {
+            squared_norm = next_squared_norm;
+            break;
+        }
+        let beta = next_squared_norm / squared_norm;
+        for (direction_value, &residual_value) in direction.iter_mut().zip(&residual) {
+            *direction_value = residual_value + beta * *direction_value;
+        }
+        squared_norm = next_squared_norm;
+    }
+    if squared_norm > target_squared_norm {
+        bail!(
+            "CG did not converge in {iteration_limit} iterations: relative residual={}",
+            (squared_norm / initial_squared_norm).sqrt()
+        );
+    }
+    for value in &mut x {
+        if *value == 0.0 {
+            *value = 0.0;
+        }
+    }
+    let solution = Solution::new(x, dimension)?;
+    let output = File::create(solution_path)
+        .with_context(|| format!("could not create {}", solution_path.display()))?;
+    solution
+        .write_json(BufWriter::new(output))
+        .with_context(|| format!("could not write {}", solution_path.display()))?;
+    println!("cg_iterations={iterations}");
+    println!(
+        "cg_relative_residual={:.17e}",
+        if initial_squared_norm == 0.0 {
+            0.0
+        } else {
+            (squared_norm / initial_squared_norm).sqrt()
+        }
+    );
+    println!("solution_file={}", solution_path.display());
     Ok(())
 }
 
@@ -279,6 +400,7 @@ enum ProtocolArg {
     Direct,
     Exact,
     Fast,
+    FastChunked,
 }
 
 impl From<ProtocolArg> for ProofProtocol {
@@ -287,6 +409,7 @@ impl From<ProtocolArg> for ProofProtocol {
             ProtocolArg::Direct => Self::DirectReferenceV1,
             ProtocolArg::Exact => Self::WhirField192L2V4,
             ProtocolArg::Fast => Self::FastBinary64UnitCircleV5,
+            ProtocolArg::FastChunked => Self::FastBinary64UnitCircleChunkedV6,
         }
     }
 }

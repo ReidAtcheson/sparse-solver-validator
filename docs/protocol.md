@@ -23,13 +23,14 @@ optional SignedChallenge hosted problem provenance
 The public statement produces a problem digest, manifest digest, protocol ID,
 and transcript digest. Backend proof bytes cannot change any of them.
 
-Three proof kinds are registered:
+Four proof kinds are registered:
 
 | Protocol | Meaning | Carries `x` | Validator row scan |
 | --- | --- | ---: | ---: |
 | `direct-reference-v1` | Independent binary64 relation computation | yes | yes |
 | `whir-field192-l2-v4` | Exact integer statement for Q63.64 `x` | no | no |
 | `fast-binary64-unit-circle-v5` | Provisional sampled metric diagnostics | no | no |
+| `fast-binary64-unit-circle-chunked-v6` | V5 diagnostics with 32-value Merkle leaves | no | no |
 
 The direct profile is not succinct. The exact and fast profiles receive a
 restricted verifier statement with the registered public-MLE evaluator but no
@@ -469,6 +470,21 @@ W = [x_0, ..., x_(N-1), R_0, ..., R_(N-1)].
 `W` is bit-reversed into monomial-coefficient order and evaluated on twice as
 many complex roots of unity as coefficients. The resulting rate-one-half
 unit-circle codeword is committed with a BLAKE3 Merkle root.
+
+The experimental `fast-binary64-unit-circle-chunked-v6` profile leaves the
+binary64 relation, sumchecks, code, query count, and full 256-bit BLAKE3 roots
+unchanged. Its only substantive change is the Merkle layout: one leaf commits
+32 adjacent complex evaluations in one 512-byte hash input. A queried index
+opens its complete chunk, and a canonical multiproof authenticates the selected
+chunks. Separate protocol, transcript, leaf, padding, node, and oracle-tree
+domains prevent V5 and V6 commitments or proofs from being reinterpreted.
+
+This is an explicit time/bandwidth trade. It reduces short-message leaf hashes
+and the height of every tree, but reveals extra adjacent evaluations and can
+roughly double proof size at the current 64-query policy. It does not reduce
+oversampling, establish a global numerical soundness theorem, provide zero
+knowledge, or justify replacing BLAKE3 with a non-binding checksum. The fixed
+chunk width is an empirical first point rather than an optimized parameter.
 
 The strict precommitment binds the statement, problem, manifest, typed
 public-evaluator version and metadata, numerical policy, code basis, shapes, and

@@ -1,0 +1,40 @@
+{
+  "schema": "sparse-solve/problem-template/v1",
+  "randomness": {
+    "kind": "literal-v1",
+    "seed": "0202020202020202020202020202020202020202020202020202020202020202"
+  },
+  "matrix": {
+    "kind": "seeded-symmetric-dia-laplacian-v1",
+    "dimension": 10000,
+    "boundary": "truncate-v1",
+    "fractional_bits": 12,
+    "diagonal_shift_mantissa": "256",
+    "edge_diagonals": [
+      {
+        "positive_offset": 1,
+        "period_bits": 8,
+        "minimum_weight_mantissa": "64",
+        "maximum_weight_mantissa": "256"
+      },
+      {
+        "positive_offset": 32,
+        "period_bits": 8,
+        "minimum_weight_mantissa": "32",
+        "maximum_weight_mantissa": "192"
+      }
+    ]
+  },
+  "rhs": {
+    "kind": "seeded-periodic-dyadic-v1",
+    "period_bits": 8,
+    "fractional_bits": 12,
+    "minimum_mantissa": "-2048",
+    "maximum_mantissa": "2047"
+  },
+  "requested_outputs": [
+    {
+      "kind": "squared-l2-residual-v1"
+    }
+  ]
+}

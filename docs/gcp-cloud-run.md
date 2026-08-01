@@ -179,7 +179,7 @@ gcloud run deploy "${SERVICE}" \
   --concurrency "${CONCURRENCY}" \
   --max "${MAX_INSTANCES}" \
   --max-instances "${MAX_INSTANCES}" \
-  --args "serve,--challenge-lifetime-seconds=${CHALLENGE_LIFETIME_SECONDS},--maximum-solution-elements=${MAXIMUM_SOLUTION_ELEMENTS},--allowed-protocol=direct-reference-v1,--allowed-protocol=whir-field192-l2-v4,--allowed-protocol=fast-binary64-unit-circle-v5,--max-concurrent-validations=1,--request-timeout-seconds=${REQUEST_TIMEOUT_SECONDS}" \
+  --args "serve,--challenge-lifetime-seconds=${CHALLENGE_LIFETIME_SECONDS},--maximum-solution-elements=${MAXIMUM_SOLUTION_ELEMENTS},--allowed-protocol=direct-reference-v1,--allowed-protocol=whir-field192-l2-v4,--allowed-protocol=fast-binary64-unit-circle-v5,--allowed-protocol=fast-binary64-unit-circle-chunked-v6,--max-concurrent-validations=1,--request-timeout-seconds=${REQUEST_TIMEOUT_SECONDS}" \
   --invoker-iam-check \
   --no-allow-unauthenticated
 ```

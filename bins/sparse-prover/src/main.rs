@@ -125,7 +125,10 @@ fn prove(args: &CommonProofArgs) -> Result<()> {
             );
         }
         BackendProverReport::Fast(report) => {
-            print_fast_prover_report(&report);
+            print_fast_prover_report(ProofProtocol::FastBinary64UnitCircleV5, &report);
+        }
+        BackendProverReport::FastChunked(report) => {
+            print_fast_prover_report(ProofProtocol::FastBinary64UnitCircleChunkedV6, &report);
         }
     }
     print_artifact_summary(summary, &args.proof);
@@ -185,13 +188,13 @@ fn fast_prove(args: &CommonInputArgs, precommitment_path: &Path, proof_path: &Pa
     let summary = ArtifactPrelude::parse(&encoded)?.summary();
     write_bytes(proof_path, &encoded)?;
 
-    print_fast_prover_report(&report);
+    print_fast_prover_report(ProofProtocol::FastBinary64UnitCircleV5, &report);
     print_artifact_summary(summary, proof_path);
     Ok(())
 }
 
-fn print_fast_prover_report(report: &FastProverReport) {
-    println!("proof_kind=fast-binary64-unit-circle-v5");
+fn print_fast_prover_report(protocol: ProofProtocol, report: &FastProverReport) {
+    println!("proof_kind={}", proof_protocol_name(protocol));
     println!("challenge_mode=noninteractive-fiat-shamir");
     println!("precommitment_digest={}", report.precommitment_digest);
     println!("residual_squared_l2_claim={:.17e}", report.squared_l2_claim);
@@ -218,6 +221,15 @@ fn print_fast_prover_report(report: &FastProverReport) {
         "prover_merkle_multiproof_passes={}",
         report.merkle_multiproof_passes
     );
+}
+
+const fn proof_protocol_name(protocol: ProofProtocol) -> &'static str {
+    match protocol {
+        ProofProtocol::DirectReferenceV1 => "direct-reference-v1",
+        ProofProtocol::WhirField192L2V4 => "whir-field192-l2-v4",
+        ProofProtocol::FastBinary64UnitCircleV5 => "fast-binary64-unit-circle-v5",
+        ProofProtocol::FastBinary64UnitCircleChunkedV6 => "fast-binary64-unit-circle-chunked-v6",
+    }
 }
 
 fn load_inputs(args: &CommonInputArgs) -> Result<LoadedInputs> {

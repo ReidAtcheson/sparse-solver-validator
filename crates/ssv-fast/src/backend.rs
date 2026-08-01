@@ -34,8 +34,10 @@ use crate::float_contract::{
     decode_canonical_bits,
 };
 use crate::merkle::{
-    ComplexMultiProof, MerkleError, MerkleRoot, streaming_complex_multiproof_iter,
-    streaming_complex_root, streaming_complex_root_iter, verify_complex_multiproof,
+    ComplexMultiProof, MerkleError, MerkleRoot, chunked_complex_opened_value_bits,
+    streaming_chunked_complex_multiproof_iter, streaming_chunked_complex_root_iter,
+    streaming_complex_multiproof_iter, streaming_complex_root, streaming_complex_root_iter,
+    verify_chunked_complex_multiproof, verify_complex_multiproof,
 };
 use crate::score::{
     DefectAccumulator, FastValidationScore, POLICY_3, Policy3, RelativeErrorObservation,
@@ -57,11 +59,14 @@ const FINAL_FRAME: u16 = u16::MAX;
 const PRECOMMIT_DIGEST_DOMAIN: &[u8] = b"sparse-solve/fast-precommitment/v6";
 const PAYLOAD_DIGEST_DOMAIN: &[u8] = b"sparse-solve/fast-backend-payload/v6";
 const PROTOCOL_LABEL: &[u8] = b"sparse-solve/fast/coefficient-unit-circle-linear-opening/v6";
+const CHUNKED_PROTOCOL_LABEL: &[u8] =
+    b"sparse-solve/fast/coefficient-unit-circle-linear-opening/chunked/v1";
 const FLOAT_CONTRACT: &[u8] =
     b"binary64/rne/no-fma/reject-nan-inf-negzero-subnormal/unit-circle-coeff/v2";
 const CODE_BASIS: &[u8] =
     b"packed-[x||R]/msb-mle/bit-reversed-monomial-coefficients/unit-circle-rate-1/2";
 const ORACLE_TREE_LABEL: &[u8] = b"ssv-fast/v6/packed-unit-circle-oracle";
+const CHUNKED_ORACLE_TREE_LABEL: &[u8] = b"ssv-fast/chunked-v1/packed-unit-circle-oracle";
 const MAX_PRECOMMITMENT_BYTES: usize = 4096;
 const MAX_PROOF_BYTES: usize = ssv_validation::MAX_SUCCINCT_PAYLOAD_BYTES;
 /// Maximum preflight estimate for backend-owned fast-prover memory.
@@ -76,6 +81,36 @@ const FAST_PROVER_FIXED_PEAK_BYTES: usize = 2 * MAX_PROOF_BYTES;
 // complex evaluations across the geometric folding hierarchy.
 const FAST_PROVER_PEAK_BYTES_PER_PADDED_ELEMENT: usize =
     6 * size_of::<f64>() + 8 * size_of::<ComplexValue>();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FastFlavor {
+    PerValueV5,
+    ChunkedV6,
+}
+
+impl FastFlavor {
+    fn from_protocol(protocol: ProofProtocol) -> Result<Self, FastError> {
+        match protocol {
+            ProofProtocol::FastBinary64UnitCircleV5 => Ok(Self::PerValueV5),
+            ProofProtocol::FastBinary64UnitCircleChunkedV6 => Ok(Self::ChunkedV6),
+            _ => Err(FastError::WrongProtocol),
+        }
+    }
+
+    const fn protocol_label(self) -> &'static [u8] {
+        match self {
+            Self::PerValueV5 => PROTOCOL_LABEL,
+            Self::ChunkedV6 => CHUNKED_PROTOCOL_LABEL,
+        }
+    }
+
+    const fn oracle_tree_label(self) -> &'static [u8] {
+        match self {
+            Self::PerValueV5 => ORACLE_TREE_LABEL,
+            Self::ChunkedV6 => CHUNKED_ORACLE_TREE_LABEL,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EvaluatorBinding {
@@ -163,6 +198,7 @@ impl EvaluatorBinding {
 /// Canonical commitment fixed before the first algebraic challenge exists.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FastPrecommitment {
+    protocol: ProofProtocol,
     statement_digest: Digest,
     problem_digest: Digest,
     manifest_digest: Digest,
@@ -177,6 +213,11 @@ impl FastPrecommitment {
     #[must_use]
     pub const fn logical_len(&self) -> usize {
         self.evaluator.logical_dimension
+    }
+
+    #[must_use]
+    pub const fn protocol(&self) -> ProofProtocol {
+        self.protocol
     }
 
     #[must_use]
@@ -205,7 +246,7 @@ impl FastPrecommitment {
         let mut output = Encoder::with_capacity(384);
         output.write_fixed_bytes(PRECOMMIT_MAGIC);
         output.write_u16(PRECOMMIT_VERSION);
-        output.write_u16(ProofProtocol::FastBinary64UnitCircleV5.wire_id());
+        output.write_u16(self.protocol.wire_id());
         output.write_u16(policy.policy_id);
         output.write_u64(policy.norm_zero_scale_bits);
         output.write_u64(policy.matvec_zero_scale_bits);
@@ -237,12 +278,12 @@ impl FastPrecommitment {
         {
             return Err(FastError::BadMagic);
         }
-        if input.read_u16().map_err(framing)? != PRECOMMIT_VERSION
-            || input.read_u16().map_err(framing)?
-                != ProofProtocol::FastBinary64UnitCircleV5.wire_id()
-        {
+        if input.read_u16().map_err(framing)? != PRECOMMIT_VERSION {
             return Err(FastError::UnsupportedVersion);
         }
+        let protocol = ProofProtocol::from_wire_id(input.read_u16().map_err(framing)?)
+            .ok_or(FastError::UnsupportedVersion)?;
+        FastFlavor::from_protocol(protocol)?;
         let expected = POLICY_3.transcript_parameters();
         let policy = (
             input.read_u16().map_err(framing)?,
@@ -297,6 +338,7 @@ impl FastPrecommitment {
             return Err(FastError::TranscriptShape);
         }
         Ok(Self {
+            protocol,
             statement_digest,
             problem_digest,
             manifest_digest,
@@ -473,7 +515,7 @@ pub struct FastVerifierReport {
 
 #[derive(Debug, Error)]
 pub enum FastError {
-    #[error("fast backend requires fast-binary64-unit-circle-v5")]
+    #[error("fast backend requires a registered fast binary64 protocol")]
     WrongProtocol,
     #[error("fast artifact has an unrecognized magic value")]
     BadMagic,
@@ -516,6 +558,10 @@ pub enum FastError {
 /// Experimental fast backend marker.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FastBackend;
+
+/// Experimental fast backend with 32 adjacent evaluations per Merkle leaf.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FastChunkedBackend;
 
 impl From<UnitCircleError> for FastError {
     fn from(error: UnitCircleError) -> Self {
@@ -686,6 +732,26 @@ impl FastBackend {
     }
 }
 
+impl FastChunkedBackend {
+    /// Constructs a complete local chunked-leaf proof while preparing private
+    /// material once.
+    pub fn prove_single_stage(
+        statement: &PublicStatement,
+        solution: &Solution,
+    ) -> Result<(Vec<u8>, FastProverReport), FastError> {
+        prove_single_stage_backend(statement, solution)
+    }
+
+    /// Performs cheap framing and statement-binding preflight before
+    /// algebraic verification.
+    pub fn preflight(
+        statement: &VerifierStatement<'_>,
+        payload: &[u8],
+    ) -> Result<FastPreflight, FastError> {
+        Ok(preflight_backend(statement, payload)?.report)
+    }
+}
+
 impl ValidationBackend for FastBackend {
     type ProverContext = FastProverContext;
     type ProverReport = FastProverReport;
@@ -712,6 +778,43 @@ impl ValidationBackend for FastBackend {
 }
 
 impl PrecommitBackend for FastBackend {
+    type Commitment = FastPrecommitment;
+    type CommitmentReport = FastCommitmentReport;
+
+    fn commit(
+        statement: &PublicStatement,
+        solution: &Solution,
+    ) -> Result<(Self::Commitment, Self::CommitmentReport), Self::Error> {
+        commit_backend(statement, solution)
+    }
+}
+
+impl ValidationBackend for FastChunkedBackend {
+    type ProverContext = FastProverContext;
+    type ProverReport = FastProverReport;
+    type VerifierReport = FastVerifierReport;
+    type Error = FastError;
+
+    const PROTOCOL: ProofProtocol = ProofProtocol::FastBinary64UnitCircleChunkedV6;
+
+    fn prove(
+        statement: &PublicStatement,
+        solution: &Solution,
+        context: &Self::ProverContext,
+    ) -> Result<(Vec<u8>, Self::ProverReport), Self::Error> {
+        prove_backend(statement, solution, context)
+    }
+
+    fn verify(
+        statement: &VerifierStatement<'_>,
+        payload: &[u8],
+        cancellation: &ValidationCancellation,
+    ) -> Result<Self::VerifierReport, Self::Error> {
+        verify_backend(statement, payload, cancellation)
+    }
+}
+
+impl PrecommitBackend for FastChunkedBackend {
     type Commitment = FastPrecommitment;
     type CommitmentReport = FastCommitmentReport;
 
@@ -777,6 +880,7 @@ fn prove_prepared(
     commitment: &FastPrecommitment,
     mut work: FastProverWork,
 ) -> Result<(Vec<u8>, FastProverReport), FastError> {
+    let flavor = FastFlavor::from_protocol(commitment.protocol)?;
     let mut transcript = initialize_transcript(commitment)?;
 
     // The norm endpoint is reused as the row-compression point, authenticating
@@ -893,8 +997,8 @@ fn prove_prepared(
                     let current = fold_levels.last().ok_or(FastError::TranscriptShape)?;
                     let next = current.fold(challenge)?;
                     work.record_codeword_fold()?;
-                    let label = oracle_tree_label(round + 1, next.evaluations().len());
-                    let root = complex_root(&label, next.evaluations())?;
+                    let label = oracle_tree_label(flavor, round + 1, next.evaluations().len());
+                    let root = complex_root(flavor, &label, next.evaluations())?;
                     work.record_merkle_root_computation()?;
                     Ok((next, root))
                 })();
@@ -938,6 +1042,7 @@ fn prove_prepared(
     // Query locations are derived only after every recursive oracle is fixed.
     let query_plan = draw_query_plan(&mut transcript, codeword_message_len)?;
     let folding = build_folding_opening(
+        flavor,
         fold_levels,
         &fold_roots,
         &fold_challenges,
@@ -988,9 +1093,10 @@ fn verify_backend(
     require_not_cancelled(cancellation)?;
     let preflight = preflight_backend(statement, payload_bytes)?;
     require_not_cancelled(cancellation)?;
-    let proof = decode_proof(preflight.proof_bytes, statement.dimension())?;
-    require_not_cancelled(cancellation)?;
     let commitment = preflight.commitment;
+    let flavor = FastFlavor::from_protocol(commitment.protocol)?;
+    let proof = decode_proof(preflight.proof_bytes, statement.dimension(), flavor)?;
+    require_not_cancelled(cancellation)?;
     let padded_len = commitment.evaluator.padded_dimension;
     let variables = commitment.evaluator.variables;
     let opening_variables = variables + 1;
@@ -1148,6 +1254,7 @@ fn verify_backend(
 
     let query_plan = draw_query_plan(&mut transcript, 2 * padded_len)?;
     let (fold_summary, fold_observations, merkle_hashes, opening_paths) = verify_folding_opening(
+        flavor,
         commitment.packed_codeword_root,
         &proof.folding,
         &opening_verification.endpoint.point,
@@ -1245,9 +1352,7 @@ fn preflight_backend<'a>(
     statement: &VerifierStatement<'_>,
     payload_bytes: &'a [u8],
 ) -> Result<DecodedPreflight<'a>, FastError> {
-    if statement.protocol() != ProofProtocol::FastBinary64UnitCircleV5 {
-        return Err(FastError::WrongProtocol);
-    }
+    FastFlavor::from_protocol(statement.protocol())?;
     if payload_bytes.len() > MAX_PROOF_BYTES {
         return Err(FastError::ResourceLimit);
     }
@@ -1255,6 +1360,7 @@ fn preflight_backend<'a>(
     let expected_evaluator =
         EvaluatorBinding::from_metadata(statement.public_evaluator().metadata())?;
     if commitment.statement_digest != statement.transcript_digest()
+        || commitment.protocol != statement.protocol()
         || commitment.problem_digest != statement.problem_digest()
         || commitment.manifest_digest != statement.manifest_digest()
         || commitment.evaluator != expected_evaluator
@@ -1273,9 +1379,7 @@ fn preflight_backend<'a>(
 }
 
 fn validate_prover_statement(statement: &PublicStatement) -> Result<(), FastError> {
-    if statement.manifest().protocol != ProofProtocol::FastBinary64UnitCircleV5 {
-        return Err(FastError::WrongProtocol);
-    }
+    FastFlavor::from_protocol(statement.manifest().protocol)?;
     validate_length(statement.generated().dimension())
 }
 
@@ -1322,7 +1426,12 @@ fn prepare_statement_material(
     work: &mut FastProverWork,
 ) -> Result<PreparedMaterial, FastError> {
     validate_prover_statement(statement)?;
-    prepare_material(statement.generated(), solution, work)
+    prepare_material(
+        statement.generated(),
+        solution,
+        work,
+        FastFlavor::from_protocol(statement.manifest().protocol)?,
+    )
 }
 
 fn make_statement_precommitment(
@@ -1330,6 +1439,7 @@ fn make_statement_precommitment(
     material: &PreparedMaterial,
 ) -> Result<FastPrecommitment, FastError> {
     make_precommitment(
+        statement.manifest().protocol,
         statement.transcript_digest(),
         statement.problem_digest(),
         statement.manifest_digest(),
@@ -1339,6 +1449,7 @@ fn make_statement_precommitment(
 }
 
 fn make_precommitment(
+    protocol: ProofProtocol,
     statement_digest: Digest,
     problem_digest: Digest,
     manifest_digest: Digest,
@@ -1356,6 +1467,7 @@ fn make_precommitment(
         .ok_or(FastError::TranscriptShape)?;
     let codeword_len = material.codeword.evaluations().len();
     let commitment = FastPrecommitment {
+        protocol,
         statement_digest,
         problem_digest,
         manifest_digest,
@@ -1375,6 +1487,7 @@ fn prepare_material(
     problem: &GeneratedProblem,
     solution: &Solution,
     work: &mut FastProverWork,
+    flavor: FastFlavor,
 ) -> Result<PreparedMaterial, FastError> {
     let logical_len = problem.dimension();
     let memory = fast_prover_memory_preflight(logical_len)?;
@@ -1407,8 +1520,8 @@ fn prepare_material(
     if codeword.message_len() != packed_len {
         return Err(FastError::TranscriptShape);
     }
-    let label = oracle_tree_label(0, codeword.evaluations().len());
-    let root = complex_root(&label, codeword.evaluations())?;
+    let label = oracle_tree_label(flavor, 0, codeword.evaluations().len());
+    let root = complex_root(flavor, &label, codeword.evaluations())?;
     work.record_merkle_root_computation()?;
     work.record_material_preparation(problem)?;
     Ok(PreparedMaterial {
@@ -1472,7 +1585,8 @@ fn prepare_matvec_tables(
 
 fn initialize_transcript(commitment: &FastPrecommitment) -> Result<Transcript, FastError> {
     let commitment_bytes = commitment.try_to_bytes()?;
-    let mut transcript = Transcript::new(PROTOCOL_LABEL);
+    let flavor = FastFlavor::from_protocol(commitment.protocol)?;
+    let mut transcript = Transcript::new(flavor.protocol_label());
     // The semantic public statement is fixed independently (and may carry the
     // application's signed problem provenance). Absorb it before the packed
     // oracle commitment so every subsequent challenge has the canonical
@@ -1602,16 +1716,22 @@ fn canonical_protocol_float(value: f64) -> Result<f64, FastError> {
     canonicalize_arithmetic(value).map_err(FastError::Float)
 }
 
-fn complex_root(label: &[u8], values: &[ComplexValue]) -> Result<MerkleRoot, FastError> {
-    Ok(streaming_complex_root_iter(
-        label,
-        values.iter().copied().map(ComplexValue::canonical_bits),
-    )?)
+fn complex_root(
+    flavor: FastFlavor,
+    label: &[u8],
+    values: &[ComplexValue],
+) -> Result<MerkleRoot, FastError> {
+    let bits = values.iter().copied().map(ComplexValue::canonical_bits);
+    Ok(match flavor {
+        FastFlavor::PerValueV5 => streaming_complex_root_iter(label, bits)?,
+        FastFlavor::ChunkedV6 => streaming_chunked_complex_root_iter(label, bits)?,
+    })
 }
 
-fn oracle_tree_label(round: usize, domain_len: usize) -> Vec<u8> {
-    let mut label = Vec::with_capacity(ORACLE_TREE_LABEL.len() + 16);
-    label.extend_from_slice(ORACLE_TREE_LABEL);
+fn oracle_tree_label(flavor: FastFlavor, round: usize, domain_len: usize) -> Vec<u8> {
+    let prefix = flavor.oracle_tree_label();
+    let mut label = Vec::with_capacity(prefix.len() + 16);
+    label.extend_from_slice(prefix);
     label.extend_from_slice(&(round as u64).to_le_bytes());
     label.extend_from_slice(&(domain_len as u64).to_le_bytes());
     label
@@ -1639,6 +1759,7 @@ fn absorb_float(transcript: &mut Transcript, tag: &[u8], value: f64) -> Result<(
 }
 
 fn build_folding_opening(
+    flavor: FastFlavor,
     levels: Vec<UnitCircleCodeword>,
     roots: &[MerkleRoot],
     challenges: &[f64],
@@ -1664,16 +1785,18 @@ fn build_folding_opening(
             return Err(FastError::TranscriptShape);
         }
         let selected = selected_indices_for_round(query_plan, current.evaluations().len())?;
-        let label = oracle_tree_label(round, current.evaluations().len());
-        let openings = streaming_complex_multiproof_iter(
-            &label,
-            current
-                .evaluations()
-                .iter()
-                .copied()
-                .map(ComplexValue::canonical_bits),
-            &selected,
-        )?;
+        let label = oracle_tree_label(flavor, round, current.evaluations().len());
+        let bits = current
+            .evaluations()
+            .iter()
+            .copied()
+            .map(ComplexValue::canonical_bits);
+        let openings = match flavor {
+            FastFlavor::PerValueV5 => streaming_complex_multiproof_iter(&label, bits, &selected)?,
+            FastFlavor::ChunkedV6 => {
+                streaming_chunked_complex_multiproof_iter(&label, bits, &selected)?
+            }
+        };
         work.record_merkle_multiproof_pass()?;
         round_openings.push(openings);
     }
@@ -1697,6 +1820,7 @@ fn build_folding_opening(
 }
 
 fn verify_folding_opening(
+    flavor: FastFlavor,
     initial_root: MerkleRoot,
     proof: &FoldingOpeningProof,
     challenges: &[f64],
@@ -1720,9 +1844,14 @@ fn verify_folding_opening(
     }
     let shift = u32::try_from(challenges.len() + 1).map_err(|_| FastError::ResourceLimit)?;
     let initial_domain = 1_usize.checked_shl(shift).ok_or(FastError::ResourceLimit)?;
-    let final_label = oracle_tree_label(challenges.len(), 2);
+    let final_label = oracle_tree_label(flavor, challenges.len(), 2);
     let final_bits = proof.final_values.map(ComplexValue::canonical_bits);
-    let final_root = streaming_complex_root(&final_label, &final_bits)?;
+    let final_root = match flavor {
+        FastFlavor::PerValueV5 => streaming_complex_root(&final_label, &final_bits)?,
+        FastFlavor::ChunkedV6 => {
+            streaming_chunked_complex_root_iter(&final_label, final_bits.into_iter())?
+        }
+    };
     if final_root != *proof.roots.last().ok_or(FastError::TranscriptShape)? {
         return Err(FastError::TranscriptShape);
     }
@@ -1740,9 +1869,19 @@ fn verify_folding_opening(
         } else {
             proof.roots[round - 1]
         };
-        let label = oracle_tree_label(round, domain_len);
-        let round_hashes =
-            verify_complex_multiproof(&label, domain_len, &root, &expected_indices, openings)?;
+        let label = oracle_tree_label(flavor, round, domain_len);
+        let round_hashes = match flavor {
+            FastFlavor::PerValueV5 => {
+                verify_complex_multiproof(&label, domain_len, &root, &expected_indices, openings)?
+            }
+            FastFlavor::ChunkedV6 => verify_chunked_complex_multiproof(
+                &label,
+                domain_len,
+                &root,
+                &expected_indices,
+                openings,
+            )?,
+        };
         merkle_hashes = merkle_hashes
             .checked_add(u64::try_from(round_hashes).map_err(|_| FastError::ResourceLimit)?)
             .ok_or(FastError::ResourceLimit)?;
@@ -1778,9 +1917,20 @@ fn verify_folding_opening(
             let half = current_domain / 2;
             let low_index = index % half;
             let current_openings = &proof.round_openings[round];
-            let at_z = opened_value(&round_indices[round], current_openings, low_index)?;
-            let at_negative_z =
-                opened_value(&round_indices[round], current_openings, low_index + half)?;
+            let at_z = opened_value(
+                flavor,
+                current_domain,
+                &round_indices[round],
+                current_openings,
+                low_index,
+            )?;
+            let at_negative_z = opened_value(
+                flavor,
+                current_domain,
+                &round_indices[round],
+                current_openings,
+                low_index + half,
+            )?;
             let expected = fold_pair_at_index(
                 at_z,
                 at_negative_z,
@@ -1792,6 +1942,8 @@ fn verify_folding_opening(
                 proof.final_values[low_index]
             } else {
                 opened_value(
+                    flavor,
+                    current_domain / 2,
                     &round_indices[round + 1],
                     &proof.round_openings[round + 1],
                     low_index,
@@ -1846,17 +1998,26 @@ fn selected_indices_for_round(
 }
 
 fn opened_value(
+    flavor: FastFlavor,
+    value_count: usize,
     expected_indices: &[usize],
     openings: &ComplexMultiProof,
     index: usize,
 ) -> Result<ComplexValue, FastError> {
-    let position = expected_indices
-        .binary_search(&index)
-        .map_err(|_| FastError::UnexpectedOpeningIndex)?;
-    let [real_bits, imaginary_bits] = *openings
-        .value_bits
-        .get(position)
-        .ok_or(FastError::TranscriptShape)?;
+    let [real_bits, imaginary_bits] = match flavor {
+        FastFlavor::PerValueV5 => {
+            let position = expected_indices
+                .binary_search(&index)
+                .map_err(|_| FastError::UnexpectedOpeningIndex)?;
+            *openings
+                .value_bits
+                .get(position)
+                .ok_or(FastError::TranscriptShape)?
+        }
+        FastFlavor::ChunkedV6 => {
+            chunked_complex_opened_value_bits(value_count, expected_indices, openings, index)?
+        }
+    };
     Ok(ComplexValue::from_canonical_bits(
         real_bits,
         imaginary_bits,
@@ -1982,7 +2143,11 @@ fn encode_proof(proof: &FastProof) -> Result<Vec<u8>, FastError> {
     Ok(bytes)
 }
 
-fn decode_proof(bytes: &[u8], expected_logical_len: usize) -> Result<FastProof, FastError> {
+fn decode_proof(
+    bytes: &[u8],
+    expected_logical_len: usize,
+    flavor: FastFlavor,
+) -> Result<FastProof, FastError> {
     let limits = DecodeLimits::new(MAX_PROOF_BYTES, MAX_PROOF_BYTES);
     let mut input = Reader::new(bytes, limits).map_err(framing)?;
     if input.read_u16().map_err(framing)? != PROOF_VERSION {
@@ -2019,7 +2184,13 @@ fn decode_proof(bytes: &[u8], expected_logical_len: usize) -> Result<FastProof, 
     let mut domain_len = 4 * padded_len;
     let mut round_openings = Vec::with_capacity(opening_count);
     for _ in 0..opening_count {
-        let maximum_values = (2 * query_count).min(domain_len);
+        let maximum_values = match flavor {
+            FastFlavor::PerValueV5 => (2 * query_count).min(domain_len),
+            FastFlavor::ChunkedV6 => (2 * query_count)
+                .checked_mul(crate::merkle::COMPLEX_VALUES_PER_CHUNK)
+                .ok_or(FastError::ResourceLimit)?
+                .min(domain_len),
+        };
         let maximum_frontier = maximum_values
             .checked_mul(domain_len.ilog2() as usize)
             .ok_or(FastError::ResourceLimit)?;
@@ -2174,6 +2345,18 @@ mod tests {
     use super::*;
 
     fn fixture(dimension: usize, period_bits: u8) -> (PublicStatement, Solution) {
+        fixture_for_protocol(
+            dimension,
+            period_bits,
+            ProofProtocol::FastBinary64UnitCircleV5,
+        )
+    }
+
+    fn fixture_for_protocol(
+        dimension: usize,
+        period_bits: u8,
+        protocol: ProofProtocol,
+    ) -> (PublicStatement, Solution) {
         let problem = ProblemTemplate {
             schema: TemplateSchema::V1,
             randomness: TemplateRandomness::LiteralV1 {
@@ -2198,7 +2381,7 @@ mod tests {
         let statement = PublicStatement::new(
             problem,
             ValidationManifest {
-                protocol: ProofProtocol::FastBinary64UnitCircleV5,
+                protocol,
                 max_solution_elements: dimension as u64,
                 max_public_matrix_terms: 1024,
                 max_public_rhs_terms: 1024,
@@ -2449,6 +2632,25 @@ mod tests {
     }
 
     #[test]
+    fn chunked_backend_round_trips_under_a_distinct_protocol() {
+        let (statement, solution) =
+            fixture_for_protocol(37, 2, ProofProtocol::FastBinary64UnitCircleChunkedV6);
+        let (payload, prover_report) =
+            FastChunkedBackend::prove_single_stage(&statement, &solution).unwrap();
+        let verifier_report = FastChunkedBackend::verify(
+            &statement.verifier_statement(),
+            &payload,
+            &ValidationCancellation::never(),
+        )
+        .unwrap();
+
+        assert_eq!(prover_report.squared_l2_claim, 0.0);
+        assert_eq!(verifier_report.score.squared_l2_claim, 0.0);
+        let (v5_statement, _) = fixture(37, 2);
+        assert!(FastBackend::verify(&v5_statement.verifier_statement(), &payload).is_err());
+    }
+
+    #[test]
     fn all_zero_dimension_sixteen_artifact_is_accepted_and_reports_calibration() {
         let statement = calibration_fixture();
         let dimension = statement.generated().dimension();
@@ -2461,7 +2663,8 @@ mod tests {
         let packed = vec![0.0; 2 * padded_len];
         let codeword = UnitCircleCodeword::encode(&packed).unwrap();
         let root = complex_root(
-            &oracle_tree_label(0, codeword.evaluations().len()),
+            FastFlavor::PerValueV5,
+            &oracle_tree_label(FastFlavor::PerValueV5, 0, codeword.evaluations().len()),
             codeword.evaluations(),
         )
         .unwrap();
@@ -2482,6 +2685,7 @@ mod tests {
         )
         .unwrap();
         let commitment = make_precommitment(
+            ProofProtocol::FastBinary64UnitCircleV5,
             statement.transcript_digest(),
             statement.problem_digest(),
             statement.manifest_digest(),
@@ -2546,7 +2750,12 @@ mod tests {
             fold_challenges.push(challenge);
             let fold_codeword = fold_levels.last().unwrap().fold(challenge).unwrap();
             let root = complex_root(
-                &oracle_tree_label(round + 1, fold_codeword.evaluations().len()),
+                FastFlavor::PerValueV5,
+                &oracle_tree_label(
+                    FastFlavor::PerValueV5,
+                    round + 1,
+                    fold_codeword.evaluations().len(),
+                ),
                 fold_codeword.evaluations(),
             )
             .unwrap();
@@ -2558,6 +2767,7 @@ mod tests {
         let query_plan = draw_query_plan(&mut transcript, material.codeword.message_len()).unwrap();
         let mut work = FastProverWork::default();
         let folding = build_folding_opening(
+            FastFlavor::PerValueV5,
             fold_levels,
             &fold_roots,
             &fold_challenges,
@@ -2670,6 +2880,7 @@ mod tests {
             statement.generated(),
             &solution,
             &mut FastProverWork::default(),
+            FastFlavor::PerValueV5,
         )
         .unwrap();
         assert!(
@@ -2697,6 +2908,7 @@ mod tests {
             statement.generated(),
             &solution,
             &mut FastProverWork::default(),
+            FastFlavor::PerValueV5,
         )
         .unwrap();
         assert!(

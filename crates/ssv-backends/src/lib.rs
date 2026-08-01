@@ -11,7 +11,7 @@
 
 use ssv_direct::{DirectBackend, DirectError, DirectProverReport, DirectVerifierReport};
 use ssv_exact::{ExactBackend, ExactError, ExactProverReport, ExactVerifierReport};
-use ssv_fast::{FastBackend, FastError, FastProverReport, FastVerifierReport};
+use ssv_fast::{FastBackend, FastChunkedBackend, FastError, FastProverReport, FastVerifierReport};
 use ssv_service_protocol::{
     CertifiedScore, DefectMetrics, FastConsistencyMetrics, ProofProtocol,
     PublicEvaluatorRoundoffMetrics, Unsigned192,
@@ -28,6 +28,7 @@ pub enum BackendProverReport {
     Direct(DirectProverReport),
     Exact(ExactProverReport),
     Fast(FastProverReport),
+    FastChunked(FastProverReport),
 }
 
 /// Report produced only after a backend's structural and cryptographic
@@ -41,6 +42,7 @@ pub enum BackendVerifierReport {
     Direct(DirectVerifierReport),
     Exact(ExactVerifierReport),
     Fast(Box<FastVerifierReport>),
+    FastChunked(Box<FastVerifierReport>),
 }
 
 #[derive(Debug, Error)]
@@ -94,6 +96,10 @@ pub fn prove_single_stage(
             let (payload, report) = FastBackend::prove_single_stage(statement, solution)?;
             Ok((payload, BackendProverReport::Fast(report)))
         }
+        ProofProtocol::FastBinary64UnitCircleChunkedV6 => {
+            let (payload, report) = FastChunkedBackend::prove_single_stage(statement, solution)?;
+            Ok((payload, BackendProverReport::FastChunked(report)))
+        }
     }
 }
 
@@ -117,6 +123,9 @@ pub fn verify_with_cancellation(
         ProofProtocol::FastBinary64UnitCircleV5 => Ok(BackendVerifierReport::Fast(Box::new(
             prelude.verify_with_cancellation::<FastBackend>(cancellation)?,
         ))),
+        ProofProtocol::FastBinary64UnitCircleChunkedV6 => Ok(BackendVerifierReport::FastChunked(
+            Box::new(prelude.verify_with_cancellation::<FastChunkedBackend>(cancellation)?),
+        )),
     }
 }
 
@@ -127,6 +136,7 @@ impl BackendVerifierReport {
             Self::Direct(_) => ProofProtocol::DirectReferenceV1,
             Self::Exact(_) => ProofProtocol::WhirField192L2V4,
             Self::Fast(_) => ProofProtocol::FastBinary64UnitCircleV5,
+            Self::FastChunked(_) => ProofProtocol::FastBinary64UnitCircleChunkedV6,
         }
     }
 
@@ -153,7 +163,7 @@ impl BackendVerifierReport {
                     denominator_power: report.residual.denominator_power,
                 })
             }
-            BackendVerifierReport::Fast(report) => {
+            BackendVerifierReport::Fast(report) | BackendVerifierReport::FastChunked(report) => {
                 let score = &report.score;
                 Ok(CertifiedScore::FastBinary64DiagnosticsV1 {
                     squared_l2_claim: score.squared_l2_claim,

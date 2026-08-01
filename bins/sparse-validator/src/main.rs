@@ -9,7 +9,7 @@ use ed25519_dalek::VerifyingKey;
 use ssv_backends::{BackendVerifierReport, verify as verify_backend};
 use ssv_canonical::Digest;
 use ssv_direct::{DirectArtifact, MAX_PROOF_BYTES};
-use ssv_fast::FastBackend;
+use ssv_fast::{FastBackend, FastChunkedBackend};
 use ssv_problem::{FinalizedRandomness, SuccinctPublicEvaluator};
 use ssv_service_protocol::{CertifiedScore, SignedCertificate};
 use ssv_validation::{ArtifactPrelude, MAX_ARTIFACT_BYTES};
@@ -155,10 +155,20 @@ fn inspect_common(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(challenge) = prelude.statement().challenge() {
         print_problem_challenge(challenge);
     }
-    if summary.protocol == ssv_service_protocol::ProofProtocol::FastBinary64UnitCircleV5 {
-        let preflight =
-            FastBackend::preflight(&prelude.statement().verifier_statement(), prelude.payload())
-                .context("fast payload preflight failed")?;
+    let fast_preflight = match summary.protocol {
+        ssv_service_protocol::ProofProtocol::FastBinary64UnitCircleV5 => Some(
+            FastBackend::preflight(&prelude.statement().verifier_statement(), prelude.payload()),
+        ),
+        ssv_service_protocol::ProofProtocol::FastBinary64UnitCircleChunkedV6 => {
+            Some(FastChunkedBackend::preflight(
+                &prelude.statement().verifier_statement(),
+                prelude.payload(),
+            ))
+        }
+        _ => None,
+    };
+    if let Some(preflight) = fast_preflight {
+        let preflight = preflight.context("fast payload preflight failed")?;
         println!(
             "fast_precommitment_digest={}",
             preflight.precommitment_digest
@@ -277,65 +287,70 @@ fn print_backend_report(report: &BackendVerifierReport) {
             );
         }
         BackendVerifierReport::Fast(report) => {
-            println!("proof_kind=fast-binary64-unit-circle-v5");
-            print_live_fast_validation_semantics();
-            println!(
-                "residual_squared_l2_claim={:.17e}",
-                report.score.squared_l2_claim
-            );
-            println!("residual_l2_claim={:.17e}", report.score.residual_l2_claim);
-            println!(
-                "residual_rms_claim={:.17e}",
-                report.score.residual_rms_claim
-            );
-            print_defects("norm_sumcheck", report.score.norm_sumcheck);
-            print_defects("matvec_sumcheck", report.score.matvec_sumcheck);
-            print_defects("linear_opening", report.score.linear_opening_sumcheck);
-            print_defects("unit_circle_folds", report.score.unit_circle_folds);
-            print_public_evaluator_roundoff(
-                "public_rhs",
-                report.public_evaluations.rhs.forward_absolute_error_bound,
-                report.public_evaluations.rhs.maximum_absolute_source,
-                report.public_evaluations.rhs.maximum_absolute_intermediate,
-            );
-            print_public_evaluator_roundoff(
-                "public_matrix",
-                report
-                    .public_evaluations
-                    .matrix
-                    .forward_absolute_error_bound,
-                report.public_evaluations.matrix.maximum_absolute_source,
-                report
-                    .public_evaluations
-                    .matrix
-                    .maximum_absolute_intermediate,
-            );
-            println!(
-                "recursive_query_trajectories={}",
-                report.score.proximity_queries_per_round
-            );
-            print_conditional_miss_probabilities(
-                report.score.conditional_miss_probability_upper_bound,
-            );
-            println!("sumcheck_rounds={}", report.work.sumcheck_rounds);
-            println!("merkle_hashes={}", report.work.merkle_hashes);
-            println!(
-                "public_matrix_period_terms={}",
-                report.work.public_matrix_period_terms
-            );
-            println!(
-                "public_rhs_period_terms={}",
-                report.work.public_rhs_period_terms
-            );
-            print_succinct_materialization(
-                report.work.generator_row_queries,
-                report.work.solution_elements_materialized,
-                report.work.residual_elements_materialized,
-                report.work.codeword_elements_materialized,
-                report.work.accounted_high_watermark_bytes,
-            );
+            print_fast_backend_report("fast-binary64-unit-circle-v5", report);
+        }
+        BackendVerifierReport::FastChunked(report) => {
+            print_fast_backend_report("fast-binary64-unit-circle-chunked-v6", report);
         }
     }
+}
+
+fn print_fast_backend_report(proof_kind: &str, report: &ssv_fast::FastVerifierReport) {
+    println!("proof_kind={proof_kind}");
+    print_live_fast_validation_semantics();
+    println!(
+        "residual_squared_l2_claim={:.17e}",
+        report.score.squared_l2_claim
+    );
+    println!("residual_l2_claim={:.17e}", report.score.residual_l2_claim);
+    println!(
+        "residual_rms_claim={:.17e}",
+        report.score.residual_rms_claim
+    );
+    print_defects("norm_sumcheck", report.score.norm_sumcheck);
+    print_defects("matvec_sumcheck", report.score.matvec_sumcheck);
+    print_defects("linear_opening", report.score.linear_opening_sumcheck);
+    print_defects("unit_circle_folds", report.score.unit_circle_folds);
+    print_public_evaluator_roundoff(
+        "public_rhs",
+        report.public_evaluations.rhs.forward_absolute_error_bound,
+        report.public_evaluations.rhs.maximum_absolute_source,
+        report.public_evaluations.rhs.maximum_absolute_intermediate,
+    );
+    print_public_evaluator_roundoff(
+        "public_matrix",
+        report
+            .public_evaluations
+            .matrix
+            .forward_absolute_error_bound,
+        report.public_evaluations.matrix.maximum_absolute_source,
+        report
+            .public_evaluations
+            .matrix
+            .maximum_absolute_intermediate,
+    );
+    println!(
+        "recursive_query_trajectories={}",
+        report.score.proximity_queries_per_round
+    );
+    print_conditional_miss_probabilities(report.score.conditional_miss_probability_upper_bound);
+    println!("sumcheck_rounds={}", report.work.sumcheck_rounds);
+    println!("merkle_hashes={}", report.work.merkle_hashes);
+    println!(
+        "public_matrix_period_terms={}",
+        report.work.public_matrix_period_terms
+    );
+    println!(
+        "public_rhs_period_terms={}",
+        report.work.public_rhs_period_terms
+    );
+    print_succinct_materialization(
+        report.work.generator_row_queries,
+        report.work.solution_elements_materialized,
+        report.work.residual_elements_materialized,
+        report.work.codeword_elements_materialized,
+        report.work.accounted_high_watermark_bytes,
+    );
 }
 
 fn print_live_fast_validation_semantics() {
