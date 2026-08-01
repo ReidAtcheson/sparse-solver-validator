@@ -46,10 +46,10 @@ Hardware/software: Intel Core i7-1360P, Linux 7.0.11 x86-64, Rust 1.97.0.
 
 | Dimension | Band | V5 median | V6 median | Speedup | V5 peak RSS | V6 peak RSS | V5 payload | V6 payload |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10,000 | 1 | 0.15 s | 0.03 s | 5.00x | 6,644 KiB | 6,924 KiB | 187,554 B | 387,682 B |
-| 10,000 | 32 | 0.16 s | 0.03 s | 5.33x | 6,556 KiB | 6,972 KiB | 183,298 B | 380,962 B |
-| 100,000 | 1 | 1.19 s | 0.24 s | 4.96x | 26,516 KiB | 26,936 KiB | 310,826 B | 633,034 B |
-| 100,000 | 32 | 1.22 s | 0.25 s | 4.88x | 26,556 KiB | 26,816 KiB | 317,130 B | 638,410 B |
+| 10,000 | 1 | 0.15 s | 0.02 s | 7.50x | 6,644 KiB | 7,012 KiB | 187,554 B | 387,682 B |
+| 10,000 | 32 | 0.16 s | 0.02 s | 8.00x | 6,556 KiB | 7,020 KiB | 183,298 B | 380,962 B |
+| 100,000 | 1 | 1.19 s | 0.18 s | 6.61x | 26,516 KiB | 28,788 KiB | 310,826 B | 633,034 B |
+| 100,000 | 32 | 1.22 s | 0.19 s | 6.42x | 26,556 KiB | 28,792 KiB | 317,130 B | 638,410 B |
 
 V6 reduced verifier-reported Merkle hash work from 7,542--12,403 hashes to
 2,404--5,129 hashes across these artifacts. Twenty-process verifier batches
@@ -57,8 +57,31 @@ were similar or faster (0.34--0.52 seconds for V6 versus 0.38--0.67 seconds for
 V5), so verification did not regress on these inputs.
 
 The weakness is bandwidth: payloads grew by 2.01--2.08x because each selected
-chunk is revealed in full. Peak prover RSS also rose by 1.0--6.3%. These
+chunk is revealed in full. Peak prover RSS also rose by 5.5--8.4%. These
 measurements do not choose an optimal chunk width, isolate hashing from the
 rest of proving, evaluate parallel scaling, or alter the current 64-query
 policy. V6 remains a provisional metric certificate and inherits V5's lack of
 a completed global numerical soundness theorem.
+
+## Follow-up implementation measurements
+
+The first V6 implementation recomputed almost every Merkle hash after query
+selection to construct each frontier. Retaining the complete chunked trees in
+a flat heap reduced the 100K median from 0.24--0.25 seconds to 0.20 seconds,
+while adding about 1.8--2.2 MiB of peak RSS. The generated proof bytes remained
+identical.
+
+Preparing the common BLAKE3 domain, tree-label, shape, and level prefix once and
+cloning that state for individual hashes provided a smaller additional gain. In
+25-process batches, average complete proof time changed as follows:
+
+| Dimension | Band | Retained trees | Retained trees and prefixes | Prefix gain |
+| ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 1 | 0.0236 s | 0.0220 s | 6.8% |
+| 10,000 | 32 | 0.0232 s | 0.0224 s | 3.4% |
+| 100,000 | 1 | 0.1864 s | 0.1840 s | 1.3% |
+| 100,000 | 32 | 0.1940 s | 0.1844 s | 4.9% |
+
+The batch measurement includes a fresh prover process, input parsing, and proof
+output for every repetition. It exists to resolve differences below GNU
+`time`'s per-process 0.01-second display precision.

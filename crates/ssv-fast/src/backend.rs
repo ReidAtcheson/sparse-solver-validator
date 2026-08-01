@@ -34,8 +34,9 @@ use crate::float_contract::{
     decode_canonical_bits,
 };
 use crate::merkle::{
-    ComplexMultiProof, MerkleError, MerkleRoot, chunked_complex_opened_value_bits,
-    streaming_chunked_complex_multiproof_iter, streaming_chunked_complex_root_iter,
+    ChunkedComplexTree, ComplexMultiProof, MerkleError, MerkleRoot,
+    build_chunked_complex_tree_iter, chunked_complex_multiproof_from_tree_iter,
+    chunked_complex_opened_value_bits, streaming_chunked_complex_root_iter,
     streaming_complex_multiproof_iter, streaming_complex_root, streaming_complex_root_iter,
     verify_chunked_complex_multiproof, verify_complex_multiproof,
 };
@@ -81,6 +82,9 @@ const FAST_PROVER_FIXED_PEAK_BYTES: usize = 2 * MAX_PROOF_BYTES;
 // complex evaluations across the geometric folding hierarchy.
 const FAST_PROVER_PEAK_BYTES_PER_PADDED_ELEMENT: usize =
     6 * size_of::<f64>() + 8 * size_of::<ComplexValue>();
+// Chunked V6 additionally retains fewer than 16N bytes of flat Merkle nodes
+// across the geometric folding hierarchy.
+const CHUNKED_TREE_PEAK_BYTES_PER_PADDED_ELEMENT: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FastFlavor {
@@ -582,6 +586,7 @@ struct PreparedMaterial {
     packed: Vec<f64>,
     codeword: UnitCircleCodeword,
     root: MerkleRoot,
+    chunked_tree: Option<ChunkedComplexTree>,
     estimated_backend_peak_bytes: usize,
 }
 
@@ -971,6 +976,15 @@ fn prove_prepared(
         )
         .map_err(|_| FastError::ResourceLimit)?;
     fold_levels.push(material.codeword);
+    let mut fold_trees = Vec::new();
+    fold_trees
+        .try_reserve_exact(
+            opening_rounds
+                .checked_add(1)
+                .ok_or(FastError::ResourceLimit)?,
+        )
+        .map_err(|_| FastError::ResourceLimit)?;
+    fold_trees.push(material.chunked_tree);
     let mut fold_roots = Vec::new();
     fold_roots
         .try_reserve_exact(opening_rounds)
@@ -998,17 +1012,18 @@ fn prove_prepared(
                     let next = current.fold(challenge)?;
                     work.record_codeword_fold()?;
                     let label = oracle_tree_label(flavor, round + 1, next.evaluations().len());
-                    let root = complex_root(flavor, &label, next.evaluations())?;
+                    let (root, tree) = complex_root_and_cache(flavor, &label, next.evaluations())?;
                     work.record_merkle_root_computation()?;
-                    Ok((next, root))
+                    Ok((next, root, tree))
                 })();
                 match fold_result {
-                    Ok((next, root)) => {
+                    Ok((next, root, tree)) => {
                         // The child root is fixed before the next polynomial
                         // and challenge enter the transcript.
                         transcript.absorb_root(b"linear-opening-fold-root", &root);
                         fold_roots.push(root);
                         fold_levels.push(next);
+                        fold_trees.push(tree);
                     }
                     Err(error) => {
                         fold_error = Some(error);
@@ -1044,6 +1059,7 @@ fn prove_prepared(
     let folding = build_folding_opening(
         flavor,
         fold_levels,
+        fold_trees,
         &fold_roots,
         &fold_challenges,
         &query_plan,
@@ -1400,13 +1416,22 @@ struct FastProverMemoryEstimate {
     estimated_backend_peak_bytes: usize,
 }
 
-fn fast_prover_memory_preflight(logical_len: usize) -> Result<FastProverMemoryEstimate, FastError> {
+fn fast_prover_memory_preflight(
+    logical_len: usize,
+    flavor: FastFlavor,
+) -> Result<FastProverMemoryEstimate, FastError> {
     validate_length(logical_len)?;
     let padded_len = logical_len
         .checked_next_power_of_two()
         .ok_or(FastError::ResourceLimit)?;
+    let bytes_per_element = match flavor {
+        FastFlavor::PerValueV5 => FAST_PROVER_PEAK_BYTES_PER_PADDED_ELEMENT,
+        FastFlavor::ChunkedV6 => FAST_PROVER_PEAK_BYTES_PER_PADDED_ELEMENT
+            .checked_add(CHUNKED_TREE_PEAK_BYTES_PER_PADDED_ELEMENT)
+            .ok_or(FastError::ResourceLimit)?,
+    };
     let variable_bytes = padded_len
-        .checked_mul(FAST_PROVER_PEAK_BYTES_PER_PADDED_ELEMENT)
+        .checked_mul(bytes_per_element)
         .ok_or(FastError::ResourceLimit)?;
     let estimated_backend_peak_bytes = variable_bytes
         .checked_add(FAST_PROVER_FIXED_PEAK_BYTES)
@@ -1490,7 +1515,7 @@ fn prepare_material(
     flavor: FastFlavor,
 ) -> Result<PreparedMaterial, FastError> {
     let logical_len = problem.dimension();
-    let memory = fast_prover_memory_preflight(logical_len)?;
+    let memory = fast_prover_memory_preflight(logical_len, flavor)?;
     let padded_len = memory.padded_len;
 
     if solution.as_slice().len() != logical_len {
@@ -1521,7 +1546,7 @@ fn prepare_material(
         return Err(FastError::TranscriptShape);
     }
     let label = oracle_tree_label(flavor, 0, codeword.evaluations().len());
-    let root = complex_root(flavor, &label, codeword.evaluations())?;
+    let (root, chunked_tree) = complex_root_and_cache(flavor, &label, codeword.evaluations())?;
     work.record_merkle_root_computation()?;
     work.record_material_preparation(problem)?;
     Ok(PreparedMaterial {
@@ -1532,6 +1557,7 @@ fn prepare_material(
         packed,
         codeword,
         root,
+        chunked_tree,
         estimated_backend_peak_bytes: memory.estimated_backend_peak_bytes,
     })
 }
@@ -1716,6 +1742,7 @@ fn canonical_protocol_float(value: f64) -> Result<f64, FastError> {
     canonicalize_arithmetic(value).map_err(FastError::Float)
 }
 
+#[cfg(test)]
 fn complex_root(
     flavor: FastFlavor,
     label: &[u8],
@@ -1726,6 +1753,21 @@ fn complex_root(
         FastFlavor::PerValueV5 => streaming_complex_root_iter(label, bits)?,
         FastFlavor::ChunkedV6 => streaming_chunked_complex_root_iter(label, bits)?,
     })
+}
+
+fn complex_root_and_cache(
+    flavor: FastFlavor,
+    label: &[u8],
+    values: &[ComplexValue],
+) -> Result<(MerkleRoot, Option<ChunkedComplexTree>), FastError> {
+    let bits = values.iter().copied().map(ComplexValue::canonical_bits);
+    match flavor {
+        FastFlavor::PerValueV5 => Ok((streaming_complex_root_iter(label, bits)?, None)),
+        FastFlavor::ChunkedV6 => {
+            let tree = build_chunked_complex_tree_iter(label, bits)?;
+            Ok((tree.root(), Some(tree)))
+        }
+    }
 }
 
 fn oracle_tree_label(flavor: FastFlavor, round: usize, domain_len: usize) -> Vec<u8> {
@@ -1761,6 +1803,7 @@ fn absorb_float(transcript: &mut Transcript, tag: &[u8], value: f64) -> Result<(
 fn build_folding_opening(
     flavor: FastFlavor,
     levels: Vec<UnitCircleCodeword>,
+    trees: Vec<Option<ChunkedComplexTree>>,
     roots: &[MerkleRoot],
     challenges: &[f64],
     query_plan: &QueryPlan,
@@ -1770,6 +1813,7 @@ fn build_folding_opening(
     if roots.len() != challenges.len()
         || roots.len() != initial.message_len().ilog2() as usize
         || levels.len() != roots.len().checked_add(1).ok_or(FastError::ResourceLimit)?
+        || trees.len() != levels.len()
     {
         return Err(FastError::TranscriptShape);
     }
@@ -1794,7 +1838,8 @@ fn build_folding_opening(
         let openings = match flavor {
             FastFlavor::PerValueV5 => streaming_complex_multiproof_iter(&label, bits, &selected)?,
             FastFlavor::ChunkedV6 => {
-                streaming_chunked_complex_multiproof_iter(&label, bits, &selected)?
+                let tree = trees[round].as_ref().ok_or(FastError::TranscriptShape)?;
+                chunked_complex_multiproof_from_tree_iter(tree, &label, bits, &selected)?
             }
         };
         work.record_merkle_multiproof_pass()?;
@@ -2461,17 +2506,23 @@ mod tests {
 
     #[test]
     fn prover_memory_preflight_has_a_checked_power_of_two_boundary() {
-        let accepted = fast_prover_memory_preflight(1 << 22).unwrap();
+        let accepted = fast_prover_memory_preflight(1 << 22, FastFlavor::PerValueV5).unwrap();
         assert_eq!(accepted.padded_len, 1 << 22);
         assert_eq!(
             accepted.estimated_backend_peak_bytes,
             FAST_PROVER_FIXED_PEAK_BYTES + (1 << 22) * FAST_PROVER_PEAK_BYTES_PER_PADDED_ELEMENT
         );
+        let chunked = fast_prover_memory_preflight(1 << 22, FastFlavor::ChunkedV6).unwrap();
+        assert_eq!(
+            chunked.estimated_backend_peak_bytes,
+            accepted.estimated_backend_peak_bytes
+                + (1 << 22) * CHUNKED_TREE_PEAK_BYTES_PER_PADDED_ELEMENT
+        );
         assert!(
             accepted.estimated_backend_peak_bytes <= MAX_FAST_PROVER_ESTIMATED_BACKEND_PEAK_BYTES
         );
         assert!(matches!(
-            fast_prover_memory_preflight(1 << 23),
+            fast_prover_memory_preflight(1 << 23, FastFlavor::PerValueV5),
             Err(FastError::ResourceLimit)
         ));
         assert!(matches!(
@@ -2676,9 +2727,13 @@ mod tests {
             packed,
             codeword,
             root,
-            estimated_backend_peak_bytes: fast_prover_memory_preflight(dimension)
-                .unwrap()
-                .estimated_backend_peak_bytes,
+            chunked_tree: None,
+            estimated_backend_peak_bytes: fast_prover_memory_preflight(
+                dimension,
+                FastFlavor::PerValueV5,
+            )
+            .unwrap()
+            .estimated_backend_peak_bytes,
         };
         let evaluator = EvaluatorBinding::from_metadata(
             statement.generated().public_evaluation_plan().metadata(),
@@ -2769,6 +2824,7 @@ mod tests {
         let folding = build_folding_opening(
             FastFlavor::PerValueV5,
             fold_levels,
+            vec![None; fold_roots.len() + 1],
             &fold_roots,
             &fold_challenges,
             &query_plan,

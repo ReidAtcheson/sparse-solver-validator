@@ -541,18 +541,21 @@ by themselves authenticate an arbitrary MLE endpoint supplied by the prover.
 
 The prover retains the geometrically shrinking codeword levels created by step
 4. Their combined evaluation count is less than twice the initial codeword.
-After the query locations are known, root-free scans of those levels construct
-only the unselected Merkle frontier subtrees needed by each multiproof; no level
-is folded again and no committed root is reconstructed. The linear-opening
-weights are filled directly into their final `2N` table.
+V5 performs root-free scans of those levels after query selection and hashes
+only the unselected frontier subtrees required by its multiproofs. V6 instead
+retains each much smaller chunked tree in a flat heap layout and copies the
+selected frontier hashes without a second hash pass. Common BLAKE3 prefix states
+are prepared once per tree or level and cloned for individual leaves and nodes;
+this preserves the canonical hash inputs and roots. No level is folded again.
+The linear-opening weights are filled directly into their final `2N` table.
 
 Before allocating these tables, the backend applies a checked peak-memory
 model. It accounts for `176N` bytes of simultaneously live size-dependent
-buffers plus two maximum-size proof encodings and rejects estimates above 1
-GiB. This is a conservative bound on backend-owned buffers; it excludes the
-caller-owned problem and solution and allocator metadata. Large codeword and
-table allocations remain fallible below that ceiling and report the backend
-resource-limit error on failure.
+buffers in V5 and `192N` in tree-retaining V6, plus two maximum-size proof
+encodings, and rejects estimates above 1 GiB. This is a conservative bound on
+backend-owned buffers; it excludes the caller-owned problem and solution and
+allocator metadata. Large codeword and table allocations remain fallible below
+that ceiling and report the backend resource-limit error on failure.
 
 ### 9.5 Zero scales and diagnostic semantics
 
