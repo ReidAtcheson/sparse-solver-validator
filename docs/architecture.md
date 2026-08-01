@@ -390,6 +390,23 @@ its observed binary64 defects and sampled bad-fraction curves into a final
 numerical soundness bound. The claimed residual and its diagnostics therefore
 do not establish residual quality by themselves.
 
+### 6.4 `fast-binary64-unit-circle-chunked-v6`
+
+The chunked profile retains the V5 algebra and full-width BLAKE3 commitments,
+but commits 32 adjacent complex codeword evaluations per Merkle leaf. Openings
+reveal complete selected chunks. Protocol and hash domains are distinct from
+V5, so this representation change cannot silently alter the frozen V5 wire
+contract.
+
+The layout lowers prover hashing work at the cost of larger proofs and more
+revealed evaluations. Because chunking makes complete trees compact, the prover
+retains their hashes in flat heap order and extracts post-challenge frontiers
+without rehashing. Common BLAKE3 domain and shape prefixes are also reused
+within each tree level. These are prover implementation details and do not
+change V6 roots or proof bytes. V6 remains an experimental performance profile,
+not a new soundness argument; all limitations of the provisional V5 metric
+semantics continue to apply.
+
 ## 7. Executable targets
 
 ### `sparse-problem`

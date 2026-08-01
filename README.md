@@ -27,9 +27,11 @@ numerical audit.
 
 > `direct-reference-v1` is not succinct and does not hide `x`.
 > `whir-field192-l2-v4` proves an exact integer statement about once-quantized
-> Q63.64 `x`. `fast-binary64-unit-circle-v5` operates on canonical binary64
-> `x` and is an experimental metric certificate with no completed global
-> numerical soundness theorem. None of the profiles claims zero knowledge.
+> Q63.64 `x`. `fast-binary64-unit-circle-v5` and its experimental
+> 32-value-Merkle-leaf `fast-binary64-unit-circle-chunked-v6` derivative
+> operate on canonical binary64 `x` and are metric certificates with no
+> completed global numerical soundness theorem. None of the profiles claims
+> zero knowledge.
 
 ## Workspace
 

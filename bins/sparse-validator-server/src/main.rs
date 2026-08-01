@@ -33,8 +33,7 @@ use zeroize::Zeroizing;
 
 const MAX_TEMPLATE_JSON_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAXIMUM_PUBLIC_EVALUATION_TERMS: u64 = 4096;
-const DEFAULT_ALLOWED_PROTOCOLS: &str =
-    "direct-reference-v1,whir-field192-l2-v4,fast-binary64-unit-circle-v5";
+const DEFAULT_ALLOWED_PROTOCOLS: &str = "direct-reference-v1,whir-field192-l2-v4,fast-binary64-unit-circle-v5,fast-binary64-unit-circle-chunked-v6";
 const PACKAGE_VALIDATOR_BUILD: &str =
     concat!("sparse-validator-server/", env!("CARGO_PKG_VERSION"));
 
@@ -645,6 +644,10 @@ mod tests {
         assert_eq!(
             parse_proof_protocol("fast-binary64-unit-circle-v5").unwrap(),
             ProofProtocol::FastBinary64UnitCircleV5
+        );
+        assert_eq!(
+            parse_proof_protocol("fast-binary64-unit-circle-chunked-v6").unwrap(),
+            ProofProtocol::FastBinary64UnitCircleChunkedV6
         );
         assert!(parse_proof_protocol("unknown").is_err());
     }

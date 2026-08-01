@@ -841,6 +841,7 @@ fn dia_family_with_seeded_rhs_round_trips_every_backend_without_a_manufactured_s
         ProofProtocol::DirectReferenceV1,
         ProofProtocol::WhirField192L2V4,
         ProofProtocol::FastBinary64UnitCircleV5,
+        ProofProtocol::FastBinary64UnitCircleChunkedV6,
     ] {
         let statement = statement(
             problem.clone(),
@@ -869,6 +870,12 @@ fn dia_family_with_seeded_rhs_round_trips_every_backend_without_a_manufactured_s
             }
             BackendVerifierReport::Fast(report) => {
                 assert_eq!(protocol, ProofProtocol::FastBinary64UnitCircleV5);
+                assert!(report.score.squared_l2_claim < 1.0e-20);
+                assert_eq!(report.work.public_matrix_period_terms, 6);
+                assert_eq!(report.work.generator_row_queries, 0);
+            }
+            BackendVerifierReport::FastChunked(report) => {
+                assert_eq!(protocol, ProofProtocol::FastBinary64UnitCircleChunkedV6);
                 assert!(report.score.squared_l2_claim < 1.0e-20);
                 assert_eq!(report.work.public_matrix_period_terms, 6);
                 assert_eq!(report.work.generator_row_queries, 0);
@@ -906,6 +913,7 @@ fn assert_nonsymmetric_family_round_trips_every_backend(
         ProofProtocol::DirectReferenceV1,
         ProofProtocol::WhirField192L2V4,
         ProofProtocol::FastBinary64UnitCircleV5,
+        ProofProtocol::FastBinary64UnitCircleChunkedV6,
     ] {
         let statement = statement(
             problem.clone(),
@@ -938,6 +946,15 @@ fn assert_nonsymmetric_family_round_trips_every_backend(
             }
             BackendVerifierReport::Fast(report) => {
                 assert_eq!(protocol, ProofProtocol::FastBinary64UnitCircleV5);
+                assert!(report.score.squared_l2_claim < 1.0e-18);
+                assert_eq!(
+                    report.work.public_matrix_period_terms,
+                    expected_public_terms
+                );
+                assert_eq!(report.work.generator_row_queries, 0);
+            }
+            BackendVerifierReport::FastChunked(report) => {
+                assert_eq!(protocol, ProofProtocol::FastBinary64UnitCircleChunkedV6);
                 assert!(report.score.squared_l2_claim < 1.0e-18);
                 assert_eq!(
                     report.work.public_matrix_period_terms,

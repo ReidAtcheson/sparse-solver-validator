@@ -23,13 +23,14 @@ optional SignedChallenge hosted problem provenance
 The public statement produces a problem digest, manifest digest, protocol ID,
 and transcript digest. Backend proof bytes cannot change any of them.
 
-Three proof kinds are registered:
+Four proof kinds are registered:
 
 | Protocol | Meaning | Carries `x` | Validator row scan |
 | --- | --- | ---: | ---: |
 | `direct-reference-v1` | Independent binary64 relation computation | yes | yes |
 | `whir-field192-l2-v4` | Exact integer statement for Q63.64 `x` | no | no |
 | `fast-binary64-unit-circle-v5` | Provisional sampled metric diagnostics | no | no |
+| `fast-binary64-unit-circle-chunked-v6` | V5 diagnostics with 32-value Merkle leaves | no | no |
 
 The direct profile is not succinct. The exact and fast profiles receive a
 restricted verifier statement with the registered public-MLE evaluator but no
@@ -470,6 +471,21 @@ W = [x_0, ..., x_(N-1), R_0, ..., R_(N-1)].
 many complex roots of unity as coefficients. The resulting rate-one-half
 unit-circle codeword is committed with a BLAKE3 Merkle root.
 
+The experimental `fast-binary64-unit-circle-chunked-v6` profile leaves the
+binary64 relation, sumchecks, code, query count, and full 256-bit BLAKE3 roots
+unchanged. Its only substantive change is the Merkle layout: one leaf commits
+32 adjacent complex evaluations in one 512-byte hash input. A queried index
+opens its complete chunk, and a canonical multiproof authenticates the selected
+chunks. Separate protocol, transcript, leaf, padding, node, and oracle-tree
+domains prevent V5 and V6 commitments or proofs from being reinterpreted.
+
+This is an explicit time/bandwidth trade. It reduces short-message leaf hashes
+and the height of every tree, but reveals extra adjacent evaluations and can
+roughly double proof size at the current 64-query policy. It does not reduce
+oversampling, establish a global numerical soundness theorem, provide zero
+knowledge, or justify replacing BLAKE3 with a non-binding checksum. The fixed
+chunk width is an empirical first point rather than an optimized parameter.
+
 The strict precommitment binds the statement, problem, manifest, typed
 public-evaluator version and metadata, numerical policy, code basis, shapes, and
 packed codeword root before the first algebraic challenge. It contains no
@@ -525,18 +541,21 @@ by themselves authenticate an arbitrary MLE endpoint supplied by the prover.
 
 The prover retains the geometrically shrinking codeword levels created by step
 4. Their combined evaluation count is less than twice the initial codeword.
-After the query locations are known, root-free scans of those levels construct
-only the unselected Merkle frontier subtrees needed by each multiproof; no level
-is folded again and no committed root is reconstructed. The linear-opening
-weights are filled directly into their final `2N` table.
+V5 performs root-free scans of those levels after query selection and hashes
+only the unselected frontier subtrees required by its multiproofs. V6 instead
+retains each much smaller chunked tree in a flat heap layout and copies the
+selected frontier hashes without a second hash pass. Common BLAKE3 prefix states
+are prepared once per tree or level and cloned for individual leaves and nodes;
+this preserves the canonical hash inputs and roots. No level is folded again.
+The linear-opening weights are filled directly into their final `2N` table.
 
 Before allocating these tables, the backend applies a checked peak-memory
 model. It accounts for `176N` bytes of simultaneously live size-dependent
-buffers plus two maximum-size proof encodings and rejects estimates above 1
-GiB. This is a conservative bound on backend-owned buffers; it excludes the
-caller-owned problem and solution and allocator metadata. Large codeword and
-table allocations remain fallible below that ceiling and report the backend
-resource-limit error on failure.
+buffers in V5 and `192N` in tree-retaining V6, plus two maximum-size proof
+encodings, and rejects estimates above 1 GiB. This is a conservative bound on
+backend-owned buffers; it excludes the caller-owned problem and solution and
+allocator metadata. Large codeword and table allocations remain fallible below
+that ceiling and report the backend resource-limit error on failure.
 
 ### 9.5 Zero scales and diagnostic semantics
 

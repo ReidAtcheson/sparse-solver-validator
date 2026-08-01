@@ -36,6 +36,7 @@ const REGISTERED_PROTOCOLS: &[ProofProtocol] = &[
     ProofProtocol::DirectReferenceV1,
     ProofProtocol::WhirField192L2V4,
     ProofProtocol::FastBinary64UnitCircleV5,
+    ProofProtocol::FastBinary64UnitCircleChunkedV6,
 ];
 
 pub const MAX_PUBLIC_STATEMENT_BYTES: usize = 1024 * 1024;
@@ -908,6 +909,7 @@ mod tests {
         for protocol in [
             ProofProtocol::DirectReferenceV1,
             ProofProtocol::FastBinary64UnitCircleV5,
+            ProofProtocol::FastBinary64UnitCircleChunkedV6,
         ] {
             let manifest = ValidationManifest {
                 protocol,
