@@ -123,3 +123,83 @@ This optimization deliberately accepts a more strided within-stage traversal.
 The measured win shows that avoiding repeated transcendental evaluation is
 substantially more important on these workloads. It introduces no additional
 prover allocation or retained memory.
+
+## Comparison with an SPD banded direct solve
+
+The chunked commitment and reused-twiddle FFT were also measured together
+against SciPy's banded Cholesky on the exact four generated matrices above.
+`sparse-problem export` materialized each matrix and RHS as Matrix Market, and
+`benchmark_scipy_banded.py` converted the symmetric lower triangle to LAPACK
+band storage. The matrices are strictly diagonally dominant and SPD, and the
+direct solutions had relative residuals between `2.16e-16` and `4.35e-16`.
+
+The SciPy measurements used SciPy 1.16.2, NumPy 2.3.4, and one OpenBLAS thread.
+Five warm-ups were followed by 100 repetitions. Matrix parsing, band-layout
+construction, and per-repetition input copies were outside the timer. Four
+OpenBLAS threads were also tested, but did not improve these narrow-band
+kernels. Times below are the sum of the separate factorization and triangular
+solve medians.
+
+| Dimension | Band | Band storage | Factor | Triangular solve | Direct solve |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 1 | 0.15 MiB | 0.228 ms | 0.188 ms | 0.416 ms |
+| 10,000 | 32 | 2.52 MiB | 1.891 ms | 0.252 ms | 2.143 ms |
+| 100,000 | 1 | 1.53 MiB | 1.663 ms | 1.339 ms | 3.002 ms |
+| 100,000 | 32 | 25.18 MiB | 20.419 ms | 2.867 ms | 23.285 ms |
+
+The combined prover was built from revision
+`6724380fd9dccdc6cd03e3976c0050c81f1bb7d3`. Complete prover processes used
+`RAYON_NUM_THREADS=1`, two warm-ups, and 30 measured repetitions. Complete
+validator processes used five warm-ups and 200 measured repetitions. Both CLI
+measurements include process startup, artifact parsing or encoding, and file or
+diagnostic output; consequently they are conservative relative to the
+in-memory SciPy kernel timings.
+
+| Dimension | Band | Direct solve | Proof | Proof / solve | Validation | Validation / solve |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 1 | 0.416 ms | 17.373 ms | 41.8x | 15.749 ms | 37.9x |
+| 10,000 | 32 | 2.143 ms | 17.564 ms | 8.2x | 16.215 ms | 7.6x |
+| 100,000 | 1 | 3.002 ms | 128.355 ms | 42.8x | 15.687 ms | 5.2x |
+| 100,000 | 32 | 23.285 ms | 129.216 ms | 5.5x | 21.162 ms | 0.91x |
+
+Median peak RSS from seven complete GNU `time` runs was 7.0--28.3 MiB for the
+prover and 4.8--5.3 MiB for the validator:
+
+| Dimension | Band | Prover peak RSS | Validator peak RSS | Proof artifact |
+| ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 1 | 7,164 KiB | 4,900 KiB | 388,529 B |
+| 10,000 | 32 | 7,068 KiB | 4,900 KiB | 381,911 B |
+| 100,000 | 1 | 28,780 KiB | 5,456 KiB | 633,882 B |
+| 100,000 | 32 | 28,944 KiB | 5,468 KiB | 639,360 B |
+
+These ratios are sensitive to bandwidth for a principled reason. The banded
+Cholesky cost grows with the square of the half-bandwidth, whereas these
+matrices store only offsets 1 and 32 and the proof follows their structural
+nonzeros. At 100K and band 32, validation is already slightly cheaper than the
+direct solve, but proof construction remains 5.5 times as expensive. Band 1 is
+an intentionally difficult baseline for a proof system: LAPACK solves the
+tridiagonal SPD system in only a few milliseconds, leaving the prover about 42
+times slower.
+
+This remains an optimistic solver comparison because it relies on symmetry and
+positive definiteness. A nonsymmetric benchmark would need banded LU or an
+iterative solver. Conversely, comparing complete Rust CLI processes against
+isolated SciPy kernels charges the proof path for I/O and startup that the
+solver timing excludes. The result should therefore be read as an operational
+upper bound on proof and validation overhead, not a pure arithmetic-kernel
+comparison.
+
+After exporting a fixture as shown below, the direct-solve measurement is
+reproducible with:
+
+```sh
+target/release/sparse-problem export \
+  --problem /tmp/ssv-chunked-n100000-b32.problem.json \
+  --matrix /tmp/ssv-chunked-n100000-b32.mtx \
+  --rhs /tmp/ssv-chunked-n100000-b32.rhs.mtx
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python \
+  benchmarks/chunked-fast-merkle/benchmark_scipy_banded.py \
+  --matrix /tmp/ssv-chunked-n100000-b32.mtx \
+  --rhs /tmp/ssv-chunked-n100000-b32.rhs.mtx \
+  --half-bandwidth 32 --warmups 5 --repetitions 100
+```
