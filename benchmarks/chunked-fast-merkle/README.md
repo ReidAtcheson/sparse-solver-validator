@@ -85,3 +85,41 @@ cloning that state for individual hashes provided a smaller additional gain. In
 The batch measurement includes a fresh prover process, input parsing, and proof
 output for every repetition. It exists to resolve differences below GNU
 `time`'s per-process 0.01-second display precision.
+
+## Unit-circle FFT twiddle reuse experiment
+
+Profiling the retained-tree V6 prover identified the initial rate-one-half
+unit-circle FFT as the new dominant stage. Its original block-major traversal
+called `sin_cos` once per butterfly even though every block in a stage uses the
+same twiddles. At the 100K padded shape this meant 4,980,736 transcendental
+evaluations for 524,287 distinct stage twiddles.
+
+The experimental traversal puts the stage offset outside the block loop. It
+therefore evaluates each twiddle once without allocating a table. Every
+butterfly still uses the same `evaluation_point(offset, block_len)` value and
+butterflies within a stage are disjoint. A reference-equivalence test covers
+power-of-two FFT lengths through 4,096, and complete baseline and optimized
+artifacts were byte-identical on all four benchmark fixtures.
+
+The 10K timings are medians from ten interleaved 20-process batches, reported
+per proof. The 100K timings are medians from twenty interleaved paired runs.
+All runs used release binaries and `RAYON_NUM_THREADS=1`. Median RSS is from
+the paired single-process runs.
+
+| Dimension | Band | Baseline | Reused twiddles | Time reduction | Baseline RSS | Reused-twiddle RSS |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 1 | 22.707 ms | 17.061 ms | 24.9% | 6,892 KiB | 6,942 KiB |
+| 10,000 | 32 | 22.927 ms | 17.192 ms | 25.0% | 6,912 KiB | 6,872 KiB |
+| 100,000 | 1 | 172.738 ms | 126.808 ms | 26.6% | 28,736 KiB | 28,730 KiB |
+| 100,000 | 32 | 181.464 ms | 134.060 ms | 26.1% | 28,770 KiB | 28,734 KiB |
+
+On the 100K band-32 profile, whole-process instruction references fell from
+3,003,658,379 to 2,258,231,879 (24.8%). Initial unit-circle encoding fell from
+1,494,608,776 to 749,182,846 instructions, while the subsequent fold, Merkle,
+sumcheck, and input paths were unchanged. Validator RSS was also unchanged
+within measurement noise, and validation does not execute this FFT path.
+
+This optimization deliberately accepts a more strided within-stage traversal.
+The measured win shows that avoiding repeated transcendental evaluation is
+substantially more important on these workloads. It introduces no additional
+prover allocation or retained memory.

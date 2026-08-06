@@ -401,9 +401,13 @@ fn fft_in_place(values: &mut [ComplexValue]) -> Result<(), UnitCircleError> {
     for stage in 1..=variables {
         let block_len = 1_usize << stage;
         let half = block_len / 2;
-        for block_start in (0..len).step_by(block_len) {
-            for offset in 0..half {
-                let twiddle = evaluation_point(offset, block_len)?;
+        // Every block in a stage uses the same `half` twiddles. Keep the
+        // twiddle outermost so each transcendental evaluation is performed
+        // once without allocating a table. Butterflies within a stage are
+        // disjoint, so changing their traversal order preserves exact results.
+        for offset in 0..half {
+            let twiddle = evaluation_point(offset, block_len)?;
+            for block_start in (0..len).step_by(block_len) {
                 let even = values[block_start + offset];
                 let odd = values[block_start + offset + half].multiply(twiddle)?;
                 values[block_start + offset] = even.add(odd)?;
@@ -438,6 +442,36 @@ fn map_source_error(error: FloatContractError) -> UnitCircleError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_fft_in_place(values: &mut [ComplexValue]) -> Result<(), UnitCircleError> {
+        let len = values.len();
+        if len == 0 || !len.is_power_of_two() {
+            return Err(UnitCircleError::InvalidCodewordShape);
+        }
+
+        let variables = len.trailing_zeros();
+        for index in 0..len {
+            let reversed = bit_reverse(index, variables);
+            if index < reversed {
+                values.swap(index, reversed);
+            }
+        }
+
+        for stage in 1..=variables {
+            let block_len = 1_usize << stage;
+            let half = block_len / 2;
+            for block_start in (0..len).step_by(block_len) {
+                for offset in 0..half {
+                    let twiddle = evaluation_point(offset, block_len)?;
+                    let even = values[block_start + offset];
+                    let odd = values[block_start + offset + half].multiply(twiddle)?;
+                    values[block_start + offset] = even.add(odd)?;
+                    values[block_start + offset + half] = even.subtract(odd)?;
+                }
+            }
+        }
+        Ok(())
+    }
 
     fn assert_close(actual: ComplexValue, expected: ComplexValue, scale: f64) {
         let tolerance = 4096.0 * f64::EPSILON * scale.max(1.0);
@@ -507,6 +541,23 @@ mod tests {
             ComplexValue::new(f64::from_bits(1), 0.0),
             Err(UnitCircleError::SubnormalComponent)
         );
+    }
+
+    #[test]
+    fn reused_stage_twiddles_are_bit_identical_to_the_reference_fft() {
+        for variables in 0..=12_u32 {
+            let len = 1_usize << variables;
+            let mut optimized = (0..len)
+                .map(|index| {
+                    ComplexValue::new(index as f64 * 0.125 - 7.0, 3.0 - index as f64 * 0.0625)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let mut reference = optimized.clone();
+            fft_in_place(&mut optimized).unwrap();
+            reference_fft_in_place(&mut reference).unwrap();
+            assert_eq!(optimized, reference, "FFT length {len}");
+        }
     }
 
     #[test]
