@@ -649,6 +649,10 @@ mod tests {
             parse_proof_protocol("fast-binary64-unit-circle-chunked-v6").unwrap(),
             ProofProtocol::FastBinary64UnitCircleChunkedV6
         );
+        assert_eq!(
+            parse_proof_protocol("fast-binary64-unit-circle-chunked-sha256-v7").unwrap(),
+            ProofProtocol::FastBinary64UnitCircleChunkedSha256V7
+        );
         assert!(parse_proof_protocol("unknown").is_err());
     }
 

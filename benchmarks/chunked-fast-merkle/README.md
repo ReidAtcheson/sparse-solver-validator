@@ -85,3 +85,68 @@ cloning that state for individual hashes provided a smaller additional gain. In
 The batch measurement includes a fresh prover process, input parsing, and proof
 output for every repetition. It exists to resolve differences below GNU
 `time`'s per-process 0.01-second display precision.
+
+## SHA-256/SHA-NI experiment
+
+The separately versioned
+`fast-binary64-unit-circle-chunked-sha256-v7` protocol keeps V6's 32-value
+chunk layout and 32-byte roots, but uses SHA-256 for chunk leaves and internal
+nodes. V6 remains BLAKE3, so builds cannot silently reinterpret an existing
+proof. RustCrypto's SHA-256 implementation selects SHA-NI at runtime. The
+comparison host reports `sha_ni`, and the default prover binary contains SHA
+instructions. A second build enabled the `ssv-fast/sha256-force-soft` feature;
+that binary contains no SHA instructions and produced byte-identical V7
+artifacts.
+
+The ignored release microbenchmark exercises the same retained-tree prefix
+cloning and hashing paths as the prover. Each figure is the median of seven
+100,000-hash samples.
+
+| Hash path | BLAKE3 | SHA-256/SHA-NI | SHA-256 software |
+| --- | ---: | ---: | ---: |
+| 32-complex-value leaf | 478.66 ns | 290.01 ns | 1,372.84 ns |
+| 64-byte internal node | 134.33 ns | 81.09 ns | 313.65 ns |
+
+Run the hardware-selected kernel benchmark with:
+
+```sh
+cargo +stable test --release -p ssv-fast benchmark_chunk_hash_kernels -- \
+  --ignored --nocapture --test-threads=1
+```
+
+Add `--features sha256-force-soft` before the test name for the software
+control. Do not use `--all-features` for the SHA-NI measurement because it
+deliberately enables that control feature.
+
+Complete CLI measurements used one warm-up and twelve repetitions per
+fixture, `RAYON_NUM_THREADS=1`, release binaries, and fresh proof-file output.
+Elapsed time includes process startup, JSON parsing, proving, artifact
+encoding, and output. RSS is the median GNU `time` peak. The 10K timings are
+startup-sensitive; the 100K rows give the more useful comparison.
+
+| Dimension | Band | V6 BLAKE3 median | V7 SHA-NI median | V7 software median | V6 prover RSS | V7 SHA-NI prover RSS |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 1 | 23.915 ms | 22.264 ms | 27.613 ms | 6,910 KiB | 6,898 KiB |
+| 10,000 | 32 | 27.802 ms | 23.808 ms | 27.546 ms | 6,964 KiB | 6,928 KiB |
+| 100,000 | 1 | 181.388 ms | 176.351 ms | 221.278 ms | 28,746 KiB | 28,726 KiB |
+| 100,000 | 32 | 188.841 ms | 179.198 ms | 224.356 ms | 28,726 KiB | 28,780 KiB |
+
+At 100K, SHA-NI reduces complete proof time by 2.8--5.1% with effectively
+unchanged prover RSS. Forced-software SHA-256 is 18.8--22.0% slower than V6.
+Median validator RSS was also effectively unchanged: 5,568 versus 5,534 KiB
+for band 1 and 5,550 versus 5,438 KiB for band 32. Validator wall times were
+dominated by 10--50 ms process-startup noise and did not show a stable hash
+effect.
+
+V7 payload sizes ranged from 368,888 to 623,777 bytes, versus 381,911 to
+639,360 bytes for the corresponding V6 runs. This is not compression: both
+hashes emit 32 bytes. The version-specific transcript labels select different
+query paths, so individual payloads vary while retaining the same format and
+size bounds.
+
+The main weakness is portability. SHA-NI is a small win on this Intel host,
+but software SHA-256 is a clear prover regression. More importantly, the
+kernel's roughly 39% SHA-NI advantage becomes only 3--5% end to end. After
+chunking, hashing is no longer the dominant prover cost, so this experiment
+does not support replacing V6 solely for speed. It does show that a runtime
+SHA-NI path can avoid the RSS increase that motivated this branch.

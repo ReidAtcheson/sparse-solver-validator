@@ -1,4 +1,4 @@
-//! Streaming BLAKE3 Merkle commitments for canonical complex binary64 leaves.
+//! Streaming 32-byte Merkle commitments for canonical complex binary64 leaves.
 //!
 //! This is intentionally the complex multiproof subset used by the
 //! coefficient-aligned unit-circle protocol. Scalar trees and one-leaf wire
@@ -9,9 +9,11 @@
 //! The per-value V5 hash domains, logical-shape binding, padding, index order,
 //! and frontier order are frozen from `fast-validation/src/merkle.rs` at
 //! research revision `be8b67b74da54d162df2e6e0a9d813779959bb60`.
-//! The separately domain-separated V6 layout commits 32 adjacent evaluations
-//! per leaf and opens selected chunks in full.
+//! The separately domain-separated chunked layout commits 32 adjacent
+//! evaluations per leaf and opens selected chunks in full. Protocol versions
+//! choose BLAKE3 or SHA-256 without changing that layout.
 
+use sha2::Sha256;
 use thiserror::Error;
 
 const COMPLEX_LEAF_DOMAIN: &[u8] = b"sparse-solution/fast-validation/merkle/complex-leaf/v2";
@@ -27,7 +29,48 @@ const COMPLEX_CHUNK_NODE_DOMAIN: &[u8] =
 /// Number of adjacent complex evaluations authenticated by one chunked leaf.
 pub const COMPLEX_VALUES_PER_CHUNK: usize = 32;
 
-/// A BLAKE3 Merkle root.
+/// Cryptographic compression used by a chunked Merkle protocol version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChunkHashAlgorithm {
+    Blake3,
+    Sha256,
+}
+
+// A prefix lives once per tree level. Hashing matches on its variant before
+// cloning the concrete hasher, so SHA-256 does not copy BLAKE3-sized storage.
+// Boxing BLAKE3 would add an unnecessary allocation to prefix construction.
+#[allow(clippy::large_enum_variant)]
+enum ChunkHasher {
+    Blake3(blake3::Hasher),
+    Sha256(Sha256),
+}
+
+impl ChunkHasher {
+    fn new(algorithm: ChunkHashAlgorithm) -> Self {
+        match algorithm {
+            ChunkHashAlgorithm::Blake3 => Self::Blake3(blake3::Hasher::new()),
+            ChunkHashAlgorithm::Sha256 => Self::Sha256(Sha256::default()),
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Blake3(hasher) => {
+                hasher.update(bytes);
+            }
+            Self::Sha256(hasher) => sha2::Digest::update(hasher, bytes),
+        }
+    }
+
+    fn finalize(self) -> MerkleRoot {
+        match self {
+            Self::Blake3(hasher) => *hasher.finalize().as_bytes(),
+            Self::Sha256(hasher) => sha2::Digest::finalize(hasher).into(),
+        }
+    }
+}
+
+/// A 32-byte Merkle root.
 pub type MerkleRoot = [u8; 32];
 
 /// A canonical compact opening of several complex leaves.
@@ -48,6 +91,7 @@ pub struct ComplexMultiProof {
 /// chunk and permits later multiproof extraction without rehashing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ChunkedComplexTree {
+    algorithm: ChunkHashAlgorithm,
     tree_label: Box<[u8]>,
     value_count: usize,
     padded_chunk_count: usize,
@@ -373,6 +417,7 @@ pub fn verify_complex_multiproof(
 /// to a power of two. Production unit-circle domains are powers of two, so
 /// they have either one short leaf or no synthetic padding.
 pub(crate) fn streaming_chunked_complex_root_iter<I>(
+    algorithm: ChunkHashAlgorithm,
     tree_label: &[u8],
     mut value_bits: I,
 ) -> Result<MerkleRoot, MerkleError>
@@ -394,9 +439,15 @@ where
                     .next()
                     .expect("exact-size complex iterator ended inside a chunk");
             }
-            hash_complex_chunk_leaf(tree_label, value_count, chunk_index, &chunk[..chunk_len])
+            hash_complex_chunk_leaf(
+                algorithm,
+                tree_label,
+                value_count,
+                chunk_index,
+                &chunk[..chunk_len],
+            )
         } else {
-            hash_complex_chunk_padding(tree_label, value_count, chunk_index)
+            hash_complex_chunk_padding(algorithm, tree_label, value_count, chunk_index)
         };
         let mut node = StreamingNode {
             hash,
@@ -408,6 +459,7 @@ where
             let parent_index = node.node_index / 2;
             node = StreamingNode {
                 hash: hash_complex_chunk_node(
+                    algorithm,
                     tree_label,
                     value_count,
                     height + 1,
@@ -433,6 +485,7 @@ where
 
 /// Builds and retains a flat chunked tree for later opening extraction.
 pub(crate) fn build_chunked_complex_tree_iter<I>(
+    algorithm: ChunkHashAlgorithm,
     tree_label: &[u8],
     mut value_bits: I,
 ) -> Result<ChunkedComplexTree, MerkleError>
@@ -451,10 +504,18 @@ where
         .map_err(|_| MerkleError::AllocationFailed)?;
     hashes.resize(hash_slots, [0_u8; 32]);
     let mut chunk = [[0_u64; 2]; COMPLEX_VALUES_PER_CHUNK];
-    let chunk_leaf_prefix =
-        complex_chunk_prefix(COMPLEX_CHUNK_LEAF_DOMAIN, tree_label, value_count);
-    let chunk_padding_prefix =
-        complex_chunk_prefix(COMPLEX_CHUNK_PADDING_DOMAIN, tree_label, value_count);
+    let chunk_leaf_prefix = complex_chunk_prefix(
+        algorithm,
+        COMPLEX_CHUNK_LEAF_DOMAIN,
+        tree_label,
+        value_count,
+    );
+    let chunk_padding_prefix = complex_chunk_prefix(
+        algorithm,
+        COMPLEX_CHUNK_PADDING_DOMAIN,
+        tree_label,
+        value_count,
+    );
 
     for chunk_index in 0..padded_chunk_count {
         hashes[padded_chunk_count + chunk_index] = if chunk_index < chunk_count {
@@ -479,7 +540,7 @@ where
     let mut level = 1_usize;
     while child_width > 1 {
         let parent_width = child_width / 2;
-        let node_prefix = complex_chunk_node_prefix(tree_label, value_count, level);
+        let node_prefix = complex_chunk_node_prefix(algorithm, tree_label, value_count, level);
         for parent_index in 0..parent_width {
             hashes[parent_width + parent_index] = hash_complex_chunk_node_from_prefix(
                 &node_prefix,
@@ -498,6 +559,7 @@ where
         .map_err(|_| MerkleError::AllocationFailed)?;
     owned_label.extend_from_slice(tree_label);
     Ok(ChunkedComplexTree {
+        algorithm,
         tree_label: owned_label.into_boxed_slice(),
         value_count,
         padded_chunk_count,
@@ -507,6 +569,7 @@ where
 
 /// Extracts a chunked multiproof from a retained tree without hashing again.
 pub(crate) fn chunked_complex_multiproof_from_tree_iter<I>(
+    algorithm: ChunkHashAlgorithm,
     tree: &ChunkedComplexTree,
     tree_label: &[u8],
     mut value_bits: I,
@@ -516,7 +579,10 @@ where
     I: ExactSizeIterator<Item = [u64; 2]>,
 {
     let value_count = value_bits.len();
-    if tree.tree_label.as_ref() != tree_label || tree.value_count != value_count {
+    if tree.algorithm != algorithm
+        || tree.tree_label.as_ref() != tree_label
+        || tree.value_count != value_count
+    {
         return Err(MerkleError::RootMismatch);
     }
     let selected_chunks = selected_complex_chunks(value_count, selected_indices)?;
@@ -572,6 +638,7 @@ where
 /// This deliberately exchanges proof bytes for fewer short-message hashes.
 #[cfg(test)]
 pub(crate) fn streaming_chunked_complex_multiproof_iter<I>(
+    algorithm: ChunkHashAlgorithm,
     tree_label: &[u8],
     mut value_bits: I,
     selected_indices: &[usize],
@@ -607,6 +674,7 @@ where
                 None
             } else {
                 Some(hash_complex_chunk_leaf(
+                    algorithm,
                     tree_label,
                     value_count,
                     chunk_index,
@@ -615,6 +683,7 @@ where
             }
         } else {
             Some(hash_complex_chunk_padding(
+                algorithm,
                 tree_label,
                 value_count,
                 chunk_index,
@@ -628,6 +697,7 @@ where
         while let Some(left) = reduction[height].take() {
             let parent_hash = match (left.hash, node.hash) {
                 (Some(left_hash), Some(right_hash)) => Some(hash_complex_chunk_node(
+                    algorithm,
                     tree_label,
                     value_count,
                     height + 1,
@@ -718,6 +788,7 @@ pub(crate) fn chunked_complex_multiproof_frontier_len(
 
 /// Verifies a compact proof whose leaves contain 32 adjacent values.
 pub(crate) fn verify_chunked_complex_multiproof(
+    algorithm: ChunkHashAlgorithm,
     tree_label: &[u8],
     value_count: usize,
     root: &MerkleRoot,
@@ -751,6 +822,7 @@ pub(crate) fn verify_chunked_complex_multiproof(
         nodes.push((
             chunk_index,
             hash_complex_chunk_leaf(
+                algorithm,
                 tree_label,
                 value_count,
                 chunk_index,
@@ -790,6 +862,7 @@ pub(crate) fn verify_chunked_complex_multiproof(
             parents.push((
                 parent_index,
                 hash_complex_chunk_node(
+                    algorithm,
                     tree_label,
                     value_count,
                     level + 1,
@@ -1185,6 +1258,7 @@ fn selected_complex_chunks(
 }
 
 fn hash_complex_chunk_leaf(
+    algorithm: ChunkHashAlgorithm,
     tree_label: &[u8],
     value_count: usize,
     chunk_index: usize,
@@ -1199,26 +1273,31 @@ fn hash_complex_chunk_leaf(
         output[..8].copy_from_slice(&real_bits.to_le_bytes());
         output[8..].copy_from_slice(&imaginary_bits.to_le_bytes());
     }
-    let mut hasher = blake3::Hasher::new();
-    update_field(&mut hasher, COMPLEX_CHUNK_LEAF_DOMAIN);
-    update_field(&mut hasher, tree_label);
-    update_usize(&mut hasher, value_count);
-    update_usize(&mut hasher, chunk_index);
-    update_usize(&mut hasher, value_bits.len());
+    let mut hasher = ChunkHasher::new(algorithm);
+    update_chunk_field(&mut hasher, COMPLEX_CHUNK_LEAF_DOMAIN);
+    update_chunk_field(&mut hasher, tree_label);
+    update_chunk_usize(&mut hasher, value_count);
+    update_chunk_usize(&mut hasher, chunk_index);
+    update_chunk_usize(&mut hasher, value_bits.len());
     hasher.update(&packed[..16 * value_bits.len()]);
-    *hasher.finalize().as_bytes()
+    hasher.finalize()
 }
 
-fn complex_chunk_prefix(domain: &[u8], tree_label: &[u8], value_count: usize) -> blake3::Hasher {
-    let mut hasher = blake3::Hasher::new();
-    update_field(&mut hasher, domain);
-    update_field(&mut hasher, tree_label);
-    update_usize(&mut hasher, value_count);
+fn complex_chunk_prefix(
+    algorithm: ChunkHashAlgorithm,
+    domain: &[u8],
+    tree_label: &[u8],
+    value_count: usize,
+) -> ChunkHasher {
+    let mut hasher = ChunkHasher::new(algorithm);
+    update_chunk_field(&mut hasher, domain);
+    update_chunk_field(&mut hasher, tree_label);
+    update_chunk_usize(&mut hasher, value_count);
     hasher
 }
 
 fn hash_complex_chunk_leaf_from_prefix(
-    prefix: &blake3::Hasher,
+    prefix: &ChunkHasher,
     chunk_index: usize,
     value_bits: &[[u64; 2]],
 ) -> MerkleRoot {
@@ -1231,36 +1310,55 @@ fn hash_complex_chunk_leaf_from_prefix(
         output[..8].copy_from_slice(&real_bits.to_le_bytes());
         output[8..].copy_from_slice(&imaginary_bits.to_le_bytes());
     }
-    let mut hasher = prefix.clone();
-    update_usize(&mut hasher, chunk_index);
-    update_usize(&mut hasher, value_bits.len());
-    hasher.update(&packed[..16 * value_bits.len()]);
-    *hasher.finalize().as_bytes()
+    match prefix {
+        ChunkHasher::Blake3(prefix) => {
+            let mut hasher = prefix.clone();
+            update_usize(&mut hasher, chunk_index);
+            update_usize(&mut hasher, value_bits.len());
+            hasher.update(&packed[..16 * value_bits.len()]);
+            *hasher.finalize().as_bytes()
+        }
+        ChunkHasher::Sha256(prefix) => {
+            let mut hasher = prefix.clone();
+            update_sha256_usize(&mut hasher, chunk_index);
+            update_sha256_usize(&mut hasher, value_bits.len());
+            sha2::Digest::update(&mut hasher, &packed[..16 * value_bits.len()]);
+            sha2::Digest::finalize(hasher).into()
+        }
+    }
 }
 
 fn hash_complex_chunk_padding(
+    algorithm: ChunkHashAlgorithm,
     tree_label: &[u8],
     value_count: usize,
     chunk_index: usize,
 ) -> MerkleRoot {
-    let mut hasher = blake3::Hasher::new();
-    update_field(&mut hasher, COMPLEX_CHUNK_PADDING_DOMAIN);
-    update_field(&mut hasher, tree_label);
-    update_usize(&mut hasher, value_count);
-    update_usize(&mut hasher, chunk_index);
-    *hasher.finalize().as_bytes()
+    let mut hasher = ChunkHasher::new(algorithm);
+    update_chunk_field(&mut hasher, COMPLEX_CHUNK_PADDING_DOMAIN);
+    update_chunk_field(&mut hasher, tree_label);
+    update_chunk_usize(&mut hasher, value_count);
+    update_chunk_usize(&mut hasher, chunk_index);
+    hasher.finalize()
 }
 
-fn hash_complex_chunk_padding_from_prefix(
-    prefix: &blake3::Hasher,
-    chunk_index: usize,
-) -> MerkleRoot {
-    let mut hasher = prefix.clone();
-    update_usize(&mut hasher, chunk_index);
-    *hasher.finalize().as_bytes()
+fn hash_complex_chunk_padding_from_prefix(prefix: &ChunkHasher, chunk_index: usize) -> MerkleRoot {
+    match prefix {
+        ChunkHasher::Blake3(prefix) => {
+            let mut hasher = prefix.clone();
+            update_usize(&mut hasher, chunk_index);
+            *hasher.finalize().as_bytes()
+        }
+        ChunkHasher::Sha256(prefix) => {
+            let mut hasher = prefix.clone();
+            update_sha256_usize(&mut hasher, chunk_index);
+            sha2::Digest::finalize(hasher).into()
+        }
+    }
 }
 
 fn hash_complex_chunk_node(
+    algorithm: ChunkHashAlgorithm,
     tree_label: &[u8],
     value_count: usize,
     level: usize,
@@ -1268,41 +1366,53 @@ fn hash_complex_chunk_node(
     left: &MerkleRoot,
     right: &MerkleRoot,
 ) -> MerkleRoot {
-    let mut hasher = blake3::Hasher::new();
-    update_field(&mut hasher, COMPLEX_CHUNK_NODE_DOMAIN);
-    update_field(&mut hasher, tree_label);
-    update_usize(&mut hasher, value_count);
-    update_usize(&mut hasher, level);
-    update_usize(&mut hasher, index);
+    let mut hasher = ChunkHasher::new(algorithm);
+    update_chunk_field(&mut hasher, COMPLEX_CHUNK_NODE_DOMAIN);
+    update_chunk_field(&mut hasher, tree_label);
+    update_chunk_usize(&mut hasher, value_count);
+    update_chunk_usize(&mut hasher, level);
+    update_chunk_usize(&mut hasher, index);
     hasher.update(left);
     hasher.update(right);
-    *hasher.finalize().as_bytes()
+    hasher.finalize()
 }
 
 fn complex_chunk_node_prefix(
+    algorithm: ChunkHashAlgorithm,
     tree_label: &[u8],
     value_count: usize,
     level: usize,
-) -> blake3::Hasher {
-    let mut hasher = blake3::Hasher::new();
-    update_field(&mut hasher, COMPLEX_CHUNK_NODE_DOMAIN);
-    update_field(&mut hasher, tree_label);
-    update_usize(&mut hasher, value_count);
-    update_usize(&mut hasher, level);
+) -> ChunkHasher {
+    let mut hasher = ChunkHasher::new(algorithm);
+    update_chunk_field(&mut hasher, COMPLEX_CHUNK_NODE_DOMAIN);
+    update_chunk_field(&mut hasher, tree_label);
+    update_chunk_usize(&mut hasher, value_count);
+    update_chunk_usize(&mut hasher, level);
     hasher
 }
 
 fn hash_complex_chunk_node_from_prefix(
-    prefix: &blake3::Hasher,
+    prefix: &ChunkHasher,
     index: usize,
     left: &MerkleRoot,
     right: &MerkleRoot,
 ) -> MerkleRoot {
-    let mut hasher = prefix.clone();
-    update_usize(&mut hasher, index);
-    hasher.update(left);
-    hasher.update(right);
-    *hasher.finalize().as_bytes()
+    match prefix {
+        ChunkHasher::Blake3(prefix) => {
+            let mut hasher = prefix.clone();
+            update_usize(&mut hasher, index);
+            hasher.update(left);
+            hasher.update(right);
+            *hasher.finalize().as_bytes()
+        }
+        ChunkHasher::Sha256(prefix) => {
+            let mut hasher = prefix.clone();
+            update_sha256_usize(&mut hasher, index);
+            sha2::Digest::update(&mut hasher, left);
+            sha2::Digest::update(&mut hasher, right);
+            sha2::Digest::finalize(hasher).into()
+        }
+    }
 }
 
 fn hash_complex_leaf(
@@ -1355,6 +1465,23 @@ fn update_field(hasher: &mut blake3::Hasher, value: &[u8]) {
     hasher.update(value);
 }
 
+fn update_chunk_field(hasher: &mut ChunkHasher, value: &[u8]) {
+    update_chunk_usize(hasher, value.len());
+    hasher.update(value);
+}
+
+fn update_chunk_usize(hasher: &mut ChunkHasher, value: usize) {
+    // Supported Rust targets use at most 64-bit `usize`; this keeps roots
+    // portable between 32- and 64-bit validators.
+    hasher.update(&(value as u64).to_le_bytes());
+}
+
+fn update_sha256_usize(hasher: &mut Sha256, value: usize) {
+    // Keep the SHA-256 protocol encoding identical to the BLAKE3 chunk
+    // encoding and portable between supported Rust target widths.
+    sha2::Digest::update(hasher, (value as u64).to_le_bytes());
+}
+
 fn update_usize(hasher: &mut blake3::Hasher, value: usize) {
     // Supported Rust targets use at most 64-bit `usize`; this keeps roots
     // portable between 32- and 64-bit validators.
@@ -1364,6 +1491,8 @@ fn update_usize(hasher: &mut blake3::Hasher, value: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
 
     const LABEL: &[u8] = b"solution-x";
 
@@ -1621,54 +1750,72 @@ mod tests {
 
     #[test]
     fn chunked_roots_and_multiproofs_round_trip_across_chunk_boundaries() {
-        for value_count in 1_usize..=97 {
-            let values = (0..value_count)
-                .map(|index| {
-                    [
-                        (index as f64 + 0.375).to_bits(),
-                        (17.0 - index as f64 * 0.25).to_bits(),
-                    ]
-                })
-                .collect::<Vec<_>>();
-            let selected = (0..value_count)
-                .filter(|index| {
-                    *index == 0
-                        || *index + 1 == value_count
-                        || *index == 31
-                        || *index == 32
-                        || *index % 19 == 0
-                })
-                .collect::<Vec<_>>();
-            let root = streaming_chunked_complex_root_iter(LABEL, values.iter().copied()).unwrap();
-            let proof =
-                streaming_chunked_complex_multiproof_iter(LABEL, values.iter().copied(), &selected)
-                    .unwrap();
-            let retained = build_chunked_complex_tree_iter(LABEL, values.iter().copied()).unwrap();
-            let retained_proof = chunked_complex_multiproof_from_tree_iter(
-                &retained,
-                LABEL,
-                values.iter().copied(),
-                &selected,
-            )
-            .unwrap();
-            assert_eq!(retained.root(), root);
-            assert_eq!(retained_proof, proof);
-            assert_eq!(
-                proof.value_bits.len(),
-                chunked_complex_opening_value_len(value_count, &selected).unwrap()
-            );
-            assert_eq!(
-                proof.frontier.len(),
-                chunked_complex_multiproof_frontier_len(value_count, &selected).unwrap()
-            );
-            verify_chunked_complex_multiproof(LABEL, value_count, &root, &selected, &proof)
+        for algorithm in [ChunkHashAlgorithm::Blake3, ChunkHashAlgorithm::Sha256] {
+            for value_count in 1_usize..=97 {
+                let values = (0..value_count)
+                    .map(|index| {
+                        [
+                            (index as f64 + 0.375).to_bits(),
+                            (17.0 - index as f64 * 0.25).to_bits(),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                let selected = (0..value_count)
+                    .filter(|index| {
+                        *index == 0
+                            || *index + 1 == value_count
+                            || *index == 31
+                            || *index == 32
+                            || *index % 19 == 0
+                    })
+                    .collect::<Vec<_>>();
+                let root =
+                    streaming_chunked_complex_root_iter(algorithm, LABEL, values.iter().copied())
+                        .unwrap();
+                let proof = streaming_chunked_complex_multiproof_iter(
+                    algorithm,
+                    LABEL,
+                    values.iter().copied(),
+                    &selected,
+                )
                 .unwrap();
-            for &index in &selected {
+                let retained =
+                    build_chunked_complex_tree_iter(algorithm, LABEL, values.iter().copied())
+                        .unwrap();
+                let retained_proof = chunked_complex_multiproof_from_tree_iter(
+                    algorithm,
+                    &retained,
+                    LABEL,
+                    values.iter().copied(),
+                    &selected,
+                )
+                .unwrap();
+                assert_eq!(retained.root(), root);
+                assert_eq!(retained_proof, proof);
                 assert_eq!(
-                    chunked_complex_opened_value_bits(value_count, &selected, &proof, index)
-                        .unwrap(),
-                    values[index]
+                    proof.value_bits.len(),
+                    chunked_complex_opening_value_len(value_count, &selected).unwrap()
                 );
+                assert_eq!(
+                    proof.frontier.len(),
+                    chunked_complex_multiproof_frontier_len(value_count, &selected).unwrap()
+                );
+                verify_chunked_complex_multiproof(
+                    algorithm,
+                    LABEL,
+                    value_count,
+                    &root,
+                    &selected,
+                    &proof,
+                )
+                .unwrap();
+                for &index in &selected {
+                    assert_eq!(
+                        chunked_complex_opened_value_bits(value_count, &selected, &proof, index)
+                            .unwrap(),
+                        values[index]
+                    );
+                }
             }
         }
     }
@@ -1679,17 +1826,23 @@ mod tests {
             .map(|index| [(index as f64).to_bits(), (index as f64 + 0.5).to_bits()])
             .collect::<Vec<_>>();
         let selected = vec![3, 40];
-        let root = streaming_chunked_complex_root_iter(LABEL, values.iter().copied()).unwrap();
-        let proof =
-            streaming_chunked_complex_multiproof_iter(LABEL, values.iter().copied(), &selected)
-                .unwrap();
+        let algorithm = ChunkHashAlgorithm::Blake3;
+        let root =
+            streaming_chunked_complex_root_iter(algorithm, LABEL, values.iter().copied()).unwrap();
+        let proof = streaming_chunked_complex_multiproof_iter(
+            algorithm,
+            LABEL,
+            values.iter().copied(),
+            &selected,
+        )
+        .unwrap();
         assert_eq!(proof.value_bits.len(), 64);
         assert!(proof.frontier.is_empty());
 
         let mut changed = proof.clone();
         changed.value_bits[17][0] ^= 1;
         assert_eq!(
-            verify_chunked_complex_multiproof(LABEL, 64, &root, &selected, &changed),
+            verify_chunked_complex_multiproof(algorithm, LABEL, 64, &root, &selected, &changed,),
             Err(MerkleError::RootMismatch)
         );
     }
@@ -1698,8 +1851,103 @@ mod tests {
     fn chunked_and_single_value_tree_domains_are_distinct() {
         let values = complex_values();
         assert_ne!(
-            streaming_chunked_complex_root_iter(LABEL, values.iter().copied()).unwrap(),
+            streaming_chunked_complex_root_iter(
+                ChunkHashAlgorithm::Blake3,
+                LABEL,
+                values.iter().copied(),
+            )
+            .unwrap(),
             streaming_complex_root(LABEL, &values).unwrap()
         );
+    }
+
+    #[test]
+    fn chunk_hash_algorithms_are_domain_distinct() {
+        let values = complex_values();
+        let blake3 = streaming_chunked_complex_root_iter(
+            ChunkHashAlgorithm::Blake3,
+            LABEL,
+            values.iter().copied(),
+        )
+        .unwrap();
+        let sha256 = streaming_chunked_complex_root_iter(
+            ChunkHashAlgorithm::Sha256,
+            LABEL,
+            values.iter().copied(),
+        )
+        .unwrap();
+        assert_ne!(blake3, sha256);
+    }
+
+    /// Release-only microbenchmark for the exact chunk-leaf and internal-node
+    /// hash paths used while retaining a prover tree. Run with
+    /// `cargo test --release -p ssv-fast benchmark_chunk_hash_kernels --
+    /// --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore = "release-only hash microbenchmark"]
+    fn benchmark_chunk_hash_kernels() {
+        const ITERATIONS: usize = 100_000;
+        const SAMPLES: usize = 7;
+        let values = (0..COMPLEX_VALUES_PER_CHUNK)
+            .map(|index| {
+                [
+                    (index as f64 + 0.375).to_bits(),
+                    (17.0 - index as f64 * 0.25).to_bits(),
+                ]
+            })
+            .collect::<Vec<_>>();
+
+        for algorithm in [ChunkHashAlgorithm::Blake3, ChunkHashAlgorithm::Sha256] {
+            let leaf_prefix = complex_chunk_prefix(
+                algorithm,
+                COMPLEX_CHUNK_LEAF_DOMAIN,
+                LABEL,
+                COMPLEX_VALUES_PER_CHUNK * 4096,
+            );
+            let node_prefix =
+                complex_chunk_node_prefix(algorithm, LABEL, COMPLEX_VALUES_PER_CHUNK * 4096, 3);
+            let left = [0x5a_u8; 32];
+            let right = [0xa5_u8; 32];
+
+            let mut checksum = 0_u8;
+            let mut leaf_samples = [0.0_f64; SAMPLES];
+            let mut node_samples = [0.0_f64; SAMPLES];
+            for sample in 0..SAMPLES {
+                let start = Instant::now();
+                for index in 0..ITERATIONS {
+                    checksum ^= hash_complex_chunk_leaf_from_prefix(
+                        black_box(&leaf_prefix),
+                        black_box(index),
+                        black_box(&values),
+                    )[0];
+                }
+                leaf_samples[sample] = start.elapsed().as_nanos() as f64 / ITERATIONS as f64;
+
+                let start = Instant::now();
+                for index in 0..ITERATIONS {
+                    checksum ^= hash_complex_chunk_node_from_prefix(
+                        black_box(&node_prefix),
+                        black_box(index),
+                        black_box(&left),
+                        black_box(&right),
+                    )[0];
+                }
+                node_samples[sample] = start.elapsed().as_nanos() as f64 / ITERATIONS as f64;
+            }
+            leaf_samples.sort_by(f64::total_cmp);
+            node_samples.sort_by(f64::total_cmp);
+            black_box(checksum);
+            println!(
+                "hash_kernel algorithm={algorithm:?} samples={SAMPLES} iterations={ITERATIONS} \
+                 leaf_ns_median={:.2} leaf_ns_range={:.2}..{:.2} \
+                 node_ns_median={:.2} node_ns_range={:.2}..{:.2}",
+                leaf_samples[SAMPLES / 2],
+                leaf_samples[0],
+                leaf_samples[SAMPLES - 1],
+                node_samples[SAMPLES / 2],
+                node_samples[0],
+                node_samples[SAMPLES - 1],
+            );
+        }
     }
 }

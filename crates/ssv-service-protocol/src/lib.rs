@@ -142,6 +142,9 @@ pub enum ProofProtocol {
     /// Experimental binary64 diagnostics with 32-value Merkle leaves.
     #[serde(rename = "fast-binary64-unit-circle-chunked-v6")]
     FastBinary64UnitCircleChunkedV6,
+    /// Experimental V6 chunk layout using SHA-256 Merkle compression.
+    #[serde(rename = "fast-binary64-unit-circle-chunked-sha256-v7")]
+    FastBinary64UnitCircleChunkedSha256V7,
 }
 
 /// Immutable numerical parameters for fast diagnostic policy 3.
@@ -166,6 +169,7 @@ impl ProofProtocol {
             Self::WhirField192L2V4 => 2,
             Self::FastBinary64UnitCircleV5 => 6,
             Self::FastBinary64UnitCircleChunkedV6 => 7,
+            Self::FastBinary64UnitCircleChunkedSha256V7 => 8,
         }
     }
 
@@ -177,6 +181,7 @@ impl ProofProtocol {
             2 => Some(Self::WhirField192L2V4),
             6 => Some(Self::FastBinary64UnitCircleV5),
             7 => Some(Self::FastBinary64UnitCircleChunkedV6),
+            8 => Some(Self::FastBinary64UnitCircleChunkedSha256V7),
             _ => None,
         }
     }
@@ -985,6 +990,22 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ProofProtocol::FastBinary64UnitCircleChunkedV6).unwrap(),
             "\"fast-binary64-unit-circle-chunked-v6\""
+        );
+    }
+
+    #[test]
+    fn sha256_chunked_fast_v7_has_a_distinct_wire_and_json_id() {
+        assert_eq!(
+            ProofProtocol::FastBinary64UnitCircleChunkedSha256V7.wire_id(),
+            8
+        );
+        assert_eq!(
+            ProofProtocol::from_wire_id(8),
+            Some(ProofProtocol::FastBinary64UnitCircleChunkedSha256V7)
+        );
+        assert_eq!(
+            serde_json::to_string(&ProofProtocol::FastBinary64UnitCircleChunkedSha256V7).unwrap(),
+            "\"fast-binary64-unit-circle-chunked-sha256-v7\""
         );
     }
 

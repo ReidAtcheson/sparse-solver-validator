@@ -34,7 +34,7 @@ use crate::float_contract::{
     decode_canonical_bits,
 };
 use crate::merkle::{
-    ChunkedComplexTree, ComplexMultiProof, MerkleError, MerkleRoot,
+    ChunkHashAlgorithm, ChunkedComplexTree, ComplexMultiProof, MerkleError, MerkleRoot,
     build_chunked_complex_tree_iter, chunked_complex_multiproof_from_tree_iter,
     chunked_complex_opened_value_bits, streaming_chunked_complex_root_iter,
     streaming_complex_multiproof_iter, streaming_complex_root, streaming_complex_root_iter,
@@ -62,12 +62,16 @@ const PAYLOAD_DIGEST_DOMAIN: &[u8] = b"sparse-solve/fast-backend-payload/v6";
 const PROTOCOL_LABEL: &[u8] = b"sparse-solve/fast/coefficient-unit-circle-linear-opening/v6";
 const CHUNKED_PROTOCOL_LABEL: &[u8] =
     b"sparse-solve/fast/coefficient-unit-circle-linear-opening/chunked/v1";
+const CHUNKED_SHA256_PROTOCOL_LABEL: &[u8] =
+    b"sparse-solve/fast/coefficient-unit-circle-linear-opening/chunked-sha256/v1";
 const FLOAT_CONTRACT: &[u8] =
     b"binary64/rne/no-fma/reject-nan-inf-negzero-subnormal/unit-circle-coeff/v2";
 const CODE_BASIS: &[u8] =
     b"packed-[x||R]/msb-mle/bit-reversed-monomial-coefficients/unit-circle-rate-1/2";
 const ORACLE_TREE_LABEL: &[u8] = b"ssv-fast/v6/packed-unit-circle-oracle";
 const CHUNKED_ORACLE_TREE_LABEL: &[u8] = b"ssv-fast/chunked-v1/packed-unit-circle-oracle";
+const CHUNKED_SHA256_ORACLE_TREE_LABEL: &[u8] =
+    b"ssv-fast/chunked-sha256-v1/packed-unit-circle-oracle";
 const MAX_PRECOMMITMENT_BYTES: usize = 4096;
 const MAX_PROOF_BYTES: usize = ssv_validation::MAX_SUCCINCT_PAYLOAD_BYTES;
 /// Maximum preflight estimate for backend-owned fast-prover memory.
@@ -90,6 +94,7 @@ const CHUNKED_TREE_PEAK_BYTES_PER_PADDED_ELEMENT: usize = 16;
 enum FastFlavor {
     PerValueV5,
     ChunkedV6,
+    ChunkedSha256V7,
 }
 
 impl FastFlavor {
@@ -97,6 +102,7 @@ impl FastFlavor {
         match protocol {
             ProofProtocol::FastBinary64UnitCircleV5 => Ok(Self::PerValueV5),
             ProofProtocol::FastBinary64UnitCircleChunkedV6 => Ok(Self::ChunkedV6),
+            ProofProtocol::FastBinary64UnitCircleChunkedSha256V7 => Ok(Self::ChunkedSha256V7),
             _ => Err(FastError::WrongProtocol),
         }
     }
@@ -105,6 +111,7 @@ impl FastFlavor {
         match self {
             Self::PerValueV5 => PROTOCOL_LABEL,
             Self::ChunkedV6 => CHUNKED_PROTOCOL_LABEL,
+            Self::ChunkedSha256V7 => CHUNKED_SHA256_PROTOCOL_LABEL,
         }
     }
 
@@ -112,6 +119,15 @@ impl FastFlavor {
         match self {
             Self::PerValueV5 => ORACLE_TREE_LABEL,
             Self::ChunkedV6 => CHUNKED_ORACLE_TREE_LABEL,
+            Self::ChunkedSha256V7 => CHUNKED_SHA256_ORACLE_TREE_LABEL,
+        }
+    }
+
+    const fn chunk_hash_algorithm(self) -> Option<ChunkHashAlgorithm> {
+        match self {
+            Self::PerValueV5 => None,
+            Self::ChunkedV6 => Some(ChunkHashAlgorithm::Blake3),
+            Self::ChunkedSha256V7 => Some(ChunkHashAlgorithm::Sha256),
         }
     }
 }
@@ -567,6 +583,10 @@ pub struct FastBackend;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FastChunkedBackend;
 
+/// Experimental fast backend using SHA-256 for chunked Merkle compression.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FastChunkedSha256Backend;
+
 impl From<UnitCircleError> for FastError {
     fn from(error: UnitCircleError) -> Self {
         match error {
@@ -757,6 +777,26 @@ impl FastChunkedBackend {
     }
 }
 
+impl FastChunkedSha256Backend {
+    /// Constructs a complete local SHA-256 chunked-leaf proof while preparing
+    /// private material once.
+    pub fn prove_single_stage(
+        statement: &PublicStatement,
+        solution: &Solution,
+    ) -> Result<(Vec<u8>, FastProverReport), FastError> {
+        prove_single_stage_backend(statement, solution)
+    }
+
+    /// Performs cheap framing and statement-binding preflight before
+    /// algebraic verification.
+    pub fn preflight(
+        statement: &VerifierStatement<'_>,
+        payload: &[u8],
+    ) -> Result<FastPreflight, FastError> {
+        Ok(preflight_backend(statement, payload)?.report)
+    }
+}
+
 impl ValidationBackend for FastBackend {
     type ProverContext = FastProverContext;
     type ProverReport = FastProverReport;
@@ -820,6 +860,43 @@ impl ValidationBackend for FastChunkedBackend {
 }
 
 impl PrecommitBackend for FastChunkedBackend {
+    type Commitment = FastPrecommitment;
+    type CommitmentReport = FastCommitmentReport;
+
+    fn commit(
+        statement: &PublicStatement,
+        solution: &Solution,
+    ) -> Result<(Self::Commitment, Self::CommitmentReport), Self::Error> {
+        commit_backend(statement, solution)
+    }
+}
+
+impl ValidationBackend for FastChunkedSha256Backend {
+    type ProverContext = FastProverContext;
+    type ProverReport = FastProverReport;
+    type VerifierReport = FastVerifierReport;
+    type Error = FastError;
+
+    const PROTOCOL: ProofProtocol = ProofProtocol::FastBinary64UnitCircleChunkedSha256V7;
+
+    fn prove(
+        statement: &PublicStatement,
+        solution: &Solution,
+        context: &Self::ProverContext,
+    ) -> Result<(Vec<u8>, Self::ProverReport), Self::Error> {
+        prove_backend(statement, solution, context)
+    }
+
+    fn verify(
+        statement: &VerifierStatement<'_>,
+        payload: &[u8],
+        cancellation: &ValidationCancellation,
+    ) -> Result<Self::VerifierReport, Self::Error> {
+        verify_backend(statement, payload, cancellation)
+    }
+}
+
+impl PrecommitBackend for FastChunkedSha256Backend {
     type Commitment = FastPrecommitment;
     type CommitmentReport = FastCommitmentReport;
 
@@ -1426,9 +1503,11 @@ fn fast_prover_memory_preflight(
         .ok_or(FastError::ResourceLimit)?;
     let bytes_per_element = match flavor {
         FastFlavor::PerValueV5 => FAST_PROVER_PEAK_BYTES_PER_PADDED_ELEMENT,
-        FastFlavor::ChunkedV6 => FAST_PROVER_PEAK_BYTES_PER_PADDED_ELEMENT
-            .checked_add(CHUNKED_TREE_PEAK_BYTES_PER_PADDED_ELEMENT)
-            .ok_or(FastError::ResourceLimit)?,
+        FastFlavor::ChunkedV6 | FastFlavor::ChunkedSha256V7 => {
+            FAST_PROVER_PEAK_BYTES_PER_PADDED_ELEMENT
+                .checked_add(CHUNKED_TREE_PEAK_BYTES_PER_PADDED_ELEMENT)
+                .ok_or(FastError::ResourceLimit)?
+        }
     };
     let variable_bytes = padded_len
         .checked_mul(bytes_per_element)
@@ -1751,7 +1830,13 @@ fn complex_root(
     let bits = values.iter().copied().map(ComplexValue::canonical_bits);
     Ok(match flavor {
         FastFlavor::PerValueV5 => streaming_complex_root_iter(label, bits)?,
-        FastFlavor::ChunkedV6 => streaming_chunked_complex_root_iter(label, bits)?,
+        FastFlavor::ChunkedV6 | FastFlavor::ChunkedSha256V7 => streaming_chunked_complex_root_iter(
+            flavor
+                .chunk_hash_algorithm()
+                .ok_or(FastError::TranscriptShape)?,
+            label,
+            bits,
+        )?,
     })
 }
 
@@ -1763,8 +1848,14 @@ fn complex_root_and_cache(
     let bits = values.iter().copied().map(ComplexValue::canonical_bits);
     match flavor {
         FastFlavor::PerValueV5 => Ok((streaming_complex_root_iter(label, bits)?, None)),
-        FastFlavor::ChunkedV6 => {
-            let tree = build_chunked_complex_tree_iter(label, bits)?;
+        FastFlavor::ChunkedV6 | FastFlavor::ChunkedSha256V7 => {
+            let tree = build_chunked_complex_tree_iter(
+                flavor
+                    .chunk_hash_algorithm()
+                    .ok_or(FastError::TranscriptShape)?,
+                label,
+                bits,
+            )?;
             Ok((tree.root(), Some(tree)))
         }
     }
@@ -1837,9 +1928,17 @@ fn build_folding_opening(
             .map(ComplexValue::canonical_bits);
         let openings = match flavor {
             FastFlavor::PerValueV5 => streaming_complex_multiproof_iter(&label, bits, &selected)?,
-            FastFlavor::ChunkedV6 => {
+            FastFlavor::ChunkedV6 | FastFlavor::ChunkedSha256V7 => {
                 let tree = trees[round].as_ref().ok_or(FastError::TranscriptShape)?;
-                chunked_complex_multiproof_from_tree_iter(tree, &label, bits, &selected)?
+                chunked_complex_multiproof_from_tree_iter(
+                    flavor
+                        .chunk_hash_algorithm()
+                        .ok_or(FastError::TranscriptShape)?,
+                    tree,
+                    &label,
+                    bits,
+                    &selected,
+                )?
             }
         };
         work.record_merkle_multiproof_pass()?;
@@ -1893,9 +1992,13 @@ fn verify_folding_opening(
     let final_bits = proof.final_values.map(ComplexValue::canonical_bits);
     let final_root = match flavor {
         FastFlavor::PerValueV5 => streaming_complex_root(&final_label, &final_bits)?,
-        FastFlavor::ChunkedV6 => {
-            streaming_chunked_complex_root_iter(&final_label, final_bits.into_iter())?
-        }
+        FastFlavor::ChunkedV6 | FastFlavor::ChunkedSha256V7 => streaming_chunked_complex_root_iter(
+            flavor
+                .chunk_hash_algorithm()
+                .ok_or(FastError::TranscriptShape)?,
+            &final_label,
+            final_bits.into_iter(),
+        )?,
     };
     if final_root != *proof.roots.last().ok_or(FastError::TranscriptShape)? {
         return Err(FastError::TranscriptShape);
@@ -1919,13 +2022,18 @@ fn verify_folding_opening(
             FastFlavor::PerValueV5 => {
                 verify_complex_multiproof(&label, domain_len, &root, &expected_indices, openings)?
             }
-            FastFlavor::ChunkedV6 => verify_chunked_complex_multiproof(
-                &label,
-                domain_len,
-                &root,
-                &expected_indices,
-                openings,
-            )?,
+            FastFlavor::ChunkedV6 | FastFlavor::ChunkedSha256V7 => {
+                verify_chunked_complex_multiproof(
+                    flavor
+                        .chunk_hash_algorithm()
+                        .ok_or(FastError::TranscriptShape)?,
+                    &label,
+                    domain_len,
+                    &root,
+                    &expected_indices,
+                    openings,
+                )?
+            }
         };
         merkle_hashes = merkle_hashes
             .checked_add(u64::try_from(round_hashes).map_err(|_| FastError::ResourceLimit)?)
@@ -2059,7 +2167,7 @@ fn opened_value(
                 .get(position)
                 .ok_or(FastError::TranscriptShape)?
         }
-        FastFlavor::ChunkedV6 => {
+        FastFlavor::ChunkedV6 | FastFlavor::ChunkedSha256V7 => {
             chunked_complex_opened_value_bits(value_count, expected_indices, openings, index)?
         }
     };
@@ -2231,7 +2339,7 @@ fn decode_proof(
     for _ in 0..opening_count {
         let maximum_values = match flavor {
             FastFlavor::PerValueV5 => (2 * query_count).min(domain_len),
-            FastFlavor::ChunkedV6 => (2 * query_count)
+            FastFlavor::ChunkedV6 | FastFlavor::ChunkedSha256V7 => (2 * query_count)
                 .checked_mul(crate::merkle::COMPLEX_VALUES_PER_CHUNK)
                 .ok_or(FastError::ResourceLimit)?
                 .min(domain_len),

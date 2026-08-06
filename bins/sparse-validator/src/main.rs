@@ -9,7 +9,7 @@ use ed25519_dalek::VerifyingKey;
 use ssv_backends::{BackendVerifierReport, verify as verify_backend};
 use ssv_canonical::Digest;
 use ssv_direct::{DirectArtifact, MAX_PROOF_BYTES};
-use ssv_fast::{FastBackend, FastChunkedBackend};
+use ssv_fast::{FastBackend, FastChunkedBackend, FastChunkedSha256Backend};
 use ssv_problem::{FinalizedRandomness, SuccinctPublicEvaluator};
 use ssv_service_protocol::{CertifiedScore, SignedCertificate};
 use ssv_validation::{ArtifactPrelude, MAX_ARTIFACT_BYTES};
@@ -165,6 +165,12 @@ fn inspect_common(path: &Path, bytes: &[u8]) -> Result<()> {
                 prelude.payload(),
             ))
         }
+        ssv_service_protocol::ProofProtocol::FastBinary64UnitCircleChunkedSha256V7 => {
+            Some(FastChunkedSha256Backend::preflight(
+                &prelude.statement().verifier_statement(),
+                prelude.payload(),
+            ))
+        }
         _ => None,
     };
     if let Some(preflight) = fast_preflight {
@@ -291,6 +297,9 @@ fn print_backend_report(report: &BackendVerifierReport) {
         }
         BackendVerifierReport::FastChunked(report) => {
             print_fast_backend_report("fast-binary64-unit-circle-chunked-v6", report);
+        }
+        BackendVerifierReport::FastChunkedSha256(report) => {
+            print_fast_backend_report("fast-binary64-unit-circle-chunked-sha256-v7", report);
         }
     }
 }

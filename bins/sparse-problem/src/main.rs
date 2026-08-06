@@ -401,6 +401,7 @@ enum ProtocolArg {
     Exact,
     Fast,
     FastChunked,
+    FastChunkedSha256,
 }
 
 impl From<ProtocolArg> for ProofProtocol {
@@ -410,6 +411,7 @@ impl From<ProtocolArg> for ProofProtocol {
             ProtocolArg::Exact => Self::WhirField192L2V4,
             ProtocolArg::Fast => Self::FastBinary64UnitCircleV5,
             ProtocolArg::FastChunked => Self::FastBinary64UnitCircleChunkedV6,
+            ProtocolArg::FastChunkedSha256 => Self::FastBinary64UnitCircleChunkedSha256V7,
         }
     }
 }

@@ -37,6 +37,7 @@ const REGISTERED_PROTOCOLS: &[ProofProtocol] = &[
     ProofProtocol::WhirField192L2V4,
     ProofProtocol::FastBinary64UnitCircleV5,
     ProofProtocol::FastBinary64UnitCircleChunkedV6,
+    ProofProtocol::FastBinary64UnitCircleChunkedSha256V7,
 ];
 
 pub const MAX_PUBLIC_STATEMENT_BYTES: usize = 1024 * 1024;
@@ -910,6 +911,7 @@ mod tests {
             ProofProtocol::DirectReferenceV1,
             ProofProtocol::FastBinary64UnitCircleV5,
             ProofProtocol::FastBinary64UnitCircleChunkedV6,
+            ProofProtocol::FastBinary64UnitCircleChunkedSha256V7,
         ] {
             let manifest = ValidationManifest {
                 protocol,

@@ -5,8 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+sha256-force-soft = ["sha2/force-soft"]
+
 [dependencies]
 blake3.workspace = true
+sha2.workspace = true
 ssv-canonical = { path = "../ssv-canonical" }
 ssv-problem = { path = "../ssv-problem" }
 ssv-service-protocol = { path = "../ssv-service-protocol" }

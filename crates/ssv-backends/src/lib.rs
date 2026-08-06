@@ -11,7 +11,10 @@
 
 use ssv_direct::{DirectBackend, DirectError, DirectProverReport, DirectVerifierReport};
 use ssv_exact::{ExactBackend, ExactError, ExactProverReport, ExactVerifierReport};
-use ssv_fast::{FastBackend, FastChunkedBackend, FastError, FastProverReport, FastVerifierReport};
+use ssv_fast::{
+    FastBackend, FastChunkedBackend, FastChunkedSha256Backend, FastError, FastProverReport,
+    FastVerifierReport,
+};
 use ssv_service_protocol::{
     CertifiedScore, DefectMetrics, FastConsistencyMetrics, ProofProtocol,
     PublicEvaluatorRoundoffMetrics, Unsigned192,
@@ -29,6 +32,7 @@ pub enum BackendProverReport {
     Exact(ExactProverReport),
     Fast(FastProverReport),
     FastChunked(FastProverReport),
+    FastChunkedSha256(FastProverReport),
 }
 
 /// Report produced only after a backend's structural and cryptographic
@@ -43,6 +47,7 @@ pub enum BackendVerifierReport {
     Exact(ExactVerifierReport),
     Fast(Box<FastVerifierReport>),
     FastChunked(Box<FastVerifierReport>),
+    FastChunkedSha256(Box<FastVerifierReport>),
 }
 
 #[derive(Debug, Error)]
@@ -100,6 +105,11 @@ pub fn prove_single_stage(
             let (payload, report) = FastChunkedBackend::prove_single_stage(statement, solution)?;
             Ok((payload, BackendProverReport::FastChunked(report)))
         }
+        ProofProtocol::FastBinary64UnitCircleChunkedSha256V7 => {
+            let (payload, report) =
+                FastChunkedSha256Backend::prove_single_stage(statement, solution)?;
+            Ok((payload, BackendProverReport::FastChunkedSha256(report)))
+        }
     }
 }
 
@@ -126,6 +136,11 @@ pub fn verify_with_cancellation(
         ProofProtocol::FastBinary64UnitCircleChunkedV6 => Ok(BackendVerifierReport::FastChunked(
             Box::new(prelude.verify_with_cancellation::<FastChunkedBackend>(cancellation)?),
         )),
+        ProofProtocol::FastBinary64UnitCircleChunkedSha256V7 => {
+            Ok(BackendVerifierReport::FastChunkedSha256(Box::new(
+                prelude.verify_with_cancellation::<FastChunkedSha256Backend>(cancellation)?,
+            )))
+        }
     }
 }
 
@@ -137,6 +152,7 @@ impl BackendVerifierReport {
             Self::Exact(_) => ProofProtocol::WhirField192L2V4,
             Self::Fast(_) => ProofProtocol::FastBinary64UnitCircleV5,
             Self::FastChunked(_) => ProofProtocol::FastBinary64UnitCircleChunkedV6,
+            Self::FastChunkedSha256(_) => ProofProtocol::FastBinary64UnitCircleChunkedSha256V7,
         }
     }
 
@@ -163,7 +179,9 @@ impl BackendVerifierReport {
                     denominator_power: report.residual.denominator_power,
                 })
             }
-            BackendVerifierReport::Fast(report) | BackendVerifierReport::FastChunked(report) => {
+            BackendVerifierReport::Fast(report)
+            | BackendVerifierReport::FastChunked(report)
+            | BackendVerifierReport::FastChunkedSha256(report) => {
                 let score = &report.score;
                 Ok(CertifiedScore::FastBinary64DiagnosticsV1 {
                     squared_l2_claim: score.squared_l2_claim,

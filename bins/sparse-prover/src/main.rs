@@ -130,6 +130,12 @@ fn prove(args: &CommonProofArgs) -> Result<()> {
         BackendProverReport::FastChunked(report) => {
             print_fast_prover_report(ProofProtocol::FastBinary64UnitCircleChunkedV6, &report);
         }
+        BackendProverReport::FastChunkedSha256(report) => {
+            print_fast_prover_report(
+                ProofProtocol::FastBinary64UnitCircleChunkedSha256V7,
+                &report,
+            );
+        }
     }
     print_artifact_summary(summary, &args.proof);
     Ok(())
@@ -229,6 +235,9 @@ const fn proof_protocol_name(protocol: ProofProtocol) -> &'static str {
         ProofProtocol::WhirField192L2V4 => "whir-field192-l2-v4",
         ProofProtocol::FastBinary64UnitCircleV5 => "fast-binary64-unit-circle-v5",
         ProofProtocol::FastBinary64UnitCircleChunkedV6 => "fast-binary64-unit-circle-chunked-v6",
+        ProofProtocol::FastBinary64UnitCircleChunkedSha256V7 => {
+            "fast-binary64-unit-circle-chunked-sha256-v7"
+        }
     }
 }
 
