@@ -1,6 +1,7 @@
 # Brakedown-shaped binary64 commitment cost floor
 
-Status: throughput experiment without a proximity or soundness claim.
+Status: throughput and two-sumcheck composition experiments without a
+proximity or soundness claim.
 
 This benchmark accompanies
 [`brakedown-inspired-binary64-metric-commitments.md`](../../proposals/brakedown-inspired-binary64-metric-commitments.md).
@@ -30,6 +31,35 @@ claimed expansion, distance, local-test, or decoder theorem. Authentication
 paths are stored independently rather than as a deduplicated multiproof, so
 the byte figures are conservative for the implemented tree.
 
+## Residual-composition mode
+
+The same example has an explicit `--residual-composition` mode. It keeps the
+surrogate commitment but replaces the synthetic source with the padded message
+`[x || r]` for a registered shifted graph-Laplacian problem. It then performs:
+
+1. the sparse pass `r = A x - b`;
+2. a product sumcheck for `sum_i r_i^2`, yielding `rho` and
+   `r_tilde(rho)`;
+3. a sparse pass forming `w_j = sum_i eq(rho,i) A_ij`;
+4. a product sumcheck for
+   `b_tilde(rho) + r_tilde(rho) = sum_j w_j x_j`, yielding `sigma` and
+   `x_tilde(sigma)`;
+5. two row combinations of the one committed matrix for the packed MLE points
+   `(0, sigma)` and `(1, rho)`; and
+6. one shared set of sampled encoded columns authenticating both combinations.
+
+The verifier replays both sumchecks, evaluates the registered public matrix
+and RHS MLEs, authenticates each opened column once, and reports every
+binary64 defect. Changing a terminal claim changes the subsequent query
+schedule; stale claims or Merkle paths fail structural verification.
+
+This is an end-to-end **composition cost**, not an end-to-end sound proof. The
+implemented degree-4 graph is not a distance code, so the sampled-column step
+is explicitly conditioned on an unavailable proximity theorem. The benchmark
+prints the minimum encoded weight of a one-source-coordinate change and its
+exact without-replacement query miss probability to make that limitation
+visible in every run.
+
 ## Reproduction
 
 ```sh
@@ -44,6 +74,27 @@ target/release/examples/brakedown_metric_commitment \
   --warmups 2 \
   --repetitions 25
 ```
+
+The composed 1M offset-32 run is:
+
+```sh
+target/release/examples/brakedown_metric_commitment \
+  --residual-composition \
+  --dimension 1048576 \
+  --rows 1024 \
+  --offsets 1,32 \
+  --parity-denominator 2 \
+  --degree 4 \
+  --queries 16 \
+  --warmups 2 \
+  --repetitions 25
+```
+
+Use `--offsets 1` for the half-bandwidth-1 comparison. The candidate solution
+is generated outside the timer as `1` plus a deterministic integer multiple
+of `2^-24`; `--perturbation-bits` changes that scale. Problem compilation is
+also excluded. Residual construction, all commitment work, both sumchecks,
+both sparse proof scans, and opening extraction are included.
 
 The master seed defaults to `0x5eedc0ded15ca11e`. Graph, source, row-weight,
 column-weight, and query seeds are deterministically domain-separated in the
@@ -104,12 +155,80 @@ These defects are measurements, not acceptance thresholds. In particular, the
 queried maximum being smaller than the global maximum illustrates why sampled
 observations require a confidence statement and magnitude or energy control.
 
+## Two-sumcheck composition results
+
+The composed runs used the same machine and release profile, one thread, two
+warm-ups, and 25 measured repetitions. The packed two-table message used 1,024
+rows and 2,048 source columns, one parity column per two source columns,
+degree 4, and 16 shared column queries.
+
+| Offsets | Structural nnz | Prover median | Min--max | Verifier median | Estimated proof | Peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `[1]` | 3,145,726 | 142.419 ms | 133.973--148.457 ms | 16.452 ms | 171,128 B | 60,224 KiB |
+| `[1, 32]` | 5,242,814 | 171.202 ms | 160.415--180.859 ms | 30.584 ms | 171,128 B | 60,240 KiB |
+
+The proof estimate includes one 32-byte root, the three scalar claims, both
+20-round quadratic sumchecks, both complete source row combinations, 16 full
+opened columns, indices, and naive authentication paths. It is not canonical
+serialization. It is 2.04% of the 8 MiB raw solution.
+
+Median offset-32 prover stages were:
+
+| Stage | Time |
+| --- | ---: |
+| Residual sparse pass | 46.463 ms |
+| Packed-message copy | 5.934 ms |
+| Sparse row encoding | 5.594 ms |
+| Column/tree commitment | 23.722 ms |
+| Residual-norm sumcheck | 23.388 ms |
+| Matvec row-compression sparse pass | 48.935 ms |
+| Matvec sumcheck | 13.441 ms |
+| Two terminal row combinations | 3.512 ms |
+| Opening extraction | 0.024 ms |
+
+The two sparse passes account for about 95.4 ms and are now the largest cost.
+There is no global FFT and no third linear-opening sumcheck.
+
+The honest maximum defects were `2.07e-25` in the norm transcript,
+`1.11e-16` in the matvec transcript, `9.05e-26` at the residual opening,
+`1.11e-15` at the solution opening, and `5.55e-16` among sampled code
+combinations. These are diagnostic observations, not a derived acceptance
+threshold.
+
+### Deliberate falsification result
+
+For this shape the surrogate has 3,072 encoded columns. Its minimum encoded
+weight for changing one source coordinate is only one: at least one systematic
+source coordinate happens to have no adjacent parity column. Sixteen uniform
+queries without replacement miss that coordinate with probability
+
+```text
+3056 / 3072 = 0.9947916667.
+```
+
+This is decisive evidence that the throughput graph cannot serve as the final
+code. The good runtime answers only the composition-cost question. A real
+linear-time code with proved distance and robust local testing must replace the
+surrogate, and the complete benchmark must then be rerun.
+
 ## Relation to the measured solves
 
 The earlier 1M SciPy banded-Cholesky measurements, including factorization and
 triangular solve, were 30.491 ms at half-bandwidth 1 and 247.374 ms at
 half-bandwidth 32. The `256 x 4096` surrogate therefore costs about 0.55 and
 0.068 of those solves, respectively.
+
+The two-sumcheck composition is the more relevant comparison:
+
+| Half-bandwidth | SciPy factor + solve | Composed prover | Prover / solve | Current proof / composed prover |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 30.491 ms | 142.419 ms | 4.67x | 11.90x |
+| 32 | 247.374 ms | 171.202 ms | 0.69x | 9.72x |
+
+Thus the measured offset-32 composition no longer perturbs the benchmark more
+than the solve itself. The offset-1 case remains about 4.7 times the very fast
+banded factor-and-solve. Neither comparison includes the unknown cost needed
+to replace the unsound sparse graph with a defensible Brakedown code.
 
 This is encouraging but incomplete. The surrogate omits:
 

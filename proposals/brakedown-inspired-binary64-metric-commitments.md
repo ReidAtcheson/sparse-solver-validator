@@ -37,6 +37,11 @@ Investigate a Brakedown-shaped commitment to a canonical binary64 message
 6. Compose proved bounds derived from those observations into an interval for
    the final squared residual norm.
 
+Do not add a separate randomized Hadamard layer to this path. Its intended role
+was distance amplification, which belongs in the Brakedown code itself; a
+Hadamard checksum layer without an authenticated distance test only adds
+another committed table and another relation to prove.
+
 The hoped-for prover cost is a small number of sequential passes:
 
 ```text
@@ -361,17 +366,65 @@ MLE values. Their tables halve each round, so their arithmetic is linear in
 the initial table size. The new commitment removes the rate-one-half global
 FFT; it does not remove all vector passes.
 
-Before the PCS opening, batch all required committed evaluations with fresh
-coefficients sampled after their claims are fixed. Candidate inputs include:
+The first concrete composition needs only **two** committed endpoints. Use the
+repository sign convention
 
-- the solution endpoint from the sparse matvec sumcheck;
-- the residual-witness endpoint from its norm sumcheck;
-- the packed-message endpoint; and
-- any auxiliary defect or magnitude claim.
+```text
+r = A x - b.
+```
 
-The batching relation is approximate and receives its own anti-cancellation
-allocation. It must not turn one small combined defect into deterministic
-bounds for every component.
+Changing to `b - A x` only negates `r` and leaves its squared norm unchanged.
+The noninteractive order is:
+
+1. Compute `r`, pack `[x || r]`, encode its rows, and commit the encoded
+   columns before drawing any algebraic challenge.
+2. Prove the claim `S = sum_i r_i^2` with the product sumcheck. Its terminal
+   point `rho` supplies both the value `r_tilde(rho)` and the random row
+   compression used by the next relation.
+3. Define the structured random vector
+
+   ```text
+   lambda_i = eq(rho, i)
+   ```
+
+   and make one sparse pass to form
+
+   ```text
+   w_j = sum_i lambda_i A_ij.
+   ```
+
+   The identity
+
+   ```text
+   b_tilde(rho) + r_tilde(rho) = sum_j w_j x_j
+   ```
+
+   is proved by a second product sumcheck. At its terminal point `sigma`, the
+   verifier evaluates the public `A_tilde(rho, sigma)` succinctly and needs the
+   committed value `x_tilde(sigma)`.
+4. Reduce the two claims `r_tilde(rho)` and `x_tilde(sigma)` to two row
+   combinations of the same matrix-shaped commitment. Send both source
+   combinations, derive one shared set of column queries only after both are
+   fixed, and authenticate both against every opened column.
+
+This ordering is important. An arbitrary explicit random vector `lambda`
+would force the verifier to form `A^T lambda` in `O(nnz(A))` work. Equality
+weights derived from an MLE point give the same random linear-functional role
+while letting the registered public evaluator compute the terminal matrix MLE
+succinctly. Reusing the norm endpoint also eliminates a separate residual
+opening point.
+
+In particular, the current fast backend's third linear-opening sumcheck and
+unit-circle fold are not part of this candidate. Brakedown-shaped column
+testing is intended to authenticate the two terminal values directly. This is
+an architectural simplification, not a theorem: the sampled test is sound only
+after a real distance code and a binary64 metric proximity statement connect
+the supplied row combinations to the committed systematic source.
+
+The first prototype sends the two source combinations separately but shares
+all opened columns and authentication paths. A later algebraic batching step
+could reduce those vectors, but it would require an anti-cancellation analysis
+and is not needed to test the main runtime hypothesis.
 
 A future bound calculator consumes an ordered sequence such as:
 
@@ -451,6 +504,67 @@ throughput surrogate with no distance or proximity claim, and the measurement
 omits relation sumchecks and global metric composition. It nevertheless
 falsifies the concern that sparse encoding plus hashing must already be slower
 than the 30.491 ms band-1 solve on this fixture.
+
+### 8.1 Two-sumcheck composition experiment
+
+The follow-up `--residual-composition` mode commits the padded message
+`[x || r]` and implements the four-stage composition in Section 7. It uses the
+existing binary64 product-sumcheck and registered succinct public evaluator,
+not reimplementations. The timed prover includes:
+
+- the sparse `r = A x - b` pass;
+- packing `x` and `r`;
+- row encoding and the full encoded-column Merkle commitment;
+- the residual-norm sumcheck;
+- the sparse row-compression pass and matvec sumcheck;
+- both terminal row combinations; and
+- extraction of one shared sampled-column opening.
+
+Problem compilation and deterministic construction of the input candidate
+`x` are outside the timer. The candidate is `1` plus a reproducible small
+dyadic perturbation; it is not a hidden solve. The matrix is the registered
+shifted graph Laplacian with either positive offset `[1]` or `[1, 32]`. The
+`[1, 32]` case has half-bandwidth 32 but only five structural diagonals, matching
+the sparse family used in the earlier solve comparison.
+
+On the same single-threaded release setup, with `N = 2^20`, a `1024 x 2048`
+source layout for the two-table message, parity/source `1/2`, degree 4, and 16
+shared queries, 25 measured repetitions gave:
+
+| Offsets | Structural nnz | Prover median | Verifier median | Estimated proof | Peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `[1]` | 3,145,726 | 142.419 ms | 16.452 ms | 171,128 B | 60,224 KiB |
+| `[1, 32]` | 5,242,814 | 171.202 ms | 30.584 ms | 171,128 B | 60,240 KiB |
+
+The proof-byte value is a canonical-width estimate, not a serialized artifact.
+It includes the root, two sumchecks, two source row combinations, 16 complete
+columns, and naive independent authentication paths. At 2.04% of the 8 MiB
+raw solution it is about 5.4 times smaller than the roughly 927--932 KiB
+current fast artifacts.
+
+Relative to the recorded factorization-plus-solve and current-proof numbers:
+
+| Half-bandwidth | SciPy factor + solve | Composition / solve | Current proof / composition |
+| ---: | ---: | ---: | ---: |
+| 1 | 30.491 ms | 4.67x | 11.90x |
+| 32 | 247.374 ms | 0.69x | 9.72x |
+
+The important profile change is that the two sparse passes are now the main
+cost. At offset `[1, 32]`, residual construction and row compression consumed
+about 95.4 ms together; commitment hashing was 23.7 ms, norm sumcheck 23.4 ms,
+and matvec sumcheck 13.4 ms. The experiment therefore supports the intended
+algorithmic direction: after removing the global FFT and third opening
+sumcheck, proof construction is within a small number of sequential sparse and
+vector passes.
+
+It does **not** establish a sound certificate. The throughput surrogate's
+degree-4 graph has no distance amplification. In the measured `1024 x 2048`
+layout at least one source column participates in no parity column, so a
+one-coordinate change affects one of 3,072 encoded columns. Sixteen uniform
+queries miss that change with probability `0.9947916667`. A real Brakedown
+code must replace this graph and its encoding, memory, and query requirements
+must be remeasured. The prototype status string is deliberately
+`two-sumcheck-composition-with-assumed-code-proximity`.
 
 The surrogate is promising if its complete encode/commit/open-preparation time
 is comfortably below the 247 ms band-32 solve. Matching the 30 ms band-1 solve
@@ -578,6 +692,15 @@ be reused only where their numerical contracts match the successor profile.
 Brakedown does not solve binary64 proximity for us. It does identify a credible
 way to remove the global FFT while retaining a succinct MLE opening: matrix
 layout, row encoding, column commitment, and sampled combination checks.
+
+The two-sumcheck experiment sharpens that conclusion. The residual norm
+endpoint can serve directly as the random row functional for the sparse
+relation, leaving only `r_tilde(rho)` and `x_tilde(sigma)` to authenticate. On
+the 1M offset-32 fixture, every implemented prover pass took about 171 ms in
+aggregate, below the recorded 247 ms factor-and-solve and almost ten times
+faster than the current complete proof. The remaining obstacle is no longer an
+unexplained performance gap; it is the concrete distance/proximity statement
+and the cost of the real code that supplies it.
 
 The binary64 opportunity is not to weaken exact equality with an arbitrary
 tolerance. It is to promote the sequence of discrepancies to authenticated

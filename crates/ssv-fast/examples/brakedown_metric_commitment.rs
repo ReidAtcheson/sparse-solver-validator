@@ -1,10 +1,11 @@
 //! Throughput surrogate for a Brakedown-shaped binary64 metric commitment.
 //!
-//! This example deliberately implements no proof protocol and makes no
-//! proximity or soundness claim. It measures the minimum data movement for a
-//! systematic sparse row encoding, a column Merkle commitment, and one encoded
-//! row combination. The final defects quantify floating-point disagreement
-//! between encode-then-combine and combine-then-encode.
+//! The default mode deliberately implements no proof protocol and measures the
+//! minimum data movement for a systematic sparse row encoding, a column Merkle
+//! commitment, and one encoded row combination. `--residual-composition` adds
+//! the two existing binary64 sumchecks and batches their terminal MLE claims
+//! into one sampled-column opening. Neither mode instantiates a distance code
+//! or makes a proximity or soundness claim.
 
 #![forbid(unsafe_code)]
 
@@ -14,11 +15,21 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use ssv_fast::{
+    ProductSumcheckProof, QuadraticBernstein, Transcript, canonical_bits,
+    float_contract::canonicalize_arithmetic, product_sum, prove_product_owned, verify_product,
+    verify_product_endpoint,
+};
+use ssv_problem::{
+    BoundaryRule, GeneratedProblem, InstanceSeed, MatrixSpec, ProblemTemplate, RequestedOutput,
+    RhsSpec, SuccinctPublicEvaluator, SymmetricDiaEdge, TemplateRandomness, TemplateSchema,
+};
 
 const LEAF_DOMAIN: &[u8] = b"ssv/research/brakedown-metric/column-leaf/v1";
 const PADDING_DOMAIN: &[u8] = b"ssv/research/brakedown-metric/column-padding/v1";
 const NODE_DOMAIN: &[u8] = b"ssv/research/brakedown-metric/column-node/v1";
 const VALUES_PER_HASH_BLOCK: usize = 64;
+const RESIDUAL_PROTOCOL_LABEL: &[u8] = b"ssv/research/brakedown-residual-composition/v1";
 
 #[derive(Debug, Parser)]
 #[command(about = "Benchmark a speculative sparse-code binary64 commitment")]
@@ -51,6 +62,18 @@ struct Args {
 
     #[arg(long, default_value_t = 0x5eed_c0de_d15c_a11e)]
     seed: u64,
+
+    /// Run the two-sumcheck residual composition over a generated sparse system.
+    #[arg(long)]
+    residual_composition: bool,
+
+    /// Positive graph-Laplacian offsets used by residual-composition mode.
+    #[arg(long, value_delimiter = ',', default_value = "1,32")]
+    offsets: Vec<usize>,
+
+    /// Candidate-solution perturbation is an integer multiple of 2^-bits.
+    #[arg(long, default_value_t = 24)]
+    perturbation_bits: u32,
 }
 
 #[derive(Debug)]
@@ -218,11 +241,33 @@ impl ColumnTree {
         indices.truncate(queries);
         indices.sort_unstable();
 
-        let value_count = queries
+        self.opening_at_indices(source, parity, rows, source_columns, &indices)
+    }
+
+    fn opening_at_indices(
+        &self,
+        source: &[f64],
+        parity: &[f64],
+        rows: usize,
+        source_columns: usize,
+        indices: &[usize],
+    ) -> Result<NaiveOpening, io::Error> {
+        if indices.is_empty()
+            || indices.iter().any(|&index| index >= self.column_count)
+            || indices.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(invalid(
+                "opening indices must be nonempty, sorted, unique, and in range",
+            ));
+        }
+
+        let value_count = indices
+            .len()
             .checked_mul(rows)
             .ok_or_else(|| invalid("opened value count overflow"))?;
         let tree_height = self.padded_columns.ilog2() as usize;
-        let authentication_count = queries
+        let authentication_count = indices
+            .len()
             .checked_mul(tree_height)
             .ok_or_else(|| invalid("authentication hash count overflow"))?;
         let mut values = Vec::new();
@@ -234,7 +279,7 @@ impl ColumnTree {
             .try_reserve_exact(authentication_count)
             .map_err(|_| invalid("could not allocate authentication paths"))?;
 
-        for &column_index in &indices {
+        for &column_index in indices {
             values.extend_from_slice(column(source, parity, rows, source_columns, column_index));
             let mut node_index = self.padded_columns + column_index;
             while node_index > 1 {
@@ -244,7 +289,7 @@ impl ColumnTree {
         }
 
         Ok(NaiveOpening {
-            indices,
+            indices: indices.to_vec(),
             values,
             authentication,
         })
@@ -382,9 +427,379 @@ struct TimingSamples {
     total: Vec<Duration>,
 }
 
+#[derive(Clone, Debug)]
+struct ResidualCompositionProof {
+    residual_squared_l2: f64,
+    norm_sumcheck: ProductSumcheckProof,
+    residual_at_row_point: f64,
+    matvec_sumcheck: ProductSumcheckProof,
+    solution_at_column_point: f64,
+    source_combinations: [Vec<f64>; 2],
+    opening: NaiveOpening,
+}
+
+impl ResidualCompositionProof {
+    fn payload_bytes(&self) -> Result<usize, io::Error> {
+        let scalar_bytes = 3_usize
+            .checked_mul(size_of::<f64>())
+            .ok_or_else(|| invalid("proof scalar byte count overflow"))?;
+        let sumcheck_rounds = self
+            .norm_sumcheck
+            .rounds
+            .len()
+            .checked_add(self.matvec_sumcheck.rounds.len())
+            .ok_or_else(|| invalid("proof sumcheck round count overflow"))?;
+        let sumcheck_bytes = sumcheck_rounds
+            .checked_mul(3 * size_of::<f64>())
+            .ok_or_else(|| invalid("proof sumcheck byte count overflow"))?;
+        let combination_values = self
+            .source_combinations
+            .iter()
+            .try_fold(0_usize, |total, combination| {
+                total.checked_add(combination.len())
+            })
+            .ok_or_else(|| invalid("proof combination value count overflow"))?;
+        let combination_bytes = combination_values
+            .checked_mul(size_of::<f64>())
+            .ok_or_else(|| invalid("proof combination byte count overflow"))?;
+        let index_bytes = self
+            .opening
+            .indices
+            .len()
+            .checked_mul(size_of::<u64>())
+            .ok_or_else(|| invalid("proof opening index byte count overflow"))?;
+        let value_bytes = self
+            .opening
+            .values
+            .len()
+            .checked_mul(size_of::<f64>())
+            .ok_or_else(|| invalid("proof opening value byte count overflow"))?;
+        let authentication_bytes = self
+            .opening
+            .authentication
+            .len()
+            .checked_mul(size_of::<[u8; 32]>())
+            .ok_or_else(|| invalid("proof authentication byte count overflow"))?;
+        32_usize
+            .checked_add(scalar_bytes)
+            .and_then(|bytes| bytes.checked_add(sumcheck_bytes))
+            .and_then(|bytes| bytes.checked_add(combination_bytes))
+            .and_then(|bytes| bytes.checked_add(index_bytes))
+            .and_then(|bytes| bytes.checked_add(value_bytes))
+            .and_then(|bytes| bytes.checked_add(authentication_bytes))
+            .ok_or_else(|| invalid("proof payload byte count overflow"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ResidualCompositionMetrics {
+    norm_sumcheck_maximum_absolute_defect: f64,
+    matvec_sumcheck_maximum_absolute_defect: f64,
+    residual_opening_absolute_defect: f64,
+    solution_opening_absolute_defect: f64,
+    queried_combination_maximum_absolute_defect: f64,
+    public_matrix_forward_error_bound: f64,
+    public_rhs_forward_error_bound: f64,
+}
+
+#[derive(Debug, Default)]
+struct ResidualTimingSamples {
+    residual: Vec<Duration>,
+    packing: Vec<Duration>,
+    encoding: Vec<Duration>,
+    commitment: Vec<Duration>,
+    norm_sumcheck: Vec<Duration>,
+    matvec_compression: Vec<Duration>,
+    matvec_sumcheck: Vec<Duration>,
+    opening_combinations: Vec<Duration>,
+    opening_extraction: Vec<Duration>,
+    total: Vec<Duration>,
+    verification: Vec<Duration>,
+}
+
+fn run_residual_composition(args: &Args) -> Result<(), Box<dyn Error>> {
+    let padded_dimension = args
+        .dimension
+        .checked_next_power_of_two()
+        .ok_or_else(|| invalid("dimension padding overflow"))?;
+    let packed_dimension = padded_dimension
+        .checked_mul(2)
+        .ok_or_else(|| invalid("packed residual message length overflow"))?;
+    let source_columns = packed_dimension / args.rows;
+    let parity_columns = source_columns.div_ceil(args.parity_denominator);
+    let code_seed = args.seed ^ 0x434f_4445_4752_4150;
+    let code = SparseSystematicCode::new(source_columns, parity_columns, args.degree, code_seed)?;
+    let encoded_columns = code.encoded_columns()?;
+    if args.queries > encoded_columns {
+        return Err(invalid("queries cannot exceed encoded columns").into());
+    }
+
+    let problem = generated_laplacian_problem(args.dimension, &args.offsets, args.seed)?;
+    let solution = generate_candidate_solution(
+        args.dimension,
+        args.perturbation_bits,
+        args.seed ^ 0x534f_4c55_5449_4f4e,
+    )?;
+    let mut samples = ResidualTimingSamples::default();
+    let mut final_root = [0_u8; 32];
+    let mut final_tree_bytes = 0_usize;
+    let mut final_proof_bytes = 0_usize;
+    let mut final_metrics = ResidualCompositionMetrics::default();
+    let mut final_residual_squared_l2 = 0.0_f64;
+
+    for repetition in 0..args.warmups + args.repetitions {
+        let total_start = Instant::now();
+
+        let start = Instant::now();
+        let residual = compute_generated_residual(&problem, &solution)?;
+        let residual_time = start.elapsed();
+
+        let start = Instant::now();
+        let source =
+            pack_solution_and_residual(&solution, &residual, padded_dimension, packed_dimension)?;
+        let packing = start.elapsed();
+
+        let start = Instant::now();
+        let parity = code.encode_rows(&source, args.rows)?;
+        let encoding = start.elapsed();
+
+        let start = Instant::now();
+        let tree = build_column_tree(&source, &parity, args.rows, source_columns, encoded_columns)?;
+        let commitment = start.elapsed();
+
+        let mut transcript = initialize_residual_transcript(
+            &problem,
+            tree.root(),
+            args.rows,
+            &code,
+            args.queries,
+            code_seed,
+        )?;
+
+        let start = Instant::now();
+        let residual_left = source[padded_dimension..].to_vec();
+        let residual_right = residual_left.clone();
+        let residual_squared_l2 =
+            product_sum(&residual_left, &residual_right).map_err(calculation_error)?;
+        absorb_float(
+            &mut transcript,
+            b"residual-squared-l2-claim",
+            residual_squared_l2,
+        )?;
+        let (norm_sumcheck, norm_endpoint) = prove_product_owned(
+            residual_left,
+            residual_right,
+            residual_squared_l2,
+            |round, polynomial| {
+                sumcheck_challenge(&mut transcript, b"residual-norm", round, polynomial)
+            },
+        )
+        .map_err(calculation_error)?;
+        let residual_at_row_point = norm_endpoint.left_evaluation;
+        absorb_float(
+            &mut transcript,
+            b"residual-at-shared-row-point",
+            residual_at_row_point,
+        )?;
+        let norm_sumcheck_time = start.elapsed();
+
+        let rhs = problem
+            .public_evaluation_plan()
+            .evaluate_rhs_mle_f64(&norm_endpoint.point)
+            .map_err(calculation_error)?;
+        let matvec_initial_claim = canonical(rhs.value + residual_at_row_point)?;
+        absorb_float(
+            &mut transcript,
+            b"matvec-initial-claim",
+            matvec_initial_claim,
+        )?;
+
+        let start = Instant::now();
+        let compressed_columns =
+            prepare_compressed_columns(&problem, &norm_endpoint.point, padded_dimension)?;
+        let padded_solution = source[..padded_dimension].to_vec();
+        let matvec_compression = start.elapsed();
+
+        let start = Instant::now();
+        let (matvec_sumcheck, matvec_endpoint) = prove_product_owned(
+            compressed_columns,
+            padded_solution,
+            matvec_initial_claim,
+            |round, polynomial| {
+                sumcheck_challenge(&mut transcript, b"matvec-product", round, polynomial)
+            },
+        )
+        .map_err(calculation_error)?;
+        let solution_at_column_point = matvec_endpoint.right_evaluation;
+        absorb_float(
+            &mut transcript,
+            b"solution-at-column-point",
+            solution_at_column_point,
+        )?;
+        let matvec_sumcheck_time = start.elapsed();
+
+        let start = Instant::now();
+        let solution_packed_point = packed_endpoint_point(0.0, &matvec_endpoint.point);
+        let residual_packed_point = packed_endpoint_point(1.0, &norm_endpoint.point);
+        let solution_combination = prepare_endpoint_combination(
+            &source,
+            &parity,
+            args.rows,
+            source_columns,
+            encoded_columns,
+            &solution_packed_point,
+        )?;
+        let residual_combination = prepare_endpoint_combination(
+            &source,
+            &parity,
+            args.rows,
+            source_columns,
+            encoded_columns,
+            &residual_packed_point,
+        )?;
+        let source_combinations = [solution_combination, residual_combination];
+        absorb_combinations(&mut transcript, &source_combinations)?;
+        let opening_combinations = start.elapsed();
+
+        let start = Instant::now();
+        let query_indices = derive_query_indices(&mut transcript, encoded_columns, args.queries)?;
+        let opening =
+            tree.opening_at_indices(&source, &parity, args.rows, source_columns, &query_indices)?;
+        let opening_extraction = start.elapsed();
+        let total = total_start.elapsed();
+
+        let proof = ResidualCompositionProof {
+            residual_squared_l2,
+            norm_sumcheck,
+            residual_at_row_point,
+            matvec_sumcheck,
+            solution_at_column_point,
+            source_combinations,
+            opening,
+        };
+
+        let start = Instant::now();
+        let metrics = verify_residual_composition(
+            &problem,
+            &code,
+            tree.root(),
+            tree.padded_columns,
+            args.rows,
+            args.queries,
+            code_seed,
+            &proof,
+        )?;
+        let verification = start.elapsed();
+
+        black_box(tree.root());
+        black_box(proof.residual_squared_l2);
+        black_box(metrics.queried_combination_maximum_absolute_defect);
+        final_root = tree.root();
+        final_tree_bytes = tree.bytes();
+        final_proof_bytes = proof.payload_bytes()?;
+        final_metrics = metrics;
+        final_residual_squared_l2 = proof.residual_squared_l2;
+
+        if repetition >= args.warmups {
+            samples.residual.push(residual_time);
+            samples.packing.push(packing);
+            samples.encoding.push(encoding);
+            samples.commitment.push(commitment);
+            samples.norm_sumcheck.push(norm_sumcheck_time);
+            samples.matvec_compression.push(matvec_compression);
+            samples.matvec_sumcheck.push(matvec_sumcheck_time);
+            samples.opening_combinations.push(opening_combinations);
+            samples.opening_extraction.push(opening_extraction);
+            samples.total.push(total);
+            samples.verification.push(verification);
+        }
+    }
+
+    let raw_solution_bytes = args.dimension * size_of::<f64>();
+    let source_bytes = packed_dimension * size_of::<f64>();
+    let parity_bytes = args.rows * parity_columns * size_of::<f64>();
+    let (minimum_single_source_weight, maximum_single_source_weight) =
+        single_source_encoded_weight_range(&code)?;
+    let single_source_query_miss_probability = without_replacement_miss_probability(
+        encoded_columns,
+        minimum_single_source_weight,
+        args.queries,
+    )?;
+    println!("status=two-sumcheck-composition-with-assumed-code-proximity");
+    println!("logical_dimension={}", args.dimension);
+    println!("padded_dimension={padded_dimension}");
+    println!("structural_nnz={}", problem.structural_nnz());
+    println!("offsets={:?}", args.offsets);
+    println!("rows={}", args.rows);
+    println!("source_columns={source_columns}");
+    println!("parity_columns={parity_columns}");
+    println!("encoded_columns={encoded_columns}");
+    println!("degree={}", args.degree);
+    println!("queries={}", args.queries);
+    println!("minimum_single_source_encoded_weight={minimum_single_source_weight}");
+    println!("maximum_single_source_encoded_weight={maximum_single_source_weight}");
+    println!(
+        "minimum_weight_single_source_query_miss_probability={single_source_query_miss_probability:.17e}"
+    );
+    println!("raw_solution_bytes={raw_solution_bytes}");
+    println!("source_bytes={source_bytes}");
+    println!("parity_bytes={parity_bytes}");
+    println!("retained_tree_bytes={final_tree_bytes}");
+    println!("estimated_proof_bytes={final_proof_bytes}");
+    println!(
+        "proof_to_raw_solution_ratio={:.9}",
+        final_proof_bytes as f64 / raw_solution_bytes as f64
+    );
+    println!("root={}", blake3::Hash::from_bytes(final_root).to_hex());
+    println!("residual_squared_l2={final_residual_squared_l2:.17e}");
+    println!(
+        "norm_sumcheck_maximum_absolute_defect={:.17e}",
+        final_metrics.norm_sumcheck_maximum_absolute_defect
+    );
+    println!(
+        "matvec_sumcheck_maximum_absolute_defect={:.17e}",
+        final_metrics.matvec_sumcheck_maximum_absolute_defect
+    );
+    println!(
+        "residual_opening_absolute_defect={:.17e}",
+        final_metrics.residual_opening_absolute_defect
+    );
+    println!(
+        "solution_opening_absolute_defect={:.17e}",
+        final_metrics.solution_opening_absolute_defect
+    );
+    println!(
+        "queried_combination_maximum_absolute_defect={:.17e}",
+        final_metrics.queried_combination_maximum_absolute_defect
+    );
+    println!(
+        "public_matrix_forward_error_bound={:.17e}",
+        final_metrics.public_matrix_forward_error_bound
+    );
+    println!(
+        "public_rhs_forward_error_bound={:.17e}",
+        final_metrics.public_rhs_forward_error_bound
+    );
+    print_timing("residual", &mut samples.residual);
+    print_timing("packing", &mut samples.packing);
+    print_timing("encoding", &mut samples.encoding);
+    print_timing("commitment", &mut samples.commitment);
+    print_timing("norm_sumcheck", &mut samples.norm_sumcheck);
+    print_timing("matvec_compression", &mut samples.matvec_compression);
+    print_timing("matvec_sumcheck", &mut samples.matvec_sumcheck);
+    print_timing("opening_combinations", &mut samples.opening_combinations);
+    print_timing("opening_extraction", &mut samples.opening_extraction);
+    print_timing("total", &mut samples.total);
+    print_timing("verification", &mut samples.verification);
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     validate_args(&args)?;
+    if args.residual_composition {
+        return run_residual_composition(&args);
+    }
 
     let minimum_columns = args.dimension.div_ceil(args.rows);
     let source_columns = minimum_columns
@@ -563,7 +978,636 @@ fn validate_args(args: &Args) -> Result<(), io::Error> {
     if args.queries == 0 || args.repetitions == 0 {
         return Err(invalid("queries and repetitions must be positive"));
     }
+    if args.perturbation_bits > 52 {
+        return Err(invalid("perturbation-bits cannot exceed 52"));
+    }
+    if args.residual_composition {
+        if args.offsets.is_empty() || args.offsets.len() > 16 {
+            return Err(invalid(
+                "residual composition needs between one and sixteen offsets",
+            ));
+        }
+        if args.offsets.windows(2).any(|pair| pair[0] >= pair[1])
+            || args
+                .offsets
+                .iter()
+                .any(|&offset| offset == 0 || offset >= args.dimension)
+        {
+            return Err(invalid(
+                "offsets must be strictly increasing, positive, and below dimension",
+            ));
+        }
+        let padded = args
+            .dimension
+            .checked_next_power_of_two()
+            .ok_or_else(|| invalid("dimension padding overflow"))?;
+        let message_len = padded
+            .checked_mul(2)
+            .ok_or_else(|| invalid("packed residual message length overflow"))?;
+        if args.rows > message_len || message_len % args.rows != 0 {
+            return Err(invalid(
+                "rows must divide the power-of-two packed residual message length",
+            ));
+        }
+    }
     Ok(())
+}
+
+fn generated_laplacian_problem(
+    dimension: usize,
+    offsets: &[usize],
+    seed: u64,
+) -> Result<GeneratedProblem, io::Error> {
+    let edge_diagonals = offsets
+        .iter()
+        .copied()
+        .map(|offset| {
+            Ok(SymmetricDiaEdge {
+                positive_offset: u64::try_from(offset)
+                    .map_err(|_| invalid("offset does not fit in u64"))?,
+                period_bits: 8,
+                minimum_weight_mantissa: 1,
+                maximum_weight_mantissa: 3,
+            })
+        })
+        .collect::<Result<Vec<_>, io::Error>>()?;
+    ProblemTemplate {
+        schema: TemplateSchema::V1,
+        randomness: TemplateRandomness::LiteralV1 {
+            seed: InstanceSeed::from_bytes(expand_seed(seed)),
+        },
+        matrix: MatrixSpec::SeededSymmetricDiaLaplacianV1 {
+            dimension: u64::try_from(dimension)
+                .map_err(|_| invalid("dimension does not fit in u64"))?,
+            boundary: BoundaryRule::TruncateV1,
+            fractional_bits: 8,
+            diagonal_shift_mantissa: 256,
+            edge_diagonals,
+        },
+        rhs: RhsSpec::ManufacturedOnesV1,
+        requested_outputs: vec![RequestedOutput::SquaredL2ResidualV1],
+    }
+    .finalize_literal()
+    .and_then(|problem| problem.compile())
+    .map_err(calculation_error)
+}
+
+fn expand_seed(seed: u64) -> [u8; 32] {
+    let mut bytes = [0_u8; 32];
+    let mut state = seed;
+    for chunk in bytes.chunks_exact_mut(size_of::<u64>()) {
+        chunk.copy_from_slice(&splitmix64(&mut state).to_le_bytes());
+    }
+    bytes
+}
+
+fn generate_candidate_solution(
+    dimension: usize,
+    perturbation_bits: u32,
+    seed: u64,
+) -> Result<Vec<f64>, io::Error> {
+    let exponent = i32::try_from(perturbation_bits)
+        .map_err(|_| invalid("perturbation exponent does not fit in i32"))?;
+    let unit = 2.0_f64.powi(-exponent);
+    let mut state = seed;
+    let mut solution = Vec::new();
+    solution
+        .try_reserve_exact(dimension)
+        .map_err(|_| invalid("could not allocate candidate solution"))?;
+    for _ in 0..dimension {
+        let signed_step = (splitmix64(&mut state) % 5) as i32 - 2;
+        solution.push(canonical(1.0 + f64::from(signed_step) * unit)?);
+    }
+    Ok(solution)
+}
+
+fn compute_generated_residual(
+    problem: &GeneratedProblem,
+    solution: &[f64],
+) -> Result<Vec<f64>, io::Error> {
+    if solution.len() != problem.dimension() {
+        return Err(invalid(
+            "solution length does not match the generated problem",
+        ));
+    }
+    let mut residual = Vec::new();
+    residual
+        .try_reserve_exact(problem.dimension())
+        .map_err(|_| invalid("could not allocate residual"))?;
+    for row in 0..problem.dimension() {
+        let mut dot_product = 0.0_f64;
+        for entry in problem
+            .row(row)
+            .ok_or_else(|| invalid("generated matrix row is missing"))?
+        {
+            let product = canonical(entry.value.to_f64() * solution[entry.column])?;
+            dot_product = canonical(dot_product + product)?;
+        }
+        let rhs = problem
+            .rhs_f64(row)
+            .ok_or_else(|| invalid("generated RHS entry is missing"))?;
+        residual.push(canonical(dot_product - rhs)?);
+    }
+    Ok(residual)
+}
+
+fn pack_solution_and_residual(
+    solution: &[f64],
+    residual: &[f64],
+    padded_dimension: usize,
+    packed_dimension: usize,
+) -> Result<Vec<f64>, io::Error> {
+    if solution.len() != residual.len()
+        || solution.len() > padded_dimension
+        || packed_dimension != 2 * padded_dimension
+    {
+        return Err(invalid("solution/residual packing shape is invalid"));
+    }
+    let mut source = Vec::new();
+    source
+        .try_reserve_exact(packed_dimension)
+        .map_err(|_| invalid("could not allocate packed source"))?;
+    source.resize(packed_dimension, 0.0);
+    source[..solution.len()].copy_from_slice(solution);
+    source[padded_dimension..padded_dimension + residual.len()].copy_from_slice(residual);
+    Ok(source)
+}
+
+fn prepare_compressed_columns(
+    problem: &GeneratedProblem,
+    row_point: &[f64],
+    padded_dimension: usize,
+) -> Result<Vec<f64>, io::Error> {
+    if row_point.len() != padded_dimension.ilog2() as usize {
+        return Err(invalid("row-compression point has the wrong dimension"));
+    }
+    let row_weights = equality_table(row_point)?;
+    let mut compressed_columns = Vec::new();
+    compressed_columns
+        .try_reserve_exact(padded_dimension)
+        .map_err(|_| invalid("could not allocate compressed columns"))?;
+    compressed_columns.resize(padded_dimension, 0.0);
+    for (row, &weight) in row_weights.iter().take(problem.dimension()).enumerate() {
+        for entry in problem
+            .row(row)
+            .ok_or_else(|| invalid("generated matrix row is missing"))?
+        {
+            let contribution = canonical(weight * entry.value.to_f64())?;
+            compressed_columns[entry.column] =
+                canonical(compressed_columns[entry.column] + contribution)?;
+        }
+    }
+    Ok(compressed_columns)
+}
+
+fn initialize_residual_transcript(
+    problem: &GeneratedProblem,
+    root: [u8; 32],
+    rows: usize,
+    code: &SparseSystematicCode,
+    queries: usize,
+    code_seed: u64,
+) -> Result<Transcript, io::Error> {
+    let mut transcript = Transcript::new(RESIDUAL_PROTOCOL_LABEL);
+    transcript.absorb_bytes(b"problem-digest", problem.problem_digest().as_bytes());
+    transcript.absorb_u64(
+        b"logical-dimension",
+        u64::try_from(problem.dimension())
+            .map_err(|_| invalid("dimension does not fit in transcript"))?,
+    );
+    transcript.absorb_u64(
+        b"commitment-rows",
+        u64::try_from(rows).map_err(|_| invalid("row count does not fit in transcript"))?,
+    );
+    transcript.absorb_u64(
+        b"source-columns",
+        u64::try_from(code.source_columns)
+            .map_err(|_| invalid("source width does not fit in transcript"))?,
+    );
+    transcript.absorb_u64(
+        b"parity-columns",
+        u64::try_from(code.parity_columns)
+            .map_err(|_| invalid("parity width does not fit in transcript"))?,
+    );
+    transcript.absorb_u64(
+        b"code-degree",
+        u64::try_from(code.degree)
+            .map_err(|_| invalid("code degree does not fit in transcript"))?,
+    );
+    transcript.absorb_u64(b"code-seed", code_seed);
+    transcript.absorb_u64(
+        b"column-queries",
+        u64::try_from(queries).map_err(|_| invalid("query count does not fit in transcript"))?,
+    );
+    transcript.absorb_root(b"encoded-column-root", &root);
+    Ok(transcript)
+}
+
+fn sumcheck_challenge(
+    transcript: &mut Transcript,
+    phase: &[u8],
+    round: usize,
+    polynomial: &QuadraticBernstein,
+) -> f64 {
+    transcript.absorb_bytes(b"sumcheck-phase", phase);
+    transcript.absorb_u64(b"sumcheck-round", round as u64);
+    for &coefficient in &polynomial.coefficients {
+        transcript.absorb_u64(b"sumcheck-bernstein-coefficient", coefficient.to_bits());
+    }
+    transcript
+        .challenge_dyadic_f64(b"sumcheck-challenge")
+        .expect("the bounded research transcript cannot exhaust its challenge counter")
+}
+
+fn absorb_float(transcript: &mut Transcript, tag: &[u8], value: f64) -> Result<(), io::Error> {
+    transcript.absorb_u64(tag, canonical_bits(value).map_err(calculation_error)?);
+    Ok(())
+}
+
+fn canonical(value: f64) -> Result<f64, io::Error> {
+    canonicalize_arithmetic(value).map_err(calculation_error)
+}
+
+fn equality_table(point: &[f64]) -> Result<Vec<f64>, io::Error> {
+    let final_len = 1_usize
+        .checked_shl(
+            u32::try_from(point.len())
+                .map_err(|_| invalid("MLE point dimension does not fit in u32"))?,
+        )
+        .ok_or_else(|| invalid("equality-table length overflow"))?;
+    let mut table = Vec::new();
+    table
+        .try_reserve_exact(final_len)
+        .map_err(|_| invalid("could not allocate equality table"))?;
+    table.resize(final_len, 0.0);
+    table[0] = 1.0;
+    let mut active_len = 1_usize;
+    for &coordinate in point {
+        for index in (0..active_len).rev() {
+            let weight = table[index];
+            table[2 * index] = canonical(weight * (1.0 - coordinate))?;
+            table[2 * index + 1] = canonical(weight * coordinate)?;
+        }
+        active_len = active_len
+            .checked_mul(2)
+            .ok_or_else(|| invalid("equality-table expansion overflow"))?;
+    }
+    Ok(table)
+}
+
+fn packed_endpoint_point(selector: f64, table_point: &[f64]) -> Vec<f64> {
+    let mut point = Vec::with_capacity(table_point.len() + 1);
+    point.push(selector);
+    point.extend_from_slice(table_point);
+    point
+}
+
+fn split_commitment_point(
+    point: &[f64],
+    rows: usize,
+    source_columns: usize,
+) -> Result<(&[f64], &[f64]), io::Error> {
+    let row_variables = rows.ilog2() as usize;
+    let column_variables = source_columns.ilog2() as usize;
+    if point.len() != row_variables + column_variables {
+        return Err(invalid("packed MLE point does not match commitment shape"));
+    }
+    Ok(point.split_at(column_variables))
+}
+
+fn prepare_endpoint_combination(
+    source: &[f64],
+    parity: &[f64],
+    rows: usize,
+    source_columns: usize,
+    encoded_columns: usize,
+    packed_point: &[f64],
+) -> Result<Vec<f64>, io::Error> {
+    let (_, row_point) = split_commitment_point(packed_point, rows, source_columns)?;
+    let row_weights = equality_table(row_point)?;
+    let encoded_combination = combine_columns(
+        source,
+        parity,
+        rows,
+        source_columns,
+        encoded_columns,
+        &row_weights,
+    )?;
+    Ok(encoded_combination[..source_columns].to_vec())
+}
+
+fn absorb_combinations(
+    transcript: &mut Transcript,
+    combinations: &[Vec<f64>; 2],
+) -> Result<(), io::Error> {
+    for (index, combination) in combinations.iter().enumerate() {
+        let byte_len = combination
+            .len()
+            .checked_mul(size_of::<f64>())
+            .ok_or_else(|| invalid("combination serialization length overflow"))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(byte_len)
+            .map_err(|_| invalid("could not allocate combination serialization"))?;
+        for &value in combination {
+            bytes.extend_from_slice(
+                &canonical_bits(value)
+                    .map_err(calculation_error)?
+                    .to_le_bytes(),
+            );
+        }
+        transcript.absorb_u64(b"opening-combination-index", index as u64);
+        transcript.absorb_bytes(b"opening-source-combination", &bytes);
+    }
+    Ok(())
+}
+
+fn derive_query_indices(
+    transcript: &mut Transcript,
+    encoded_columns: usize,
+    queries: usize,
+) -> Result<Vec<usize>, io::Error> {
+    if queries == 0 || queries > encoded_columns {
+        return Err(invalid("query count is outside the encoded-column domain"));
+    }
+    let mut indices = Vec::new();
+    indices
+        .try_reserve_exact(queries)
+        .map_err(|_| invalid("could not allocate query indices"))?;
+    while indices.len() < queries {
+        let index = transcript
+            .challenge_usize(b"encoded-column-query", encoded_columns)
+            .map_err(calculation_error)?;
+        if !indices.contains(&index) {
+            indices.push(index);
+        }
+    }
+    indices.sort_unstable();
+    Ok(indices)
+}
+
+fn single_source_encoded_weight_range(
+    code: &SparseSystematicCode,
+) -> Result<(usize, usize), io::Error> {
+    let mut weights = Vec::new();
+    weights
+        .try_reserve_exact(code.source_columns)
+        .map_err(|_| invalid("could not allocate source-column weights"))?;
+    weights.resize(code.source_columns, 1_usize);
+    for &neighbor in &code.neighbors {
+        weights[neighbor] = weights[neighbor]
+            .checked_add(1)
+            .ok_or_else(|| invalid("source-column encoded weight overflow"))?;
+    }
+    let minimum = weights
+        .iter()
+        .copied()
+        .min()
+        .ok_or_else(|| invalid("source-column weight set is empty"))?;
+    let maximum = weights
+        .iter()
+        .copied()
+        .max()
+        .ok_or_else(|| invalid("source-column weight set is empty"))?;
+    Ok((minimum, maximum))
+}
+
+fn without_replacement_miss_probability(
+    population: usize,
+    bad_items: usize,
+    queries: usize,
+) -> Result<f64, io::Error> {
+    if bad_items > population || queries > population {
+        return Err(invalid("miss-probability parameters are out of range"));
+    }
+    if queries > population - bad_items {
+        return Ok(0.0);
+    }
+    let mut probability = 1.0_f64;
+    for query in 0..queries {
+        probability *= (population - bad_items - query) as f64 / (population - query) as f64;
+    }
+    Ok(probability)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_residual_composition(
+    problem: &GeneratedProblem,
+    code: &SparseSystematicCode,
+    root: [u8; 32],
+    padded_columns: usize,
+    rows: usize,
+    queries: usize,
+    code_seed: u64,
+    proof: &ResidualCompositionProof,
+) -> Result<ResidualCompositionMetrics, io::Error> {
+    let encoded_columns = code.encoded_columns()?;
+    if padded_columns != encoded_columns.next_power_of_two() {
+        return Err(invalid(
+            "committed tree padding does not match the code width",
+        ));
+    }
+    let padded_dimension = problem.dimension().next_power_of_two();
+    let mut transcript =
+        initialize_residual_transcript(problem, root, rows, code, queries, code_seed)?;
+
+    absorb_float(
+        &mut transcript,
+        b"residual-squared-l2-claim",
+        proof.residual_squared_l2,
+    )?;
+    let norm = verify_product(
+        padded_dimension,
+        proof.residual_squared_l2,
+        &proof.norm_sumcheck,
+        |round, polynomial| {
+            sumcheck_challenge(&mut transcript, b"residual-norm", round, polynomial)
+        },
+    )
+    .map_err(calculation_error)?;
+    absorb_float(
+        &mut transcript,
+        b"residual-at-shared-row-point",
+        proof.residual_at_row_point,
+    )?;
+    let norm_endpoint = verify_product_endpoint(
+        &norm.endpoint,
+        proof.residual_at_row_point,
+        proof.residual_at_row_point,
+    )
+    .map_err(calculation_error)?;
+
+    let rhs = problem
+        .public_evaluation_plan()
+        .evaluate_rhs_mle_f64(&norm.endpoint.point)
+        .map_err(calculation_error)?;
+    let matvec_initial_claim = canonical(rhs.value + proof.residual_at_row_point)?;
+    absorb_float(
+        &mut transcript,
+        b"matvec-initial-claim",
+        matvec_initial_claim,
+    )?;
+    let matvec = verify_product(
+        padded_dimension,
+        matvec_initial_claim,
+        &proof.matvec_sumcheck,
+        |round, polynomial| {
+            sumcheck_challenge(&mut transcript, b"matvec-product", round, polynomial)
+        },
+    )
+    .map_err(calculation_error)?;
+    absorb_float(
+        &mut transcript,
+        b"solution-at-column-point",
+        proof.solution_at_column_point,
+    )?;
+    let matrix = problem
+        .public_evaluation_plan()
+        .evaluate_matrix_mle_f64(&norm.endpoint.point, &matvec.endpoint.point)
+        .map_err(calculation_error)?;
+    let matvec_endpoint = verify_product_endpoint(
+        &matvec.endpoint,
+        matrix.value,
+        proof.solution_at_column_point,
+    )
+    .map_err(calculation_error)?;
+
+    let solution_packed_point = packed_endpoint_point(0.0, &matvec.endpoint.point);
+    let residual_packed_point = packed_endpoint_point(1.0, &norm.endpoint.point);
+    absorb_combinations(&mut transcript, &proof.source_combinations)?;
+    let expected_queries = derive_query_indices(&mut transcript, encoded_columns, queries)?;
+    if proof.opening.indices != expected_queries {
+        return Err(invalid(
+            "opening indices do not match transcript-derived queries",
+        ));
+    }
+
+    let queried_combination_maximum_absolute_defect = verify_batched_opening(
+        root,
+        padded_columns,
+        encoded_columns,
+        rows,
+        code,
+        [&solution_packed_point, &residual_packed_point],
+        &proof.source_combinations,
+        &proof.opening,
+    )?;
+
+    let (solution_column_point, _) =
+        split_commitment_point(&solution_packed_point, rows, code.source_columns)?;
+    let (residual_column_point, _) =
+        split_commitment_point(&residual_packed_point, rows, code.source_columns)?;
+    let opened_solution = dot(
+        &proof.source_combinations[0],
+        &equality_table(solution_column_point)?,
+    )?;
+    let opened_residual = dot(
+        &proof.source_combinations[1],
+        &equality_table(residual_column_point)?,
+    )?;
+
+    let norm_sumcheck_maximum_absolute_defect = norm
+        .round_defects
+        .iter()
+        .map(|observation| observation.absolute_defect)
+        .fold(norm_endpoint.absolute_defect, f64::max);
+    let matvec_sumcheck_maximum_absolute_defect = matvec
+        .round_defects
+        .iter()
+        .map(|observation| observation.absolute_defect)
+        .fold(matvec_endpoint.absolute_defect, f64::max);
+
+    Ok(ResidualCompositionMetrics {
+        norm_sumcheck_maximum_absolute_defect,
+        matvec_sumcheck_maximum_absolute_defect,
+        residual_opening_absolute_defect: (opened_residual - proof.residual_at_row_point).abs(),
+        solution_opening_absolute_defect: (opened_solution - proof.solution_at_column_point).abs(),
+        queried_combination_maximum_absolute_defect,
+        public_matrix_forward_error_bound: matrix.roundoff.forward_absolute_error_bound,
+        public_rhs_forward_error_bound: rhs.roundoff.forward_absolute_error_bound,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_batched_opening(
+    root: [u8; 32],
+    padded_columns: usize,
+    encoded_columns: usize,
+    rows: usize,
+    code: &SparseSystematicCode,
+    packed_points: [&[f64]; 2],
+    source_combinations: &[Vec<f64>; 2],
+    opening: &NaiveOpening,
+) -> Result<f64, io::Error> {
+    let tree_height = padded_columns.ilog2() as usize;
+    let expected_values = opening
+        .indices
+        .len()
+        .checked_mul(rows)
+        .ok_or_else(|| invalid("opened value shape overflow"))?;
+    let expected_authentication = opening
+        .indices
+        .len()
+        .checked_mul(tree_height)
+        .ok_or_else(|| invalid("opening authentication shape overflow"))?;
+    if opening.indices.is_empty()
+        || opening.indices.windows(2).any(|pair| pair[0] >= pair[1])
+        || opening
+            .indices
+            .iter()
+            .any(|&index| index >= encoded_columns)
+        || opening.values.len() != expected_values
+        || opening.authentication.len() != expected_authentication
+        || source_combinations
+            .iter()
+            .any(|combination| combination.len() != code.source_columns)
+    {
+        return Err(invalid("batched opening shape is invalid"));
+    }
+
+    let mut row_weights = Vec::with_capacity(2);
+    let mut combined_parity = Vec::with_capacity(2);
+    for (packed_point, source_combination) in packed_points.iter().zip(source_combinations) {
+        let (_, row_point) = split_commitment_point(packed_point, rows, code.source_columns)?;
+        row_weights.push(equality_table(row_point)?);
+        combined_parity.push(code.encode_vector(source_combination)?);
+    }
+
+    let mut maximum_absolute_defect = 0.0_f64;
+    for (query, &column_index) in opening.indices.iter().enumerate() {
+        let values = &opening.values[query * rows..(query + 1) * rows];
+        let path = &opening.authentication[query * tree_height..(query + 1) * tree_height];
+        let mut hash = hash_column(column_index, values);
+        let mut level_index = column_index;
+        for (level, sibling) in path.iter().enumerate() {
+            let parent_index = level_index / 2;
+            hash = if level_index.is_multiple_of(2) {
+                hash_node(level + 1, parent_index, &hash, sibling)
+            } else {
+                hash_node(level + 1, parent_index, sibling, &hash)
+            };
+            level_index = parent_index;
+        }
+        if hash != root {
+            return Err(invalid(
+                "batched opening authentication path does not match the root",
+            ));
+        }
+
+        for endpoint in 0..2 {
+            let actual = dot(values, &row_weights[endpoint])?;
+            let expected = if column_index < code.source_columns {
+                source_combinations[endpoint][column_index]
+            } else {
+                combined_parity[endpoint]
+                    .get(column_index - code.source_columns)
+                    .copied()
+                    .ok_or_else(|| invalid("opened parity column is out of range"))?
+            };
+            maximum_absolute_defect = maximum_absolute_defect.max((actual - expected).abs());
+        }
+    }
+    Ok(maximum_absolute_defect)
 }
 
 fn generate_source(
@@ -825,6 +1869,10 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
+fn calculation_error(error: impl std::fmt::Display) -> io::Error {
+    io::Error::other(error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -928,5 +1976,167 @@ mod tests {
         assert!(SparseSystematicCode::new(4, 2, 0, 1).is_err());
         assert!(SparseSystematicCode::new(4, 2, 3, 1).is_err());
         assert!(SparseSystematicCode::new(4, 2, 8, 1).is_err());
+    }
+
+    #[test]
+    fn sparse_surrogate_exposes_its_single_coordinate_escape_rate() -> Result<(), Box<dyn Error>> {
+        let code = SparseSystematicCode::new(4096, 2048, 4, 29)?;
+        let (minimum_weight, maximum_weight) = single_source_encoded_weight_range(&code)?;
+        let miss = without_replacement_miss_probability(6144, minimum_weight, 16)?;
+        assert!(minimum_weight < maximum_weight);
+        assert!(miss > 0.98);
+        Ok(())
+    }
+
+    #[test]
+    fn residual_composition_replays_and_binds_terminal_claims() -> Result<(), Box<dyn Error>> {
+        let dimension = 128;
+        let rows = 16;
+        let queries = 8;
+        let seed = 0x1234_5678_9abc_def0;
+        let code_seed = seed ^ 0x434f_4445_4752_4150;
+        let problem = generated_laplacian_problem(dimension, &[1, 32], seed)?;
+        let solution = generate_candidate_solution(dimension, 24, seed ^ 7)?;
+        let padded_dimension = dimension.next_power_of_two();
+        let packed_dimension = 2 * padded_dimension;
+        let source_columns = packed_dimension / rows;
+        let code = SparseSystematicCode::new(source_columns, source_columns / 2, 4, code_seed)?;
+        let encoded_columns = code.encoded_columns()?;
+        let residual = compute_generated_residual(&problem, &solution)?;
+        let source =
+            pack_solution_and_residual(&solution, &residual, padded_dimension, packed_dimension)?;
+        let parity = code.encode_rows(&source, rows)?;
+        let tree = build_column_tree(&source, &parity, rows, source_columns, encoded_columns)?;
+        let mut transcript =
+            initialize_residual_transcript(&problem, tree.root(), rows, &code, queries, code_seed)?;
+
+        let residual_left = source[padded_dimension..].to_vec();
+        let residual_right = residual_left.clone();
+        let residual_squared_l2 = product_sum(&residual_left, &residual_right)?;
+        absorb_float(
+            &mut transcript,
+            b"residual-squared-l2-claim",
+            residual_squared_l2,
+        )?;
+        let (norm_sumcheck, norm_endpoint) = prove_product_owned(
+            residual_left,
+            residual_right,
+            residual_squared_l2,
+            |round, polynomial| {
+                sumcheck_challenge(&mut transcript, b"residual-norm", round, polynomial)
+            },
+        )?;
+        let residual_at_row_point = norm_endpoint.left_evaluation;
+        absorb_float(
+            &mut transcript,
+            b"residual-at-shared-row-point",
+            residual_at_row_point,
+        )?;
+        let rhs = problem
+            .public_evaluation_plan()
+            .evaluate_rhs_mle_f64(&norm_endpoint.point)?;
+        let matvec_initial_claim = canonical(rhs.value + residual_at_row_point)?;
+        absorb_float(
+            &mut transcript,
+            b"matvec-initial-claim",
+            matvec_initial_claim,
+        )?;
+        let compressed =
+            prepare_compressed_columns(&problem, &norm_endpoint.point, padded_dimension)?;
+        let (matvec_sumcheck, matvec_endpoint) = prove_product_owned(
+            compressed,
+            source[..padded_dimension].to_vec(),
+            matvec_initial_claim,
+            |round, polynomial| {
+                sumcheck_challenge(&mut transcript, b"matvec-product", round, polynomial)
+            },
+        )?;
+        let solution_at_column_point = matvec_endpoint.right_evaluation;
+        absorb_float(
+            &mut transcript,
+            b"solution-at-column-point",
+            solution_at_column_point,
+        )?;
+        let solution_point = packed_endpoint_point(0.0, &matvec_endpoint.point);
+        let residual_point = packed_endpoint_point(1.0, &norm_endpoint.point);
+        let source_combinations = [
+            prepare_endpoint_combination(
+                &source,
+                &parity,
+                rows,
+                source_columns,
+                encoded_columns,
+                &solution_point,
+            )?,
+            prepare_endpoint_combination(
+                &source,
+                &parity,
+                rows,
+                source_columns,
+                encoded_columns,
+                &residual_point,
+            )?,
+        ];
+        absorb_combinations(&mut transcript, &source_combinations)?;
+        let indices = derive_query_indices(&mut transcript, encoded_columns, queries)?;
+        let opening = tree.opening_at_indices(&source, &parity, rows, source_columns, &indices)?;
+        let proof = ResidualCompositionProof {
+            residual_squared_l2,
+            norm_sumcheck,
+            residual_at_row_point,
+            matvec_sumcheck,
+            solution_at_column_point,
+            source_combinations,
+            opening,
+        };
+
+        let metrics = verify_residual_composition(
+            &problem,
+            &code,
+            tree.root(),
+            tree.padded_columns,
+            rows,
+            queries,
+            code_seed,
+            &proof,
+        )?;
+        assert!(metrics.norm_sumcheck_maximum_absolute_defect.is_finite());
+        assert!(metrics.matvec_sumcheck_maximum_absolute_defect.is_finite());
+        assert!(metrics.residual_opening_absolute_defect.is_finite());
+        assert!(metrics.solution_opening_absolute_defect.is_finite());
+
+        let mut changed_endpoint = proof.clone();
+        changed_endpoint.solution_at_column_point =
+            f64::from_bits(changed_endpoint.solution_at_column_point.to_bits() ^ 1);
+        assert!(
+            verify_residual_composition(
+                &problem,
+                &code,
+                tree.root(),
+                tree.padded_columns,
+                rows,
+                queries,
+                code_seed,
+                &changed_endpoint,
+            )
+            .is_err()
+        );
+
+        let mut changed_path = proof;
+        changed_path.opening.authentication[0][0] ^= 1;
+        assert!(
+            verify_residual_composition(
+                &problem,
+                &code,
+                tree.root(),
+                tree.padded_columns,
+                rows,
+                queries,
+                code_seed,
+                &changed_path,
+            )
+            .is_err()
+        );
+        Ok(())
     }
 }
