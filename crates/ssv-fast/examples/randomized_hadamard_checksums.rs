@@ -1,10 +1,12 @@
 //! Cost and attack surrogate for systematic randomized-Hadamard checksums.
 //!
 //! This example is deliberately not a proof protocol. It measures a candidate
-//! row code `Enc_D(u) = [u || H D u]`, a complete column Merkle commitment,
-//! and one authenticated row-combination opening. It separately measures the
-//! spreading seen when an alteration is fixed before `D` and an explicit
-//! alteration constructed after the public signs are known.
+//! row code `Enc_Q(u) = [u || Q u]`, where `Q` is one or more independently
+//! signed normalized Hadamard layers, a complete column Merkle commitment, and
+//! one sampled row-combination opening. It also measures a structured MLE
+//! functional and a factor-aware global sumcheck, while explicitly retaining
+//! attacks against local sampling, forged appended parity, and an unbound
+//! private sumcheck endpoint.
 
 #![forbid(unsafe_code)]
 
@@ -16,7 +18,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use ssv_fast::{
     DefectObservation, ProductEndpoint, ProductSumcheckProof, QuadraticBernstein, Transcript,
-    evaluate_mle, product_sum, prove_product_owned, verify_product, verify_product_endpoint,
+    evaluate_mle, verify_product, verify_product_endpoint,
 };
 
 const LEAF_DOMAIN: &[u8] = b"ssv/research/randomized-hadamard/column-leaf/v1";
@@ -25,7 +27,8 @@ const NODE_DOMAIN: &[u8] = b"ssv/research/randomized-hadamard/column-node/v1";
 const QUERY_DOMAIN: &[u8] = b"ssv/research/randomized-hadamard/query-seed/v1";
 const GLOBAL_SUMCHECK_DOMAIN: &[u8] =
     b"ssv/research/randomized-hadamard/global-checksum-sumcheck/v1";
-const GLOBAL_WEIGHT_DOMAIN: &[u8] = b"ssv/research/randomized-hadamard/global-checksum-weights/v1";
+const STRUCTURED_WEIGHT_DOMAIN: &[u8] =
+    b"ssv/research/randomized-hadamard/structured-mle-weights/v1";
 const VALUES_PER_HASH_BLOCK: usize = 64;
 const TRANSPOSE_TILE: usize = 32;
 const TAIL_SCALE: f64 = 0.5;
@@ -45,6 +48,14 @@ struct Args {
     #[arg(long, default_value_t = 16)]
     queries: usize,
 
+    /// Number of randomized normalized Hadamard layers in the parity map.
+    #[arg(long, default_value_t = 1)]
+    hadamard_layers: usize,
+
+    /// Materialize the full public coefficient table as a benchmark control.
+    #[arg(long, default_value_t = false)]
+    materialize_global_coefficients: bool,
+
     /// Independent public-sign draws used by the spreading study.
     #[arg(long, default_value_t = 256)]
     spreading_trials: usize,
@@ -62,32 +73,50 @@ struct Args {
 #[derive(Debug)]
 struct RandomizedHadamardCode {
     width: usize,
-    signs: Vec<f64>,
+    sign_layers: Vec<Vec<f64>>,
     normalization: f64,
 }
 
 impl RandomizedHadamardCode {
     fn new(width: usize, seed: u64) -> Result<Self, io::Error> {
+        Self::with_layers(width, 1, seed)
+    }
+
+    fn with_layers(width: usize, layers: usize, seed: u64) -> Result<Self, io::Error> {
         if width == 0 || !width.is_power_of_two() {
             return Err(invalid("Hadamard width must be a positive power of two"));
         }
-        let mut signs = Vec::new();
-        signs
-            .try_reserve_exact(width)
-            .map_err(|_| invalid("could not allocate Hadamard signs"))?;
+        if layers == 0 {
+            return Err(invalid("Hadamard layer count must be positive"));
+        }
+        let mut sign_layers = Vec::new();
+        sign_layers
+            .try_reserve_exact(layers)
+            .map_err(|_| invalid("could not allocate Hadamard sign layers"))?;
         let mut state = seed;
-        for _ in 0..width {
-            signs.push(if splitmix64(&mut state) & 1 == 0 {
-                1.0
-            } else {
-                -1.0
-            });
+        for _ in 0..layers {
+            let mut signs = Vec::new();
+            signs
+                .try_reserve_exact(width)
+                .map_err(|_| invalid("could not allocate Hadamard signs"))?;
+            for _ in 0..width {
+                signs.push(if splitmix64(&mut state) & 1 == 0 {
+                    1.0
+                } else {
+                    -1.0
+                });
+            }
+            sign_layers.push(signs);
         }
         Ok(Self {
             width,
-            signs,
+            sign_layers,
             normalization: 1.0 / (width as f64).sqrt(),
         })
+    }
+
+    fn layers(&self) -> usize {
+        self.sign_layers.len()
     }
 
     fn encoded_columns(&self) -> Result<usize, io::Error> {
@@ -100,14 +129,53 @@ impl RandomizedHadamardCode {
         if values.len() != self.width {
             return Err(invalid("Hadamard input does not match the code width"));
         }
-        for (value, &sign) in values.iter_mut().zip(&self.signs) {
-            *value *= sign;
-        }
-        fwht_in_place(values);
-        for value in values {
-            *value *= self.normalization;
+        for signs in &self.sign_layers {
+            for (value, &sign) in values.iter_mut().zip(signs) {
+                *value *= sign;
+            }
+            fwht_in_place(values);
+            for value in values.iter_mut() {
+                *value *= self.normalization;
+            }
         }
         Ok(())
+    }
+
+    fn transpose_transform_in_place(&self, values: &mut [f64]) -> Result<(), io::Error> {
+        self.transpose_prefix_in_place(values, self.layers())
+    }
+
+    fn transpose_prefix_in_place(
+        &self,
+        values: &mut [f64],
+        layers: usize,
+    ) -> Result<(), io::Error> {
+        if values.len() != self.width {
+            return Err(invalid(
+                "Hadamard transpose input does not match the code width",
+            ));
+        }
+        if layers == 0 || layers > self.layers() {
+            return Err(invalid("Hadamard transpose prefix is out of range"));
+        }
+        for signs in self.sign_layers[..layers].iter().rev() {
+            fwht_in_place(values);
+            for (value, &sign) in values.iter_mut().zip(signs) {
+                *value *= self.normalization * sign;
+            }
+        }
+        Ok(())
+    }
+
+    fn transpose_encode_vector(&self, source: &[f64]) -> Result<Vec<f64>, io::Error> {
+        if source.len() != self.width {
+            return Err(invalid(
+                "transpose source vector does not match the code width",
+            ));
+        }
+        let mut transformed = source.to_vec();
+        self.transpose_transform_in_place(&mut transformed)?;
+        Ok(transformed)
     }
 
     fn encode_vector(&self, source: &[f64]) -> Result<Vec<f64>, io::Error> {
@@ -344,6 +412,8 @@ struct TimingSamples {
     opening_verification: Vec<Duration>,
     defect_scan: Vec<Duration>,
     total: Vec<Duration>,
+    structured_functional_control: Vec<Duration>,
+    structured_control_total: Vec<Duration>,
     global_sumcheck_table_build: Vec<Duration>,
     global_sumcheck_prove: Vec<Duration>,
     global_sumcheck_verify: Vec<Duration>,
@@ -369,10 +439,17 @@ struct RecursiveFoldSwitchMetrics {
     terminal_absolute_defect: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ForgedParityCancellationMetrics {
+    source_defect_coordinates: usize,
+    parity_maximum_absolute_defect: f64,
+    query_miss_probability: f64,
+}
+
 #[derive(Debug)]
 struct GlobalRelationTables {
     data: Vec<f64>,
-    coefficients: Vec<f64>,
+    block_column_weights: Vec<f64>,
     row_weights: Vec<f64>,
     output_weights: Vec<f64>,
     source_weights: Vec<f64>,
@@ -387,6 +464,17 @@ struct GlobalSumcheckMetrics {
     public_coefficient_endpoint_absolute_defect: f64,
     final_product_absolute_defect: f64,
     unauthenticated_data_endpoint: f64,
+    row_weight_squared_norm: f64,
+    output_weight_squared_norm: f64,
+    normalized_initial_claim: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StructuredFunctionalMetrics {
+    initial_claim: f64,
+    normalized_claim: f64,
+    output_weight_squared_norm: f64,
+    source_weight_squared_norm: f64,
 }
 
 #[derive(Debug, Default)]
@@ -418,7 +506,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .rows
         .checked_mul(source_columns)
         .ok_or_else(|| invalid("padded source dimension overflow"))?;
-    let code = RandomizedHadamardCode::new(source_columns, args.seed ^ 0x4841_4441_4d41_5244)?;
+    let code = RandomizedHadamardCode::with_layers(
+        source_columns,
+        args.hadamard_layers,
+        args.seed ^ 0x4841_4441_4d41_5244,
+    )?;
     let encoded_columns = code.encoded_columns()?;
     if args.queries > encoded_columns {
         return Err(invalid("queries cannot exceed encoded columns").into());
@@ -435,6 +527,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut final_defects = DefectMetrics::default();
     let mut final_query_defects = DefectMetrics::default();
     let mut final_global_sumcheck = GlobalSumcheckMetrics::default();
+    let mut final_structured_functional = StructuredFunctionalMetrics::default();
     let mut final_claim = 0.0;
 
     for repetition in 0..args.warmups + args.repetitions {
@@ -486,28 +579,80 @@ fn main() -> Result<(), Box<dyn Error>> {
         let total = total_start.elapsed();
 
         let start = Instant::now();
+        let structured_functional = structured_functional_control(
+            &combined[..source_columns],
+            &combined[source_columns..],
+            &code,
+            args.rows,
+            &tree.root(),
+        )?;
+        let structured_functional_control = start.elapsed();
+        let structured_control_total = total + structured_functional_control;
+
+        let start = Instant::now();
         let global_tables = build_global_relation_tables(
             source,
             parity,
             args.rows,
             source_columns,
-            &code.signs,
+            &code,
             &tree.root(),
         )?;
-        let global_initial_claim = product_sum(&global_tables.data, &global_tables.coefficients)?;
+        let materialized_coefficients = if args.materialize_global_coefficients {
+            Some(materialize_factored_coefficients(
+                &global_tables.block_column_weights,
+                &global_tables.row_weights,
+            )?)
+        } else {
+            None
+        };
+        let factored_first_round = if materialized_coefficients.is_none() {
+            Some(factored_product_round(
+                &global_tables.data,
+                &global_tables.block_column_weights,
+                &global_tables.row_weights,
+            )?)
+        } else {
+            None
+        };
+        let global_initial_claim = if let Some(coefficients) = &materialized_coefficients {
+            ssv_fast::product_sum(&global_tables.data, coefficients)?
+        } else if let Some(first_round) = factored_first_round {
+            checked_finite(
+                first_round.b0() + first_round.b2(),
+                "factored initial round endpoints",
+            )?
+        } else {
+            unreachable!("one global sumcheck preparation path is always selected")
+        };
         let global_sumcheck_table_build = start.elapsed();
 
         let start = Instant::now();
         let mut global_prover_transcript =
             initialize_global_sumcheck_transcript(&tree.root(), global_initial_claim);
-        let (global_proof, global_endpoint) = prove_product_owned(
-            global_tables.data,
-            global_tables.coefficients,
-            global_initial_claim,
-            |round, polynomial| {
-                global_sumcheck_challenge(&mut global_prover_transcript, round, polynomial)
-            },
-        )?;
+        let (global_proof, global_endpoint) = if let Some(coefficients) = materialized_coefficients
+        {
+            ssv_fast::prove_product_owned(
+                global_tables.data,
+                coefficients,
+                global_initial_claim,
+                |round, polynomial| {
+                    global_sumcheck_challenge(&mut global_prover_transcript, round, polynomial)
+                },
+            )?
+        } else {
+            prove_factored_product_owned(
+                global_tables.data,
+                global_tables.block_column_weights.clone(),
+                global_tables.row_weights.clone(),
+                global_initial_claim,
+                factored_first_round
+                    .expect("the factored prover path always prepares its first round"),
+                |round, polynomial| {
+                    global_sumcheck_challenge(&mut global_prover_transcript, round, polynomial)
+                },
+            )?
+        };
         let global_sumcheck_prove = start.elapsed();
         let staged_total = total + global_sumcheck_table_build + global_sumcheck_prove;
 
@@ -558,6 +703,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             &global_verification.round_defects,
             public_coefficient_endpoint,
             final_product.absolute_defect,
+            [
+                squared_norm(&global_tables.row_weights),
+                squared_norm(&global_tables.output_weights),
+            ],
         )?;
 
         black_box(tree.root());
@@ -565,6 +714,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         black_box(claim);
         black_box(opening.values.last());
         black_box(query_defects.maximum_absolute);
+        black_box(structured_functional.initial_claim);
         black_box(global_sumcheck.final_product_absolute_defect);
         final_root = tree.root();
         final_tree_bytes = tree.bytes();
@@ -572,6 +722,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         final_defects = defects;
         final_query_defects = query_defects;
         final_global_sumcheck = global_sumcheck;
+        final_structured_functional = structured_functional;
         final_claim = claim;
 
         if repetition >= args.warmups {
@@ -585,6 +736,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             samples.defect_scan.push(defect_scan);
             samples.total.push(total);
             samples
+                .structured_functional_control
+                .push(structured_functional_control);
+            samples
+                .structured_control_total
+                .push(structured_control_total);
+            samples
                 .global_sumcheck_table_build
                 .push(global_sumcheck_table_build);
             samples.global_sumcheck_prove.push(global_sumcheck_prove);
@@ -597,6 +754,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let parity_bytes = source_bytes;
     let transform_additions = padded_dimension
         .checked_mul(source_columns.ilog2() as usize)
+        .and_then(|value| value.checked_mul(code.layers()))
         .ok_or_else(|| invalid("transform addition count overflow"))?;
 
     println!("status=cost-and-attack-surrogate-without-soundness-claim");
@@ -604,6 +762,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("padded_dimension={padded_dimension}");
     println!("rows={}", args.rows);
     println!("source_columns={source_columns}");
+    println!("hadamard_layers={}", code.layers());
     println!("parity_columns={source_columns}");
     println!("encoded_columns={encoded_columns}");
     println!("queries={}", args.queries);
@@ -640,9 +799,45 @@ fn main() -> Result<(), Box<dyn Error>> {
         "queried_rms_absolute_defect={:.17e}",
         final_query_defects.rms_absolute
     );
+    println!("structured_functional_control=post-root-column-mle-adjoint-v1");
+    println!(
+        "structured_functional_initial_metric_claim={:.17e}",
+        final_structured_functional.initial_claim
+    );
+    println!(
+        "structured_functional_normalized_metric_claim={:.17e}",
+        final_structured_functional.normalized_claim
+    );
+    println!(
+        "structured_functional_output_weight_squared_norm={:.17e}",
+        final_structured_functional.output_weight_squared_norm
+    );
+    println!(
+        "structured_functional_source_weight_squared_norm={:.17e}",
+        final_structured_functional.source_weight_squared_norm
+    );
+    println!("structured_functional_incremental_payload_bytes=8");
+    println!("structured_functional_data_authenticated=false");
     println!(
         "global_sumcheck_initial_metric_claim={:.17e}",
         final_global_sumcheck.initial_claim
+    );
+    println!("global_contraction_weights=post-root-mle-equality-v1");
+    println!(
+        "global_sumcheck_public_coefficient_table_materialized={}",
+        args.materialize_global_coefficients
+    );
+    println!(
+        "global_sumcheck_row_weight_squared_norm={:.17e}",
+        final_global_sumcheck.row_weight_squared_norm
+    );
+    println!(
+        "global_sumcheck_output_weight_squared_norm={:.17e}",
+        final_global_sumcheck.output_weight_squared_norm
+    );
+    println!(
+        "global_sumcheck_normalized_initial_metric_claim={:.17e}",
+        final_global_sumcheck.normalized_initial_claim
     );
     println!("global_sumcheck_rounds={}", final_global_sumcheck.rounds);
     println!(
@@ -676,6 +871,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     print_timing("defect_scan", &mut samples.defect_scan);
     print_timing("total", &mut samples.total);
     print_timing(
+        "structured_functional_control",
+        &mut samples.structured_functional_control,
+    );
+    print_timing(
+        "structured_control_total",
+        &mut samples.structured_control_total,
+    );
+    print_timing(
         "global_sumcheck_table_build",
         &mut samples.global_sumcheck_table_build,
     );
@@ -692,8 +895,41 @@ fn main() -> Result<(), Box<dyn Error>> {
         args.spreading_trials,
         args.seed ^ 0x5350_5245_4144_494e,
     )?;
-    let fold_switch =
-        recursive_fold_switch_attack(&code, args.queries, args.seed ^ 0x464f_4c44_5f53_5749)?;
+    run_cascade_study(
+        source_columns,
+        args.queries,
+        args.spreading_trials,
+        args.seed ^ 0x4341_5343_4144_4553,
+    )?;
+    let forged_parity = forged_parity_cancellation_attack(
+        &code,
+        args.rows,
+        args.queries,
+        args.seed ^ 0x464f_5247_4544_5052,
+    )?;
+    println!(
+        "forged_parity_cancellation_hadamard_layers={}",
+        code.layers()
+    );
+    println!(
+        "forged_parity_cancellation_source_defect_coordinates={}",
+        forged_parity.source_defect_coordinates
+    );
+    println!(
+        "forged_parity_cancellation_parity_maximum_absolute_defect={:.17e}",
+        forged_parity.parity_maximum_absolute_defect
+    );
+    println!(
+        "forged_parity_cancellation_query_miss_probability={:.9e}",
+        forged_parity.query_miss_probability
+    );
+    let fold_control =
+        RandomizedHadamardCode::new(source_columns, args.seed ^ 0x4841_4441_4d41_5244)?;
+    let fold_switch = recursive_fold_switch_attack(
+        &fold_control,
+        args.queries,
+        args.seed ^ 0x464f_4c44_5f53_5749,
+    )?;
     println!("recursive_fold_candidate=odd-even-local-fold-v1");
     println!(
         "recursive_fold_switch_attack_first_round_pairs={}",
@@ -725,9 +961,13 @@ fn validate_args(args: &Args) -> Result<(), io::Error> {
     if !args.rows.is_power_of_two() {
         return Err(invalid("rows must be a power of two"));
     }
-    if args.queries == 0 || args.repetitions == 0 || args.spreading_trials == 0 {
+    if args.queries == 0
+        || args.hadamard_layers == 0
+        || args.repetitions == 0
+        || args.spreading_trials == 0
+    {
         return Err(invalid(
-            "queries, repetitions, and spreading trials must be positive",
+            "queries, Hadamard layers, repetitions, and spreading trials must be positive",
         ));
     }
     Ok(())
@@ -841,7 +1081,7 @@ fn recursive_fold_switch_attack(
 
     // The recursive relation sees D * source on its systematic side.
     let mut signed_alteration = fixed_alteration;
-    for (value, &sign) in signed_alteration.iter_mut().zip(&code.signs) {
+    for (value, &sign) in signed_alteration.iter_mut().zip(&code.sign_layers[0]) {
         *value *= sign;
     }
 
@@ -885,6 +1125,66 @@ fn recursive_fold_switch_attack(
             .maximum_absolute
             .max(parity_fold_defects.maximum_absolute),
         terminal_absolute_defect: (source[0] - parity[0]).abs(),
+    })
+}
+
+/// Constructs an appended parity table that cancels a false claimed row
+/// combination exactly (up to binary64 roundoff).
+///
+/// The source table is zero and the claimed combination has one nonzero
+/// coordinate. Once the row weights and transform are public, a malicious
+/// prover places the complete transformed claim in one parity row, scaled by
+/// that row's nonzero weight. Every parity-column check then passes, while only
+/// one systematic column exposes the false source claim. More Hadamard layers
+/// do not help because the appended table was never linked to the source.
+fn forged_parity_cancellation_attack(
+    code: &RandomizedHadamardCode,
+    rows: usize,
+    queries: usize,
+    seed: u64,
+) -> Result<ForgedParityCancellationMetrics, io::Error> {
+    if rows == 0 || !rows.is_power_of_two() {
+        return Err(invalid(
+            "forged parity cancellation requires a positive power-of-two row count",
+        ));
+    }
+    let row_weights = signed_dyadic_weights(rows, seed)?;
+    let chosen_row = row_weights
+        .iter()
+        .position(|weight| *weight != 0.0)
+        .ok_or_else(|| invalid("row challenge unexpectedly contains only zero weights"))?;
+    let chosen_weight = row_weights[chosen_row];
+    let mut claimed_source = vec![0.0; code.width];
+    claimed_source[0] = 1.0;
+    let claimed_parity = code.encode_vector(&claimed_source)?;
+
+    let source = vec![0.0; rows * code.width];
+    let mut forged_parity = vec![0.0; rows * code.width];
+    for (column_index, &claimed_value) in claimed_parity.iter().enumerate() {
+        forged_parity[column_index * rows + chosen_row] = claimed_value / chosen_weight;
+    }
+    let actual = combine_columns(
+        &source,
+        &forged_parity,
+        rows,
+        code.width,
+        2 * code.width,
+        &row_weights,
+    )?;
+    let source_defect_coordinates = actual[..code.width]
+        .iter()
+        .zip(&claimed_source)
+        .filter(|(actual_value, claimed_value)| *actual_value != *claimed_value)
+        .count();
+    let parity_defects = compare_vectors(&actual[code.width..], &claimed_parity)?;
+    Ok(ForgedParityCancellationMetrics {
+        source_defect_coordinates,
+        parity_maximum_absolute_defect: parity_defects.maximum_absolute,
+        query_miss_probability: miss_probability(
+            2 * code.width,
+            source_defect_coordinates,
+            queries.min(2 * code.width),
+        ),
     })
 }
 
@@ -1070,28 +1370,79 @@ fn derive_query_seed(root: &[u8; 32], combined_source: &[f64]) -> u64 {
     )
 }
 
+fn structured_functional_control(
+    combined_source: &[f64],
+    combined_parity: &[f64],
+    code: &RandomizedHadamardCode,
+    rows: usize,
+    appended_root: &[u8; 32],
+) -> Result<StructuredFunctionalMetrics, io::Error> {
+    if combined_source.len() != code.width
+        || combined_parity.len() != code.width
+        || rows == 0
+        || !rows.is_power_of_two()
+    {
+        return Err(invalid("structured functional control shape is invalid"));
+    }
+    let (_, output_point) = derive_structured_points(
+        appended_root,
+        rows.ilog2() as usize,
+        code.width.ilog2() as usize,
+    )?;
+    let output_weights = equality_weights(&output_point)?;
+    let source_weights = code.transpose_encode_vector(&output_weights)?;
+    let output_claim = dot(combined_parity, &output_weights)?;
+    let source_claim = dot(combined_source, &source_weights)?;
+    let initial_claim = checked_finite(
+        output_claim - source_claim,
+        "structured functional contraction",
+    )?;
+    let output_weight_squared_norm = squared_norm(&output_weights);
+    let source_weight_squared_norm = squared_norm(&source_weights);
+    let output_weight_norm = output_weight_squared_norm.sqrt();
+    let normalized_claim = if output_weight_norm == 0.0 {
+        0.0
+    } else {
+        initial_claim / output_weight_norm
+    };
+    Ok(StructuredFunctionalMetrics {
+        initial_claim,
+        normalized_claim,
+        output_weight_squared_norm,
+        source_weight_squared_norm,
+    })
+}
+
 fn build_global_relation_tables(
     mut source: Vec<f64>,
     parity: Vec<f64>,
     rows: usize,
     columns: usize,
-    signs: &[f64],
+    code: &RandomizedHadamardCode,
     appended_root: &[u8; 32],
 ) -> Result<GlobalRelationTables, io::Error> {
     let table_len = rows
         .checked_mul(columns)
         .ok_or_else(|| invalid("global relation table shape overflow"))?;
-    if source.len() != table_len || parity.len() != table_len || signs.len() != columns {
+    if source.len() != table_len || parity.len() != table_len || code.width != columns {
         return Err(invalid("global relation table shape is invalid"));
     }
 
-    let master_seed = derive_root_seed(appended_root, GLOBAL_WEIGHT_DOMAIN);
-    let row_weights = signed_unit_weights(rows, master_seed ^ 0x524f_575f_4c41_4d42)?;
-    let output_weights = signed_unit_weights(columns, master_seed ^ 0x4f55_545f_5745_4947)?;
-    let mut source_weights = normalized_hadamard(&output_weights)?;
-    for (value, &sign) in source_weights.iter_mut().zip(signs) {
-        *value = canonicalize_zero(*value * sign);
-    }
+    // These equality vectors turn the initial claim into a random MLE of the
+    // complete transform discrepancy. Both points are derived only after the
+    // appended checksum root is fixed. This is a useful metric functional, but
+    // it does not authenticate the private data MLE at the sumcheck endpoint.
+    let (row_point, output_point) = derive_structured_points(
+        appended_root,
+        rows.ilog2() as usize,
+        columns.ilog2() as usize,
+    )?;
+    let row_weights = equality_weights(&row_point)?;
+    let output_weights = equality_weights(&output_point)?;
+    let mut source_weights = code.transpose_encode_vector(&output_weights)?;
+    source_weights.iter_mut().for_each(|value| {
+        *value = canonicalize_zero(*value);
+    });
 
     let combined_len = table_len
         .checked_mul(2)
@@ -1105,24 +1456,21 @@ fn build_global_relation_tables(
         *value = canonicalize_zero(*value);
     }
 
-    let mut coefficients = Vec::new();
-    coefficients
-        .try_reserve_exact(combined_len)
-        .map_err(|_| invalid("could not allocate global relation coefficient table"))?;
-    for &column_weight in &output_weights {
-        for &row_weight in &row_weights {
-            coefficients.push(canonicalize_zero(row_weight * column_weight));
-        }
-    }
-    for &column_weight in &source_weights {
-        for &row_weight in &row_weights {
-            coefficients.push(canonicalize_zero(-(row_weight * column_weight)));
-        }
-    }
+    let mut block_column_weights = Vec::new();
+    block_column_weights
+        .try_reserve_exact(2 * columns)
+        .map_err(|_| invalid("could not allocate global relation column factors"))?;
+    block_column_weights.extend(output_weights.iter().copied().map(canonicalize_zero));
+    block_column_weights.extend(
+        source_weights
+            .iter()
+            .copied()
+            .map(|value| canonicalize_zero(-value)),
+    );
 
     Ok(GlobalRelationTables {
         data,
-        coefficients,
+        block_column_weights,
         row_weights,
         output_weights,
         source_weights,
@@ -1133,39 +1481,394 @@ fn canonicalize_zero(value: f64) -> f64 {
     if value == 0.0 { 0.0 } else { value }
 }
 
-fn signed_unit_weights(len: usize, seed: u64) -> Result<Vec<f64>, io::Error> {
-    if len == 0 || !len.is_power_of_two() {
-        return Err(invalid(
-            "orthogonal weight count must be a positive power of two",
-        ));
+fn derive_structured_points(
+    root: &[u8; 32],
+    row_variables: usize,
+    column_variables: usize,
+) -> Result<(Vec<f64>, Vec<f64>), io::Error> {
+    let mut transcript = Transcript::new(STRUCTURED_WEIGHT_DOMAIN);
+    transcript.absorb_root(b"appended-checksum-root", root);
+    transcript.absorb_u64(b"row-variable-count", row_variables as u64);
+    transcript.absorb_u64(b"column-variable-count", column_variables as u64);
+    let mut row_point = Vec::new();
+    row_point
+        .try_reserve_exact(row_variables)
+        .map_err(|_| invalid("could not allocate structured row point"))?;
+    for _ in 0..row_variables {
+        row_point.push(
+            transcript
+                .challenge_dyadic_f64(b"structured-row-coordinate")
+                .map_err(io::Error::other)?,
+        );
     }
+    let mut column_point = Vec::new();
+    column_point
+        .try_reserve_exact(column_variables)
+        .map_err(|_| invalid("could not allocate structured column point"))?;
+    for _ in 0..column_variables {
+        column_point.push(
+            transcript
+                .challenge_dyadic_f64(b"structured-column-coordinate")
+                .map_err(io::Error::other)?,
+        );
+    }
+    Ok((row_point, column_point))
+}
+
+fn equality_weights(point: &[f64]) -> Result<Vec<f64>, io::Error> {
+    let expected_len = 1_usize
+        .checked_shl(u32::try_from(point.len()).map_err(|_| invalid("MLE point is too large"))?)
+        .ok_or_else(|| invalid("equality-weight length overflow"))?;
     let mut weights = Vec::new();
     weights
-        .try_reserve_exact(len)
-        .map_err(|_| invalid("could not allocate orthogonal weights"))?;
-    let mut state = seed;
-    let scale = 1.0 / (len as f64).sqrt();
-    for _ in 0..len {
-        let sign = if splitmix64(&mut state) & 1 == 0 {
-            1.0
-        } else {
-            -1.0
-        };
-        weights.push(sign * scale);
+        .try_reserve_exact(expected_len)
+        .map_err(|_| invalid("could not allocate equality weights"))?;
+    weights.resize(expected_len, 0.0);
+    weights[0] = 1.0;
+    let mut active_len = 1_usize;
+    for &coordinate in point {
+        if !coordinate.is_finite() || !(0.0..=1.0).contains(&coordinate) {
+            return Err(invalid("equality-weight coordinate is outside [0, 1]"));
+        }
+        for index in (0..active_len).rev() {
+            let weight = weights[index];
+            weights[2 * index] = canonicalize_zero(weight * (1.0 - coordinate));
+            weights[2 * index + 1] = canonicalize_zero(weight * coordinate);
+        }
+        active_len *= 2;
     }
+    debug_assert_eq!(weights.len(), expected_len);
     Ok(weights)
 }
 
-fn derive_root_seed(root: &[u8; 32], domain: &[u8]) -> u64 {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(domain);
-    hasher.update(root);
-    let digest = hasher.finalize();
-    u64::from_le_bytes(
-        digest.as_bytes()[..size_of::<u64>()]
-            .try_into()
-            .expect("a BLAKE3 digest always contains eight bytes"),
-    )
+fn materialize_factored_coefficients(
+    block_column_weights: &[f64],
+    row_weights: &[f64],
+) -> Result<Vec<f64>, io::Error> {
+    let coefficient_len = block_column_weights
+        .len()
+        .checked_mul(row_weights.len())
+        .ok_or_else(|| invalid("factored coefficient length overflow"))?;
+    validate_factored_shape(coefficient_len, block_column_weights, row_weights)?;
+    let mut coefficients = Vec::new();
+    coefficients
+        .try_reserve_exact(coefficient_len)
+        .map_err(|_| invalid("could not allocate reference coefficient table"))?;
+    for &block_column_weight in block_column_weights {
+        for &row_weight in row_weights {
+            coefficients.push(checked_finite(
+                block_column_weight * row_weight,
+                "materialized coefficient",
+            )?);
+        }
+    }
+    Ok(coefficients)
+}
+
+#[cfg(test)]
+fn factored_product_sum(
+    data: &[f64],
+    block_column_weights: &[f64],
+    row_weights: &[f64],
+) -> Result<f64, io::Error> {
+    validate_factored_shape(data.len(), block_column_weights, row_weights)?;
+    let rows = row_weights.len();
+    let mut sum = CompensatedSum::default();
+    for (data_column, &column_weight) in data.chunks_exact(rows).zip(block_column_weights) {
+        for (&value, &row_weight) in data_column.iter().zip(row_weights) {
+            let coefficient =
+                checked_finite(column_weight * row_weight, "factored initial coefficient")?;
+            sum.add(checked_finite(
+                value * coefficient,
+                "factored initial product",
+            )?)?;
+        }
+    }
+    sum.finish("factored initial sum")
+}
+
+/// Runs product sumcheck while retaining the public coefficient table as two
+/// one-dimensional factors. The data table is still private and dense. This
+/// removes an avoidable `O(n)` allocation, but it does not authenticate the
+/// final data MLE against the Merkle root.
+fn prove_factored_product_owned<C>(
+    mut data: Vec<f64>,
+    mut block_column_weights: Vec<f64>,
+    mut row_weights: Vec<f64>,
+    initial_claim: f64,
+    first_round: QuadraticBernstein,
+    mut challenge: C,
+) -> Result<(ProductSumcheckProof, ProductEndpoint), io::Error>
+where
+    C: FnMut(usize, &QuadraticBernstein) -> f64,
+{
+    validate_factored_shape(data.len(), &block_column_weights, &row_weights)?;
+    if !initial_claim.is_finite() {
+        return Err(invalid("factored sumcheck initial claim must be finite"));
+    }
+    let variables = data.len().ilog2() as usize;
+    let mut claim = initial_claim;
+    let mut point = Vec::new();
+    point
+        .try_reserve_exact(variables)
+        .map_err(|_| invalid("could not allocate factored sumcheck point"))?;
+    let mut rounds = Vec::new();
+    rounds
+        .try_reserve_exact(variables)
+        .map_err(|_| invalid("could not allocate factored sumcheck rounds"))?;
+
+    for round_index in 0..variables {
+        let round = if round_index == 0 {
+            first_round
+        } else {
+            factored_product_round(&data, &block_column_weights, &row_weights)?
+        };
+        let round_challenge = challenge(round_index, &round);
+        if !round_challenge.is_finite() || !(0.0..=1.0).contains(&round_challenge) {
+            return Err(invalid("factored sumcheck challenge is outside [0, 1]"));
+        }
+        claim = round.evaluate(round_challenge).map_err(io::Error::other)?;
+        fold_values(&mut data, round_challenge)?;
+        if block_column_weights.len() > 1 {
+            fold_values(&mut block_column_weights, round_challenge)?;
+        } else {
+            fold_values(&mut row_weights, round_challenge)?;
+        }
+        point.push(round_challenge);
+        rounds.push(round);
+    }
+
+    debug_assert_eq!(data.len(), 1);
+    debug_assert_eq!(block_column_weights.len(), 1);
+    debug_assert_eq!(row_weights.len(), 1);
+    let left_evaluation = canonicalize_zero(data[0]);
+    let right_evaluation = checked_finite(
+        block_column_weights[0] * row_weights[0],
+        "factored coefficient endpoint",
+    )?;
+    let actual = checked_finite(
+        left_evaluation * right_evaluation,
+        "factored product endpoint",
+    )?;
+    let defect = observe_relation(actual, claim);
+    Ok((
+        ProductSumcheckProof { rounds },
+        ProductEndpoint {
+            point,
+            claim,
+            left_evaluation,
+            right_evaluation,
+            defect,
+        },
+    ))
+}
+
+fn factored_product_round(
+    data: &[f64],
+    block_column_weights: &[f64],
+    row_weights: &[f64],
+) -> Result<QuadraticBernstein, io::Error> {
+    validate_factored_shape(data.len(), block_column_weights, row_weights)?;
+    if data.len() < 2 {
+        return Err(invalid(
+            "factored sumcheck round requires at least two values",
+        ));
+    }
+    let half = data.len() / 2;
+    let mut b0 = CompensatedSum::default();
+    let mut b1 = CompensatedSum::default();
+    let mut b2 = CompensatedSum::default();
+
+    if block_column_weights.len() > 1 {
+        let outer_half = block_column_weights.len() / 2;
+        let rows = row_weights.len();
+        let (data_low, data_high) = data.split_at(half);
+        let (outer_low, outer_high) = block_column_weights.split_at(outer_half);
+        for (outer_index, (&outer_low_value, &outer_high_value)) in
+            outer_low.iter().zip(outer_high).enumerate()
+        {
+            let start = outer_index * rows;
+            let end = start + rows;
+            for ((&data_low_value, &data_high_value), &row_weight) in data_low[start..end]
+                .iter()
+                .zip(&data_high[start..end])
+                .zip(row_weights)
+            {
+                let coefficient_low = checked_finite(
+                    outer_low_value * row_weight,
+                    "factored round low coefficient",
+                )?;
+                let coefficient_high = checked_finite(
+                    outer_high_value * row_weight,
+                    "factored round high coefficient",
+                )?;
+                add_product_round_terms(
+                    &mut b0,
+                    &mut b1,
+                    &mut b2,
+                    data_low_value,
+                    data_high_value,
+                    coefficient_low,
+                    coefficient_high,
+                )?;
+            }
+        }
+    } else {
+        let row_half = row_weights.len() / 2;
+        let outer_weight = block_column_weights[0];
+        let mut inner_b0 = CompensatedSum::default();
+        let mut inner_b1 = CompensatedSum::default();
+        let mut inner_b2 = CompensatedSum::default();
+        for index in 0..half {
+            add_product_round_terms(
+                &mut inner_b0,
+                &mut inner_b1,
+                &mut inner_b2,
+                data[index],
+                data[index + half],
+                row_weights[index],
+                row_weights[index + row_half],
+            )?;
+        }
+        b0.add(checked_finite(
+            outer_weight * inner_b0.finish("factored row-round inner b0")?,
+            "factored row-round b0 scale",
+        )?)?;
+        b1.add(checked_finite(
+            outer_weight * inner_b1.finish("factored row-round inner b1")?,
+            "factored row-round b1 scale",
+        )?)?;
+        b2.add(checked_finite(
+            outer_weight * inner_b2.finish("factored row-round inner b2")?,
+            "factored row-round b2 scale",
+        )?)?;
+    }
+
+    Ok(QuadraticBernstein::new(
+        b0.finish("factored round b0")?,
+        b1.finish("factored round b1")?,
+        b2.finish("factored round b2")?,
+    ))
+}
+
+// Keeping the four scalar round inputs explicit makes the butterfly-style hot
+// loop easier to audit and avoids constructing a temporary record per pair.
+#[allow(clippy::too_many_arguments)]
+fn add_product_round_terms(
+    b0: &mut CompensatedSum,
+    b1: &mut CompensatedSum,
+    b2: &mut CompensatedSum,
+    data_low: f64,
+    data_high: f64,
+    coefficient_low: f64,
+    coefficient_high: f64,
+) -> Result<(), io::Error> {
+    b0.add(checked_finite(
+        data_low * coefficient_low,
+        "factored round b0 product",
+    )?)?;
+    let cross_low = checked_finite(
+        data_low * coefficient_high,
+        "factored round b1 cross product",
+    )?;
+    let cross_high = checked_finite(
+        data_high * coefficient_low,
+        "factored round b1 cross product",
+    )?;
+    b1.add(checked_finite(
+        0.5 * checked_finite(cross_low + cross_high, "factored round b1 cross sum")?,
+        "factored round b1 average",
+    )?)?;
+    b2.add(checked_finite(
+        data_high * coefficient_high,
+        "factored round b2 product",
+    )?)?;
+    Ok(())
+}
+
+fn fold_values(values: &mut Vec<f64>, challenge: f64) -> Result<(), io::Error> {
+    if values.len() < 2 || !values.len().is_power_of_two() {
+        return Err(invalid("folded value table shape is invalid"));
+    }
+    let half = values.len() / 2;
+    let complement = 1.0 - challenge;
+    for index in 0..half {
+        let low = complement * values[index];
+        let high = challenge * values[index + half];
+        values[index] = checked_finite(low + high, "factored multilinear interpolation")?;
+    }
+    values.truncate(half);
+    Ok(())
+}
+
+fn validate_factored_shape(
+    data_len: usize,
+    block_column_weights: &[f64],
+    row_weights: &[f64],
+) -> Result<(), io::Error> {
+    if data_len == 0
+        || !data_len.is_power_of_two()
+        || block_column_weights.is_empty()
+        || !block_column_weights.len().is_power_of_two()
+        || row_weights.is_empty()
+        || !row_weights.len().is_power_of_two()
+        || block_column_weights.len().checked_mul(row_weights.len()) != Some(data_len)
+    {
+        return Err(invalid("factored product table shape is invalid"));
+    }
+    if block_column_weights
+        .iter()
+        .chain(row_weights)
+        .any(|value| !value.is_finite())
+    {
+        return Err(invalid("factored product weights must be finite"));
+    }
+    Ok(())
+}
+
+fn checked_finite(value: f64, phase: &str) -> Result<f64, io::Error> {
+    if value.is_finite() {
+        Ok(canonicalize_zero(value))
+    } else {
+        Err(invalid(phase))
+    }
+}
+
+fn observe_relation(actual: f64, expected: f64) -> DefectObservation {
+    let difference = actual - expected;
+    DefectObservation {
+        actual_magnitude: actual.abs(),
+        expected_magnitude: expected.abs(),
+        absolute_defect: if difference.is_finite() {
+            difference.abs()
+        } else {
+            f64::MAX
+        },
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CompensatedSum {
+    sum: f64,
+    correction: f64,
+}
+
+impl CompensatedSum {
+    fn add(&mut self, value: f64) -> Result<(), io::Error> {
+        let next = checked_finite(self.sum + value, "compensated sum")?;
+        let correction = if self.sum.abs() >= value.abs() {
+            (self.sum - next) + value
+        } else {
+            (value - next) + self.sum
+        };
+        self.correction = checked_finite(self.correction + correction, "sum correction")?;
+        self.sum = next;
+        Ok(())
+    }
+
+    fn finish(self, phase: &str) -> Result<f64, io::Error> {
+        checked_finite(self.sum + self.correction, phase)
+    }
 }
 
 fn initialize_global_sumcheck_transcript(root: &[u8; 32], initial_claim: f64) -> Transcript {
@@ -1230,7 +1933,9 @@ fn summarize_global_sumcheck(
     round_defects: &[DefectObservation],
     public_coefficient_endpoint: f64,
     final_product_absolute_defect: f64,
+    weight_squared_norms: [f64; 2],
 ) -> Result<GlobalSumcheckMetrics, io::Error> {
+    let [row_weight_squared_norm, output_weight_squared_norm] = weight_squared_norms;
     let round_bytes = proof
         .rounds
         .len()
@@ -1244,6 +1949,12 @@ fn summarize_global_sumcheck(
         .iter()
         .map(|defect| defect.absolute_defect)
         .fold(0.0_f64, f64::max);
+    let functional_norm = (row_weight_squared_norm * output_weight_squared_norm).sqrt();
+    let normalized_initial_claim = if functional_norm == 0.0 {
+        0.0
+    } else {
+        initial_claim / functional_norm
+    };
     Ok(GlobalSumcheckMetrics {
         initial_claim,
         rounds: proof.rounds.len(),
@@ -1254,6 +1965,9 @@ fn summarize_global_sumcheck(
             .abs(),
         final_product_absolute_defect,
         unauthenticated_data_endpoint: endpoint.left_evaluation,
+        row_weight_squared_norm,
+        output_weight_squared_norm,
+        normalized_initial_claim,
     })
 }
 
@@ -1376,7 +2090,7 @@ fn run_spreading_study(
         fixed_dense_series.push(analyze_alteration(&fixed_dense, &code, queries)?);
 
         let mut adaptive_subspace = fixed_subspace.clone();
-        for (value, &sign) in adaptive_subspace.iter_mut().zip(&code.signs) {
+        for (value, &sign) in adaptive_subspace.iter_mut().zip(&code.sign_layers[0]) {
             *value *= sign;
         }
         let metrics = analyze_alteration(&adaptive_subspace, &code, queries)?;
@@ -1400,6 +2114,67 @@ fn run_spreading_study(
         println!(
             "adaptive_public_signs_parity_tail_coordinates={}",
             metrics.parity_tail
+        );
+    }
+    Ok(())
+}
+
+/// Empirically probes cascades `Q = (H D_k) ... (H D_1)` against attacks that
+/// concentrate either the first or final transform layer. A cascade retains
+/// one parity block, so this changes transform work but not committed bytes.
+/// These candidates are diagnostic only: the sweep is not a uniform robust-
+/// frame theorem, and it cannot authenticate a forged appended parity table.
+fn run_cascade_study(
+    width: usize,
+    queries: usize,
+    trials: usize,
+    seed: u64,
+) -> Result<(), io::Error> {
+    const MAX_LAYERS: usize = 4;
+    let subspace = balanced_subspace_vector(width)?;
+    let parity_spike = unit_spike(width)?;
+    let mut state = seed;
+
+    for layers in 1..=MAX_LAYERS {
+        let mut first_layer_attack = SpreadingSeries::default();
+        let mut final_layer_attack = SpreadingSeries::default();
+        let mut parity_spike_attack = SpreadingSeries::default();
+        for _ in 0..trials {
+            let code = RandomizedHadamardCode::with_layers(width, layers, splitmix64(&mut state))?;
+
+            let mut first_layer_source = subspace.clone();
+            for (value, &sign) in first_layer_source.iter_mut().zip(&code.sign_layers[0]) {
+                *value *= sign;
+            }
+            first_layer_attack.push(analyze_alteration(&first_layer_source, &code, queries)?);
+
+            let mut final_layer_source = subspace.clone();
+            for (value, &sign) in final_layer_source
+                .iter_mut()
+                .zip(&code.sign_layers[layers - 1])
+            {
+                *value *= sign;
+            }
+            if layers > 1 {
+                code.transpose_prefix_in_place(&mut final_layer_source, layers - 1)?;
+            }
+            final_layer_attack.push(analyze_alteration(&final_layer_source, &code, queries)?);
+
+            let parity_spike_source = code.transpose_encode_vector(&parity_spike)?;
+            parity_spike_attack.push(analyze_alteration(&parity_spike_source, &code, queries)?);
+        }
+
+        print_spreading_series(
+            &format!("cascade_{layers}_first_layer_subspace"),
+            &mut first_layer_attack,
+        );
+        print_spreading_series(
+            &format!("cascade_{layers}_final_layer_subspace"),
+            &mut final_layer_attack,
+        );
+        print_spreading_series(
+            &format!("cascade_{layers}_parity_spike"),
+            &mut parity_spike_attack,
         );
     }
     Ok(())
@@ -1599,12 +2374,107 @@ mod tests {
     }
 
     #[test]
+    fn cascaded_hadamard_transpose_is_an_adjoint() -> Result<(), Box<dyn Error>> {
+        let code = RandomizedHadamardCode::with_layers(256, 3, 9)?;
+        let left = random_unit_vector(256, 11)?;
+        let right = random_unit_vector(256, 13)?;
+        let transformed_left = code.encode_vector(&left)?;
+        let transposed_right = code.transpose_encode_vector(&right)?;
+        let forward_inner_product = dot(&transformed_left, &right)?;
+        let transpose_inner_product = dot(&left, &transposed_right)?;
+        assert!((forward_inner_product - transpose_inner_product).abs() < 1.0e-14);
+        assert!((squared_norm(&left) - squared_norm(&transformed_left)).abs() < 1.0e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn one_layer_structured_adjoint_has_closed_form() -> Result<(), Box<dyn Error>> {
+        let width = 256;
+        let code = RandomizedHadamardCode::new(width, 15)?;
+        let point = [0.3125, 0.625, 0.375, 0.6875, 0.5, 0.25, 0.5625, 0.4375];
+        let output_weights = equality_weights(&point)?;
+        let actual = code.transpose_encode_vector(&output_weights)?;
+        let normalization = 1.0 / (width as f64).sqrt();
+        for (index, (&actual_value, &sign)) in actual.iter().zip(&code.sign_layers[0]).enumerate() {
+            let mut expected = sign * normalization;
+            for (coordinate_index, &coordinate) in point.iter().enumerate() {
+                let bit = point.len() - coordinate_index - 1;
+                if (index >> bit) & 1 == 1 {
+                    expected *= 1.0 - 2.0 * coordinate;
+                }
+            }
+            assert!((actual_value - expected).abs() < 1.0e-16);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn factored_sumcheck_matches_materialized_reference() -> Result<(), Box<dyn Error>> {
+        let rows = 4;
+        let outer = 8;
+        let data = generate_source(rows * outer, rows * outer, 17)?;
+        let row_weights = equality_weights(&[0.375, 0.625])?;
+        let outer_weights = equality_weights(&[0.25, 0.75, 0.5])?;
+        let coefficients = materialize_factored_coefficients(&outer_weights, &row_weights)?;
+        let reference_claim = ssv_fast::product_sum(&data, &coefficients)?;
+        let factored_claim = factored_product_sum(&data, &outer_weights, &row_weights)?;
+        assert!((reference_claim - factored_claim).abs() < 1.0e-15);
+
+        let challenge = |round: usize, _: &QuadraticBernstein| {
+            const POINT: [f64; 5] = [0.375, 0.625, 0.25, 0.75, 0.5];
+            POINT[round]
+        };
+        let (reference_proof, reference_endpoint) = ssv_fast::prove_product_owned(
+            data.clone(),
+            coefficients.clone(),
+            reference_claim,
+            challenge,
+        )?;
+        let first_round = factored_product_round(&data, &outer_weights, &row_weights)?;
+        let (factored_proof, factored_endpoint) = prove_factored_product_owned(
+            data,
+            outer_weights,
+            row_weights,
+            factored_claim,
+            first_round,
+            challenge,
+        )?;
+        assert_eq!(reference_proof.rounds.len(), factored_proof.rounds.len());
+        for (reference, factored) in reference_proof.rounds.iter().zip(&factored_proof.rounds) {
+            for (&reference_value, &factored_value) in
+                reference.coefficients.iter().zip(&factored.coefficients)
+            {
+                assert!((reference_value - factored_value).abs() < 1.0e-14);
+            }
+        }
+        assert!(
+            (reference_endpoint.left_evaluation - factored_endpoint.left_evaluation).abs()
+                < 1.0e-15
+        );
+        let public_endpoint = evaluate_mle(&coefficients, &factored_endpoint.point)?;
+        assert!((public_endpoint - factored_endpoint.right_evaluation).abs() < 1.0e-15);
+        let verification = verify_product(
+            coefficients.len(),
+            factored_claim,
+            &factored_proof,
+            challenge,
+        )?;
+        assert!(
+            verification
+                .round_defects
+                .iter()
+                .all(|defect| defect.absolute_defect < 1.0e-14)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn public_signs_admit_balanced_subspace_attack() -> Result<(), Box<dyn Error>> {
         let width = 256;
         let code = RandomizedHadamardCode::new(width, 13)?;
         let fixed_spike = analyze_alteration(&unit_spike(width)?, &code, 16)?;
         let mut adaptive = balanced_subspace_vector(width)?;
-        for (value, &sign) in adaptive.iter_mut().zip(&code.signs) {
+        for (value, &sign) in adaptive.iter_mut().zip(&code.sign_layers[0]) {
             *value *= sign;
         }
         let attacked = analyze_alteration(&adaptive, &code, 16)?;
@@ -1635,6 +2505,32 @@ mod tests {
         let combined_parity = code.encode_vector(&combined[..columns])?;
         let defects = compare_vectors(&combined[columns..], &combined_parity)?;
         assert!(defects.maximum_absolute < 1.0e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn structured_functional_observes_honest_adjoint_relation() -> Result<(), Box<dyn Error>> {
+        let rows = 8;
+        let columns = 16;
+        let source_row = generate_source(rows * columns, rows * columns, 21)?;
+        let code = RandomizedHadamardCode::with_layers(columns, 2, 23)?;
+        let parity = code.encode_rows_to_columns(&source_row, rows)?;
+        let source = transpose_row_to_column(&source_row, rows, columns)?;
+        let tree = build_column_tree(&source, &parity, rows, columns, 2 * columns)?;
+        let row_weights = signed_dyadic_weights(rows, 25)?;
+        let combined = combine_columns(&source, &parity, rows, columns, 2 * columns, &row_weights)?;
+        let metrics = structured_functional_control(
+            &combined[..columns],
+            &combined[columns..],
+            &code,
+            rows,
+            &tree.root(),
+        )?;
+        assert!(metrics.initial_claim.abs() < 1.0e-14);
+        assert!(
+            (metrics.output_weight_squared_norm - metrics.source_weight_squared_norm).abs()
+                < 1.0e-14
+        );
         Ok(())
     }
 
@@ -1731,6 +2627,16 @@ mod tests {
     }
 
     #[test]
+    fn forged_appended_parity_defeats_cascaded_column_sampling() -> Result<(), Box<dyn Error>> {
+        let code = RandomizedHadamardCode::with_layers(4096, 3, 55)?;
+        let metrics = forged_parity_cancellation_attack(&code, 256, 16, 57)?;
+        assert_eq!(metrics.source_defect_coordinates, 1);
+        assert!(metrics.parity_maximum_absolute_defect < 1.0e-14);
+        assert!(metrics.query_miss_probability > 0.998);
+        Ok(())
+    }
+
+    #[test]
     fn global_coefficient_endpoint_factorizes() -> Result<(), Box<dyn Error>> {
         let rows = 8;
         let columns = 16;
@@ -1740,9 +2646,11 @@ mod tests {
         let source = transpose_row_to_column(&source_row, rows, columns)?;
         let tree = build_column_tree(&source, &parity, rows, columns, 2 * columns)?;
         let tables =
-            build_global_relation_tables(source, parity, rows, columns, &code.signs, &tree.root())?;
+            build_global_relation_tables(source, parity, rows, columns, &code, &tree.root())?;
         let point = vec![0.375; (2 * rows * columns).ilog2() as usize];
-        let direct = evaluate_mle(&tables.coefficients, &point)?;
+        let coefficients =
+            materialize_factored_coefficients(&tables.block_column_weights, &tables.row_weights)?;
+        let direct = evaluate_mle(&coefficients, &point)?;
         let factored = evaluate_global_coefficient_endpoint(
             &point,
             rows,
@@ -1769,10 +2677,18 @@ mod tests {
             parity.clone(),
             rows,
             columns,
-            &code.signs,
+            &code,
             &honest_tree.root(),
         )?;
-        assert!(product_sum(&honest.data, &honest.coefficients)?.abs() < 1.0e-14);
+        assert!(
+            factored_product_sum(
+                &honest.data,
+                &honest.block_column_weights,
+                &honest.row_weights,
+            )?
+            .abs()
+                < 1.0e-14
+        );
 
         parity[0] += 1.0;
         let altered_tree = build_column_tree(&source, &parity, rows, columns, 2 * columns)?;
@@ -1781,10 +2697,18 @@ mod tests {
             parity,
             rows,
             columns,
-            &code.signs,
+            &code,
             &altered_tree.root(),
         )?;
-        assert!(product_sum(&altered.data, &altered.coefficients)?.abs() > 0.1);
+        assert!(
+            factored_product_sum(
+                &altered.data,
+                &altered.block_column_weights,
+                &altered.row_weights,
+            )?
+            .abs()
+                > 1.0e-6
+        );
         Ok(())
     }
 
@@ -1800,18 +2724,37 @@ mod tests {
         let source = transpose_row_to_column(&source_row, rows, columns)?;
         let tree = build_column_tree(&source, &parity, rows, columns, 2 * columns)?;
         let tables =
-            build_global_relation_tables(source, parity, rows, columns, &code.signs, &tree.root())?;
-        assert!(product_sum(&tables.data, &tables.coefficients)?.abs() > 0.1);
+            build_global_relation_tables(source, parity, rows, columns, &code, &tree.root())?;
+        assert!(
+            factored_product_sum(
+                &tables.data,
+                &tables.block_column_weights,
+                &tables.row_weights,
+            )?
+            .abs()
+                > 1.0e-6
+        );
 
         // The alleged sumcheck table is not linked to the committed root. A
         // malicious prover substitutes zeros while retaining the public
         // coefficient table derived from that root.
         let fake_data = vec![0.0; tables.data.len()];
+        let first_round = factored_product_round(
+            &fake_data,
+            &tables.block_column_weights,
+            &tables.row_weights,
+        )?;
         let mut prover_transcript = initialize_global_sumcheck_transcript(&tree.root(), 0.0);
-        let (proof, endpoint) =
-            prove_product_owned(fake_data, tables.coefficients, 0.0, |round, polynomial| {
+        let (proof, endpoint) = prove_factored_product_owned(
+            fake_data,
+            tables.block_column_weights,
+            tables.row_weights.clone(),
+            0.0,
+            first_round,
+            |round, polynomial| {
                 global_sumcheck_challenge(&mut prover_transcript, round, polynomial)
-            })?;
+            },
+        )?;
         let mut verifier_transcript = initialize_global_sumcheck_transcript(&tree.root(), 0.0);
         let verification = verify_product(tables.data.len(), 0.0, &proof, |round, polynomial| {
             global_sumcheck_challenge(&mut verifier_transcript, round, polynomial)

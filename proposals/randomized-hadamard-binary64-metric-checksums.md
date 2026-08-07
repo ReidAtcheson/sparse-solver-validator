@@ -22,7 +22,7 @@ It should be read with:
 
 ## 1. Decision summary
 
-Investigate two related constructions without conflating their guarantees:
+The current experiments separate four claims that must not be conflated:
 
 1. A public systematic frame
 
@@ -37,14 +37,31 @@ Investigate two related constructions without conflating their guarantees:
    the desired randomized spreading property. Authenticating those fresh
    checksums against an earlier source commitment is the central protocol gap.
 
+3. A post-root tensor functional gives a particularly natural metric check:
+
+   ```text
+   chi(r)^T H D d = (D H chi(r))^T d.
+   ```
+
+   For one Hadamard layer the adjoint weights have a closed product form, and
+   the measured arithmetic costs only a short transform plus two inner
+   products. This is a useful real-linear identity, but a Merkle root does not
+   authenticate either dense inner product.
+
+4. Cascading independently signed Hadamard layers improves every registered
+   public-transform concentration attack at low extra cost. It still cannot
+   authenticate an arbitrary appended parity table. An explicit attack makes
+   every parity query pass while leaving only one systematic coordinate false.
+
 The research objective is a staged metric transcript in which every alleged
 discrepancy is fixed before the randomness used to measure it. A successful
 argument need not reject every nonzero discrepancy. It should prove that a
 small checksum-energy observation permits only a small change in the final
 squared-residual metric.
 
-The initial implementation measures the first construction and demonstrates
-why it is not already the second. It does not register a `ProofProtocol`.
+The implementation measures all four distinctions, including a factor-aware
+global sumcheck and attacks against both local folding and an unbound endpoint.
+It does not register a `ProofProtocol`.
 
 ## 2. Why randomized Hadamard is attractive
 
@@ -425,24 +442,53 @@ code encodes a short linear function by its complete truth table, whereas this
 proposal applies a square Walsh transform to an arbitrary length-`C` real
 vector.
 
-### 6.4 Global sumcheck candidate
+### 6.4 Structured global MLE candidate
 
-The stronger next candidate is a global contraction of the appended relation.
-After `C1`, derive row and column weights `lambda` and `L` and supervise
+The stronger candidate is a global contraction of the appended relation.
+After `C1`, derive row and column MLE points `r_R` and `r_C`, form their
+equality vectors `chi`, and supervise
 
 ```text
-s = lambda^T (P_hat - U D H^T) L
-  = lambda^T P_hat L - lambda^T U (D H^T L).
+s = chi(r_R)^T (P_hat - U Q^T) chi(r_C)
+  = MLE_(P_hat - U Q^T)(r_R, r_C),
+
+Q = H D.
 ```
 
-Equivalently, for one vector orientation this contains the proposed quantity
-`L^T (H D) d`. A sumcheck over the table and Walsh butterfly wiring can reduce
-all checksum cells to a few scalar claims. The Walsh recursion makes the
-public wiring regular, and geometrically shrinking table folds suggest an
-`O(R C)` prover pass after checksum generation rather than another global FFT.
+For one vector orientation this is exactly the proposed quantity
+`y^T (H D) d` with structured `y = chi(r_C)`. Since normalized Walsh--Hadamard
+is symmetric,
 
-This global reduction removes the particular one-unchecked-edge weakness: a
-sparse local lie contributes to a random aggregate fixed only after `C1`.
+```text
+chi(r_C)^T H D d = (D H chi(r_C))^T d.
+```
+
+Moreover, if `v` indexes the input coordinate in binary,
+
+```text
+[D H chi(r_C)]_v
+  = D_v / sqrt(C) * product_(i: v_i = 1) (1 - 2 r_(C,i)).
+```
+
+Thus the transform adjoint itself has a direct metric and tensor
+interpretation. Independent per-coordinate signs prevent its MLE at a second
+arbitrary point from collapsing to one `O(log C)` product, but materializing
+the adjoint is only `O(C)` work at the measured `C = 4096`.
+
+The complete public coefficient table factors as
+
+```text
+[chi(r_C) || -Q^T chi(r_C)] tensor chi(r_R).
+```
+
+The factor-aware prover never materializes that `2 R C` table. It computes and
+caches the first product-sumcheck round, defines the initial metric claim as
+the sum of that round's endpoints, and then folds only the dense private data.
+This preserves `O(R C)` prover work and `O(R + C)` public endpoint work.
+
+Within a correctly bound data oracle, this global reduction removes the
+particular one-unchecked-edge weakness: a sparse local lie contributes to a
+random aggregate fixed only after `C1`.
 It also matches the intended metric semantics. Instead of one Boolean test,
 the transcript can report the observed contraction, scale information,
 roundoff enclosure, and the resulting confidence bound on a norm of `E`.
@@ -478,10 +524,42 @@ mechanism. The concrete alternatives to compare are:
 4. a different commitment that natively authenticates linear/MLE queries.
 
 The executable implements this transcript-shaped approximate-sumcheck cost
-surrogate. It stops at, labels, and measures the private endpoint claim and
-prints `global_sumcheck_data_endpoint_authenticated=false`. The next target is
-to compare endpoint-binding mechanisms; the surrogate must not be counted as a
-completed proof in the meantime.
+surrogate. It also measures the much cheaper scalar functional directly on an
+honest row combination and prints
+`structured_functional_data_authenticated=false`. The sumcheck path stops at,
+labels, and measures the private endpoint claim and prints
+`global_sumcheck_data_endpoint_authenticated=false`. Neither scalar may be
+counted as a completed proof.
+
+### 6.5 Cascaded transform control
+
+One response to the single-basis public-sign attack is to retain one parity
+block but replace `Q = H D` by
+
+```text
+Q_k = (H D_k) ... (H D_1).
+```
+
+At `C = 4096`, two layers change the median 16-query miss probability of the
+registered first-layer Walsh-subspace attack from `0.7771` to `1.42e-3`. A
+final-layer subspace attack and a forced parity spike measured `4.39e-4` and
+`2.41e-3`, respectively. These are finite attack measurements, not a uniform
+numerical erasure-robustness theorem.
+
+Even a perfect uniform theorem for `[I || Q_k]` would not authenticate an
+arbitrary `P_hat`. Let `U = 0`, fix a false combination `v = e_0`, and choose a
+row with `alpha_i != 0`. After `Q_k` is public, set
+
+```text
+P_hat[i, :] = Q_k v / alpha_i
+```
+
+and every other parity row to zero. Then `alpha^T P_hat = Q_k v`: every parity
+query passes, and only the systematic coordinate carrying `v` is false.
+Sixteen queries among `2 C = 8192` columns miss it with probability
+`0.998046875`, independently of the layer count. Cascades address spreading
+only after the transform relation is authenticated; they are not that
+authentication.
 
 ## 7. Initial cost measurement
 
@@ -500,32 +578,43 @@ On the development machine it measured:
 
 | Component | Median |
 | --- | ---: |
-| Hadamard encoding into committed layout | 6.617 ms |
-| Systematic row-to-column transpose | 2.432 ms |
-| Complete 16 MiB column/Merkle commitment | 16.175 ms |
-| Encoded row combination | 1.001 ms |
-| Combination Hadamard transform | 0.011 ms |
-| Opening extraction | 0.056 ms |
-| Defect scan | 0.022 ms |
-| Base prover-side surrogate | 26.410 ms |
-| Global relation-table construction and initial contraction | 20.664 ms |
-| Global 21-round product sumcheck | 29.125 ms |
-| Staged prover-side surrogate | 75.692 ms |
+| Hadamard encoding into committed layout | 8.378 ms |
+| Systematic row-to-column transpose | 4.168 ms |
+| Complete 16 MiB column/Merkle commitment | 16.465 ms |
+| Encoded row combination | 1.012 ms |
+| Combination Hadamard transform | 0.020 ms |
+| Opening extraction | 0.078 ms |
+| Defect scan | 0.037 ms |
+| Base prover-side surrogate | 30.210 ms |
+| Structured-functional arithmetic control | 0.032 ms |
+| Base plus structured control | 30.243 ms |
+| Global data/factor construction plus cached first round | 17.789 ms |
+| Remaining factor-aware product sumcheck | 13.340 ms |
+| Endpoint-incomplete staged surrogate | 61.887 ms |
 | Opening verification | 0.071 ms |
-| Global sumcheck replay and public endpoint | 0.052 ms |
+| Global sumcheck replay and public endpoint | 0.050 ms |
 
-The 25 staged totals ranged from `72.259` to `80.281` ms. The naive opening was
+The 25 staged totals ranged from `58.792` to `67.604` ms. The naive opening was
 `72,352` bytes and the global sumcheck added `520` bytes, for a `72,872`-byte
-surrogate artifact. A cold staged process peaked at `52,284` KiB RSS. The
+surrogate artifact. A cold staged process peaked at `36,192` KiB RSS. The
 maximum honest transform/combine defect remained `1.39e-16`; the honest global
-relation contraction was `-1.67e-17`.
+relation contraction was zero in the cached-first-round summation order, with
+a maximum later round defect of `5.42e-20`.
+
+The 0.032 ms structured control observed a normalized defect of `3.70e-16`.
+It is the desired arithmetic shape, but it is explicitly unauthenticated. A
+same-executable materialized-coefficient control measured `79.611` ms staged
+and `44,360` KiB RSS. Factoring therefore reduced the global extension by
+`38.6%`, the staged total by `22.3%`, and peak RSS by `18.4%` without changing
+the 520-byte sumcheck transcript.
 
 The endpoint-incomplete staged cost is approximately:
 
-- `2.48x` the earlier `30.491` ms half-bandwidth-1 factor-and-solve;
-- `0.306x` the earlier `247.374` ms half-bandwidth-32 factor-and-solve;
-- `0.045x` the `1.66--1.69` second complete chunked/unit-circle proof; and
-- `4.52x` the `16.739` ms sparse-code commitment surrogate on the separate
+- `2.03x` the earlier `30.491` ms half-bandwidth-1 factor-and-solve;
+- `0.250x` the earlier `247.374` ms half-bandwidth-32 factor-and-solve;
+- about `0.037x` the `1.66--1.69` second complete chunked/unit-circle proof;
+  and
+- `3.70x` the `16.739` ms sparse-code commitment surrogate on the separate
   Brakedown-shaped research branch.
 
 These cross-branch measurements share the same development machine but are not
@@ -537,12 +626,10 @@ handling remain outside the staged timer.
 
 The full parity block doubles source storage before tree overhead. The fused
 row transform writes parity directly into committed column-major storage;
-source transposition remains explicit and measured. The generic global
-sumcheck consumes those two column-major allocations into a 16 MiB mutable data
-table and materializes a second 16 MiB coefficient table. This explains most
-of the increase from the earlier `27,616` KiB base-only RSS. A factor-aware
-sumcheck could avoid the coefficient table, but optimizing an
-endpoint-incomplete protocol is secondary to choosing its binding mechanism.
+source transposition remains explicit and measured. The factor-aware global
+sumcheck consumes those two allocations into a 16 MiB mutable data table and
+retains only `2 C + R` coefficient factors. The optimization makes the cost of
+the remaining authentication gap clearer; it does not close that gap.
 
 ## 8. Query-count and escape-cost illustration
 
@@ -578,10 +665,13 @@ Every candidate must test at least:
 - one-coordinate source alterations;
 - balanced Walsh-subspace indicators;
 - vectors constructed from transform basis columns after public seeds;
+- vectors concentrating the first, final, and intermediate layers of a public
+  Hadamard cascade;
 - dense random alterations fixed before transform randomness;
 - optimized vectors minimizing a selected encoded tail quantile;
 - small discrepancies distributed across every coordinate;
 - parity matrices inconsistent with their systematic source;
+- rank-one appended parity tables chosen to cancel a false row combination;
 - row errors selected to cancel under the MLE row challenge;
 - Fiat--Shamir grinding and selective aborts; and
 - scale-separated, subnormal, overflow-adjacent, and non-finite arithmetic.

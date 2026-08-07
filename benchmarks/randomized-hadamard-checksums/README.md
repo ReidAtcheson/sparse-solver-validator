@@ -4,7 +4,7 @@ This benchmark measures the isolated construction proposed in
 [randomized-Hadamard metric checksums](../../proposals/randomized-hadamard-binary64-metric-checksums.md).
 It is not a proof benchmark and makes no soundness claim.
 
-The example implements:
+The primary example implements:
 
 ```text
 Enc_D(u) = [u || H D u]
@@ -13,8 +13,21 @@ Enc_D(u) = [u || H D u]
 for every row of a canonical binary64 matrix, commits complete encoded columns
 under a flat BLAKE3 Merkle tree, prepares one row combination, encodes that
 combination, extracts naive complete-column openings, and authenticates the
-sampled linearity checks. It now also measures a global approximate sumcheck
-for one post-commitment contraction of the complete checksum relation.
+sampled linearity checks. It also measures:
+
+- the post-root structured functional
+
+  ```text
+  chi(r)^T p - (Q^T chi(r))^T u,    Q = H D,
+  ```
+
+  as an explicitly unauthenticated arithmetic control;
+- a global approximate sumcheck for the random MLE of the complete checksum
+  discrepancy;
+- a factor-aware sumcheck prover that never materializes the `2 R C` public
+  coefficient table; and
+- cascades `Q = (H D_k) ... (H D_1)` that retain one parity block while
+  applying several independently signed Hadamard layers.
 
 The opening-query seed hashes both the matrix root and the exact claimed row
 combination, so the measured opening indices are derived only after that claim
@@ -26,11 +39,15 @@ It also compares:
 - a balanced Walsh-subspace alteration constructed after the public signs are
   known; and
 - a sparse codeword-switch attack against a tempting recursive odd/even local
-  fold test.
+  fold test; and
+- a forged appended-parity attack that defeats column sampling independently
+  of the number of Hadamard layers.
 
-The latter is an explicit falsification of a uniform spreading claim for one
-public randomized-Hadamard basis. It does not contradict fixed-vector RHT
-concentration.
+The public-sign attack is an explicit falsification of a uniform spreading
+claim for one public randomized-Hadamard basis. It does not contradict
+fixed-vector RHT concentration. The appended-parity attack is stronger in a
+different direction: even an empirically well-spread cascade cannot help when
+the alleged parity table is not authenticated as the transform of the source.
 
 ## Environment
 
@@ -45,8 +62,11 @@ concentration.
 - Base prover timer: includes output allocation, full Hadamard parity
   generation, systematic transposition, complete hashing, combination
   preparation, defect scan, and opening extraction
-- Staged prover timer: adds construction of one global relation/weight table,
-  its initial contraction, and a 21-round binary64 product sumcheck
+- Structured-functional timer: derives a tensor MLE weight after the root,
+  applies the Hadamard adjoint, and evaluates two length-4096 inner products
+- Staged prover timer: adds construction of one global relation table, a
+  cached first round, and the remaining 20 rounds of a 21-round binary64
+  product sumcheck; the public coefficient table remains factored
 - Verification: timed separately
 
 The source values are deterministic dyadic values spanning `[-1, 1)`. Row and
@@ -84,19 +104,21 @@ Measured timing:
 
 | Component | Minimum | Median | Maximum |
 | --- | ---: | ---: | ---: |
-| Hadamard encoding into column layout | 6.072 ms | 6.617 ms | 7.118 ms |
-| Systematic row-to-column transpose | 2.316 ms | 2.432 ms | 3.713 ms |
-| Complete column/Merkle commitment | 15.035 ms | 16.175 ms | 17.608 ms |
-| Encoded row combination | 0.928 ms | 1.001 ms | 1.071 ms |
-| Combination Hadamard transform | 0.011 ms | 0.011 ms | 0.023 ms |
-| Opening extraction | 0.053 ms | 0.056 ms | 0.060 ms |
-| Defect scan and terminal claim | 0.021 ms | 0.022 ms | 0.040 ms |
-| **Base prover-side surrogate** | **24.437 ms** | **26.410 ms** | **28.823 ms** |
-| Global relation-table construction and initial contraction | 19.153 ms | 20.664 ms | 21.846 ms |
-| Global product sumcheck | 26.696 ms | 29.125 ms | 30.179 ms |
-| **Staged prover-side surrogate** | **72.259 ms** | **75.692 ms** | **80.281 ms** |
-| Opening authentication and checks | 0.067 ms | 0.071 ms | 0.102 ms |
-| Global sumcheck replay and public-factor endpoint | 0.049 ms | 0.052 ms | 0.083 ms |
+| Hadamard encoding into column layout | 7.827 ms | 8.378 ms | 9.117 ms |
+| Systematic row-to-column transpose | 3.903 ms | 4.168 ms | 4.542 ms |
+| Complete column/Merkle commitment | 15.440 ms | 16.465 ms | 18.067 ms |
+| Encoded row combination | 0.954 ms | 1.012 ms | 1.496 ms |
+| Combination Hadamard transform | 0.011 ms | 0.020 ms | 0.033 ms |
+| Opening extraction | 0.067 ms | 0.078 ms | 0.144 ms |
+| Defect scan and terminal claim | 0.034 ms | 0.037 ms | 0.110 ms |
+| **Base prover-side surrogate** | **28.878 ms** | **30.210 ms** | **32.101 ms** |
+| Structured-functional arithmetic control | 0.030 ms | 0.032 ms | 0.075 ms |
+| **Base plus structured control** | **28.909 ms** | **30.243 ms** | **32.140 ms** |
+| Global data/factor construction plus cached first round | 15.965 ms | 17.789 ms | 18.968 ms |
+| Remaining factor-aware product sumcheck | 12.436 ms | 13.340 ms | 17.800 ms |
+| **Endpoint-incomplete staged surrogate** | **58.792 ms** | **61.887 ms** | **67.604 ms** |
+| Opening authentication and checks | 0.067 ms | 0.071 ms | 0.089 ms |
+| Global sumcheck replay and public-factor endpoint | 0.046 ms | 0.050 ms | 0.068 ms |
 
 Representation and artifact measurements:
 
@@ -106,10 +128,12 @@ Representation and artifact measurements:
 | Hadamard parity storage | 8,388,608 B |
 | Retained Merkle tree | 524,288 B |
 | Naive opening | 72,352 B |
+| Structured-functional scalar increment | 8 B |
 | Global sumcheck increment | 520 B |
 | Staged surrogate artifact | 72,872 B |
 | Staged artifact / raw source vector | 0.8687% |
-| Peak RSS, one cold staged process | 52,284 KiB |
+| Peak RSS, one cold factored staged process | 36,192 KiB |
+| Peak RSS, materialized-coefficient control | 44,360 KiB |
 | Butterfly additions/subtractions | 12,582,912 |
 
 The retained root was
@@ -146,43 +170,83 @@ The RSS measurement used:
 Peak RSS is a single process-wide maximum, not a repeated median. Parity is
 written directly into committed column-major storage so the implementation
 does not retain a second row-major parity copy. The canonical source still
-requires a measured row-to-column transpose. The global sumcheck consumes the
-column-major source and parity allocations into a 16 MiB mutable data table and
-materializes a second 16 MiB coefficient table. The earlier base-only process
-peaked at 27,616 KiB; the endpoint-incomplete global extension therefore has a
-material memory cost even though it adds only 520 artifact bytes.
+requires a measured row-to-column transpose. The factor-aware global sumcheck
+consumes those allocations into one 16 MiB mutable data table and retains only
+`2 C + R` public factors. It does not allocate the former 16 MiB coefficient
+table. The process peak fell by 8,168 KiB relative to the same executable's
+materialized-coefficient control; allocator phase overlap means this is less
+than the table's nominal size.
 
 ## Staged append and global sumcheck
 
 The staged candidate first binds the source-side checkpoint, derives the signs
 `D`, appends and commits the alleged checksum table `P_hat`, and only then
-derives random contraction weights. For row weights `lambda` and column weights
-`L`, the measured global claim is
+derives tensor points `r_R` and `r_C`. With MLE equality vectors `chi`, the
+measured global claim is the random multilinear evaluation
 
 ```text
-lambda^T P_hat L - lambda^T U (D H^T L).
+chi(r_R)^T P_hat chi(r_C)
+    - chi(r_R)^T U Q^T chi(r_C)
+  = MLE_(P_hat - U Q^T)(r_R, r_C),
+
+Q = H D                         (one layer),
+Q = (H D_k) ... (H D_1)        (a cascade).
 ```
 
-The implementation represents this as one product sum over the concatenated
-`[P_hat || U]` table and a public factored coefficient table. A 21-round
-binary64 sumcheck reduces 2,097,152 products to one private table evaluation
-and one public coefficient evaluation. The public coefficient endpoint is
-recomputed in `O(R + C)` work from its row/column factors rather than by
-materializing the full table in the validator.
+For one layer, the column adjoint has the explicit real-valued form
+
+```text
+[D H chi(r_C)]_v
+  = D_v / sqrt(C) * product_(i: v_i = 1) (1 - 2 r_(C,i)).
+```
+
+This is the structured-`y` identity under study. It is linear algebra over
+binary64, not a finite-field analogy. Arbitrary independent signs `D_v` do
+destroy a further tensor factorization at a fresh MLE endpoint, but the full
+length-`C` adjoint costs only `O(C)` storage and verifier work here.
+
+The implementation represents the complete relation as one product sum over
+the concatenated `[P_hat || U]` table. Its public coefficient table factors as
+
+```text
+[chi(r_C) || -Q^T chi(r_C)] tensor chi(r_R).
+```
+
+The optimized prover retains those one-dimensional factors rather than a
+`2 R C` coefficient allocation. It computes the initial claim as the sum of
+the cached first round's two endpoints, then folds only the dense private data
+table. A 21-round binary64 sumcheck reduces 2,097,152 products to one private
+table evaluation and one public coefficient evaluation. The validator
+recomputes the public endpoint in `O(R + C)` work.
 
 For the honest primary input:
 
 | Quantity | Value |
 | --- | ---: |
-| Initial metric contraction | `-1.6669608401964631e-17` |
-| Maximum sumcheck round absolute defect | `1.6669608401964631e-17` |
+| Initial metric contraction in cached-round order | `0.0` |
+| Maximum sumcheck round absolute defect | `5.421010862427522e-20` |
 | Public factored endpoint disagreement | `1.0587911840678754e-22` |
-| Final product absolute defect | `6.462348535570529e-27` |
+| Final product absolute defect | `2.5849394142282115e-26` |
 | Sumcheck rounds | 21 |
 | Incremental transcript payload | 520 B |
 
+The even cheaper structured-functional control applies the same column
+functional directly to the already prepared row combination:
+
+```text
+chi(r_C)^T p - (Q^T chi(r_C))^T u.
+```
+
+It took a median `0.032` ms and observed `7.70e-18`, or `3.70e-16` after
+normalizing the functional to unit 2-norm. This is close to the desired
+arithmetic shape: one short adjoint transform and two length-`C` dot products.
+It is deliberately printed with
+`structured_functional_data_authenticated=false`. Counting its 8-byte scalar
+as a proof would assume precisely the linear authentication primitive that is
+still missing.
+
 This is a useful arithmetic and cost result, not a complete proof. The final
-private table MLE was `-5.320273864224703e-5`, and the executable deliberately
+private table MLE was `3.187459924683081e-4`, and the executable deliberately
 prints
 
 ```text
@@ -201,6 +265,23 @@ table with a material checksum mutation, substitutes an uncommitted all-zero
 private table in the sumcheck, and obtains zero defects in every round and at
 the terminal product. The missing opening must therefore bind the private
 endpoint to `[P_hat || U]`; transcript-binding the root alone is insufficient.
+
+### Factor-aware control
+
+The `--materialize-global-coefficients` flag retains the previous dense public
+coefficient table as a same-executable control. At the primary shape:
+
+| Component | Factored median | Materialized median |
+| --- | ---: | ---: |
+| Global preparation and initial claim | 17.789 ms | 21.832 ms |
+| Global product sumcheck | 13.340 ms | 28.838 ms |
+| Global extension only | 31.129 ms | 50.671 ms |
+| Complete staged surrogate | 61.887 ms | 79.611 ms |
+| Cold process peak RSS | 36,192 KiB | 44,360 KiB |
+
+Factoring reduced the measured global extension by `38.6%`, the complete
+staged time by `22.3%`, and peak RSS by `18.4%`. It changes neither proof bytes
+nor the unauthenticated endpoint status.
 
 ### Why local odd/even folding is insufficient
 
@@ -225,6 +306,45 @@ is derived after the appended root and aggregates every relation cell. Its MLE
 endpoint still needs a commitment mechanism such as the existing unit-circle
 control, a Brakedown-shaped sparse proximity layer, or another linear/MLE
 opening commitment.
+
+### Cascades improve spreading, not authentication
+
+The executable also evaluates
+
+```text
+Q_k = (H D_k) ... (H D_1)
+```
+
+with one systematic and one parity block. A second layer greatly improves the
+three registered attacks against the public square transform:
+
+| Adaptive construction | One-layer median miss | Two-layer median miss |
+| --- | ---: | ---: |
+| Concentrate the first layer on a Walsh subspace | `0.7771` | `1.42e-3` |
+| Concentrate the final layer on a Walsh subspace | `0.7771` | `4.39e-4` |
+| Force the final parity to one spike | `1.50e-5` | `2.41e-3` |
+
+The corresponding two-layer median tail fractions were `0.3359`, `0.3828`,
+and `0.3136`. This is encouraging empirical erasure robustness, not a uniform
+lower-tail theorem. The two-layer staged median was `64.159` ms versus
+`61.887` ms for one layer; proof bytes were unchanged because intermediate
+layers are not committed.
+
+More importantly, cascades do not close the appended-table gap. Set the
+committed source table to zero, fix a false claimed combination `v = e_0`, and
+choose any row with nonzero challenge weight `alpha_i`. After `Q` is known, a
+malicious prover can set
+
+```text
+P_hat[i, :] = Q v / alpha_i
+```
+
+and all other parity rows to zero. Then `alpha^T P_hat = Q v` exactly in the
+executable, so every parity-column query passes. Only the one systematic
+coordinate where `v` differs from the zero source is marked. Sixteen queries
+among 8192 encoded columns miss it with probability `0.998046875`, for one,
+two, or more Hadamard layers. This attack is why the cascade data must not be
+presented as a solution to authentication.
 
 ## Spreading and public-transform attack
 
@@ -306,21 +426,29 @@ Earlier same-machine cross-branch measurements at one million values were:
 
 | Workload | Time | Base / workload | Staged / workload |
 | --- | ---: | ---: | ---: |
-| SciPy factor plus solve, half-bandwidth 1 | 30.491 ms | 0.87x | 2.48x |
-| SciPy factor plus solve, half-bandwidth 32 | 247.374 ms | 0.107x | 0.306x |
-| Complete chunked/unit-circle proof | 1.664--1.694 s | about 0.016x | about 0.045x |
-| Sparse Brakedown-shaped commitment surrogate | 16.739 ms | 1.58x | 4.52x |
+| SciPy factor plus solve, half-bandwidth 1 | 30.491 ms | 0.992x | 2.03x |
+| SciPy factor plus solve, half-bandwidth 32 | 247.374 ms | 0.122x | 0.250x |
+| Complete chunked/unit-circle proof | 1.664--1.694 s | about 0.018x | about 0.037x |
+| Sparse Brakedown-shaped commitment surrogate | 16.739 ms | 1.81x | 3.70x |
 
-The endpoint-incomplete staged surrogate is roughly 22 times faster than the
-current complete proof. It remains about 2.5 times the band-1 factor-and-solve,
-so it would still perturb that benchmark materially; it is about 31% of the
-band-32 solve. The comparison says that the global sumcheck arithmetic and
-artifact are plausible. It does not price the missing endpoint authentication.
+The 30.243 ms base-plus-structured control is almost exactly the earlier
+30.491 ms band-1 factor-and-solve, but the control has no linear
+authentication. The endpoint-incomplete staged surrogate is roughly 27 times
+faster than the current complete proof. It remains about twice the band-1
+factor-and-solve and one quarter of the band-32 solve. The comparison says that
+the Hadamard metric arithmetic and global sumcheck are plausible. It does not
+price the missing endpoint authentication.
 
 ## Limitations
 
 - The public transform is deliberately vulnerable to adaptive structured
   alterations.
+- Two- through four-layer cascades improve the registered adaptive spreading
+  attacks but have no uniform erasure-robustness theorem.
+- A forged appended-parity table defeats column sampling with `0.998046875`
+  miss probability even when the transform is cascaded.
+- The 0.032 ms structured-functional result assumes access to the honest dense
+  row combination and is an unauthenticated arithmetic control, not a proof.
 - The global sumcheck's final private table MLE is not authenticated. Therefore
   the experiment still has no complete mechanism authenticating fresh
   post-claim Hadamard checksums against an earlier source root.
@@ -344,15 +472,19 @@ artifact are plausible. It does not price the missing endpoint authentication.
 The example has deterministic unit tests for:
 
 - Hadamard energy preservation;
+- the three-layer transform/transpose adjoint identity;
+- the closed-form one-layer adjoint of an MLE equality vector;
+- the honest structured functional for a two-layer cascade;
 - the public-sign balanced-subspace attack;
-- encode/combine commutation up to binary64 roundoff; and
+- encode/combine commutation up to binary64 roundoff;
 - Merkle opening authentication and mutation rejection;
 - normalized odd/even fold completeness;
 - the sparse local-fold codeword-switch attack;
-- factored versus materialized public sumcheck endpoints; and
-- observation of a committed checksum mutation by the global contraction; and
-- a rejection target demonstrating that an unbound zero-table sumcheck currently
-  passes every algebraic check.
+- the factor-aware sumcheck against a materialized reference;
+- observation of a committed checksum mutation by the global contraction;
+- the forged-parity cancellation attack against a three-layer cascade; and
+- a rejection target demonstrating that an unbound zero-table sumcheck
+  currently passes every algebraic check.
 
 Run them with:
 
