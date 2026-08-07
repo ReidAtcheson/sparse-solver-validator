@@ -1,11 +1,12 @@
-//! Throughput surrogate for a Brakedown-shaped binary64 metric commitment.
+//! Binary64 experiment using Brakedown's recursive expander-code layout.
 //!
-//! The default mode deliberately implements no proof protocol and measures the
-//! minimum data movement for a systematic sparse row encoding, a column Merkle
-//! commitment, and one encoded row combination. `--residual-composition` adds
-//! the two existing binary64 sumchecks and batches their terminal MLE claims
-//! into one sampled-column opening. Neither mode instantiates a distance code
-//! or makes a proximity or soundness claim.
+//! The encoder follows Algorithm 1 of Brakedown: each level computes `y = xA`,
+//! recursively encodes `y` to `z`, computes `v = zB`, and returns `(x, z, v)`.
+//! The terminal code is a small dense systematic code. The graph shape and the
+//! fast 2%-distance parameter profile match the paper, but field coefficients
+//! are replaced by a documented binary64 dyadic grid. Consequently this is not
+//! an instantiation of Brakedown's finite-field distance theorem and makes no
+//! proximity or soundness claim.
 
 #![forbid(unsafe_code)]
 
@@ -29,28 +30,35 @@ const LEAF_DOMAIN: &[u8] = b"ssv/research/brakedown-metric/column-leaf/v1";
 const PADDING_DOMAIN: &[u8] = b"ssv/research/brakedown-metric/column-padding/v1";
 const NODE_DOMAIN: &[u8] = b"ssv/research/brakedown-metric/column-node/v1";
 const VALUES_PER_HASH_BLOCK: usize = 64;
-const RESIDUAL_PROTOCOL_LABEL: &[u8] = b"ssv/research/brakedown-residual-composition/v1";
+const THROUGHPUT_PROTOCOL_LABEL: &[u8] = b"ssv/research/brakedown-metric-throughput/v2";
+const RESIDUAL_PROTOCOL_LABEL: &[u8] = b"ssv/research/brakedown-residual-composition/v2";
+
+// Fastest parameter row reported by Brakedown for fields of at least 127 bits:
+// rate 0.704, relative distance 0.02, alpha 0.1195, beta 0.0284, and sparse
+// row weights 6 and 33. Integer ratios keep every layout decision deterministic.
+const BRAKEDOWN_RATE_NUMERATOR: usize = 88;
+const BRAKEDOWN_RATE_DENOMINATOR: usize = 125;
+const BRAKEDOWN_ALPHA_NUMERATOR: usize = 239;
+const BRAKEDOWN_ALPHA_DENOMINATOR: usize = 2_000;
+const BRAKEDOWN_BETA_NUMERATOR: usize = 71;
+const BRAKEDOWN_BETA_DENOMINATOR: usize = 2_500;
+const BRAKEDOWN_A_ROW_WEIGHT: usize = 6;
+const BRAKEDOWN_B_ROW_WEIGHT: usize = 33;
+const BRAKEDOWN_BASE_THRESHOLD: usize = 30;
+const BRAKEDOWN_CODE_PROFILE: &[u8] = b"brakedown-fast-2pct-binary64-dyadic-v1";
 
 #[derive(Debug, Parser)]
-#[command(about = "Benchmark a speculative sparse-code binary64 commitment")]
+#[command(about = "Benchmark a recursive Brakedown-layout binary64 commitment")]
 struct Args {
     /// Logical number of source binary64 values.
     #[arg(long, default_value_t = 1 << 20)]
     dimension: usize,
 
-    /// Rows in the approximately square source matrix.
+    /// Rows in the source matrix; the shape trades combination and opening bytes.
     #[arg(long, default_value_t = 1024)]
     rows: usize,
 
-    /// Parity columns per this many source columns.
-    #[arg(long, default_value_t = 2)]
-    parity_denominator: usize,
-
-    /// Distinct source columns used by each parity column.
-    #[arg(long, default_value_t = 4)]
-    degree: usize,
-
-    /// Naive full-column openings used for the proof-byte estimate.
+    /// Full-column queries authenticated by one compact Merkle multiproof.
     #[arg(long, default_value_t = 16)]
     queries: usize,
 
@@ -77,129 +85,480 @@ struct Args {
 }
 
 #[derive(Debug)]
-struct SparseSystematicCode {
-    source_columns: usize,
-    parity_columns: usize,
-    degree: usize,
-    neighbors: Vec<usize>,
-    signs: Vec<bool>,
-    scale: f64,
+struct SparseRowMatrix {
+    input_len: usize,
+    output_len: usize,
+    row_weight: usize,
+    output_indices: Vec<u32>,
+    coefficients: Vec<f64>,
 }
 
-impl SparseSystematicCode {
+impl SparseRowMatrix {
     fn new(
-        source_columns: usize,
-        parity_columns: usize,
-        degree: usize,
+        input_len: usize,
+        output_len: usize,
+        requested_row_weight: usize,
         seed: u64,
     ) -> Result<Self, io::Error> {
-        if source_columns == 0 || parity_columns == 0 {
-            return Err(invalid("source and parity column counts must be positive"));
-        }
-        if degree == 0 || degree > source_columns || !degree.is_power_of_two() {
+        if input_len == 0 || output_len == 0 || requested_row_weight == 0 {
             return Err(invalid(
-                "degree must be a positive power of two no larger than the source width",
+                "sparse matrix dimensions and row weight must be positive",
             ));
         }
-        let edge_count = parity_columns
-            .checked_mul(degree)
-            .ok_or_else(|| invalid("code edge count overflow"))?;
-        let mut neighbors = Vec::new();
-        neighbors
+        u32::try_from(output_len - 1)
+            .map_err(|_| invalid("sparse matrix output width exceeds u32 indexing"))?;
+        let row_weight = requested_row_weight.min(output_len);
+        let edge_count = input_len
+            .checked_mul(row_weight)
+            .ok_or_else(|| invalid("sparse matrix edge count overflow"))?;
+        let mut output_indices = Vec::new();
+        output_indices
             .try_reserve_exact(edge_count)
-            .map_err(|_| invalid("could not allocate code neighbors"))?;
-        let mut signs = Vec::new();
-        signs
+            .map_err(|_| invalid("could not allocate sparse matrix indices"))?;
+        let mut coefficients = Vec::new();
+        coefficients
             .try_reserve_exact(edge_count)
-            .map_err(|_| invalid("could not allocate code signs"))?;
+            .map_err(|_| invalid("could not allocate sparse matrix coefficients"))?;
 
         let mut state = seed;
-        for parity_column in 0..parity_columns {
-            let edge_start = neighbors.len();
-            while neighbors.len() - edge_start < degree {
-                let random = splitmix64(&mut state)
-                    ^ (parity_column as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-                let candidate = (random as usize) % source_columns;
-                if neighbors[edge_start..].contains(&candidate) {
+        for _ in 0..input_len {
+            let row_start = output_indices.len();
+            while output_indices.len() - row_start < row_weight {
+                let candidate = (splitmix64(&mut state) as usize) % output_len;
+                let candidate = u32::try_from(candidate)
+                    .map_err(|_| invalid("sparse matrix index conversion failed"))?;
+                if output_indices[row_start..].contains(&candidate) {
                     continue;
                 }
-                neighbors.push(candidate);
-                signs.push(random & (1_u64 << 63) == 0);
+                output_indices.push(candidate);
+                coefficients.push(sample_binary64_coefficient(&mut state));
             }
         }
 
         Ok(Self {
-            source_columns,
-            parity_columns,
-            degree,
-            neighbors,
-            signs,
-            scale: 1.0 / degree as f64,
+            input_len,
+            output_len,
+            row_weight,
+            output_indices,
+            coefficients,
         })
     }
 
+    fn edge_count(&self) -> usize {
+        self.output_indices.len()
+    }
+
+    fn payload_bytes(&self) -> Result<usize, io::Error> {
+        self.output_indices
+            .len()
+            .checked_mul(size_of::<u32>())
+            .and_then(|bytes| {
+                self.coefficients
+                    .len()
+                    .checked_mul(size_of::<f64>())
+                    .and_then(|coefficient_bytes| bytes.checked_add(coefficient_bytes))
+            })
+            .ok_or_else(|| invalid("sparse matrix payload byte count overflow"))
+    }
+
+    fn apply_vector(&self, input: &[f64]) -> Result<Vec<f64>, io::Error> {
+        if input.len() != self.input_len {
+            return Err(invalid("sparse matrix input vector has the wrong length"));
+        }
+        let mut output = allocate_zeros(self.output_len, "sparse matrix vector output")?;
+        for (input_index, &input_value) in input.iter().enumerate() {
+            let edge_start = input_index * self.row_weight;
+            for edge in edge_start..edge_start + self.row_weight {
+                let output_index = self.output_indices[edge] as usize;
+                output[output_index] += input_value * self.coefficients[edge];
+            }
+        }
+        Ok(output)
+    }
+
+    fn apply_rows(&self, input: &[f64], rows: usize) -> Result<Vec<f64>, io::Error> {
+        let expected_values = rows
+            .checked_mul(self.input_len)
+            .ok_or_else(|| invalid("sparse matrix input shape overflow"))?;
+        if input.len() != expected_values {
+            return Err(invalid("sparse matrix row batch has the wrong shape"));
+        }
+        let output_values = rows
+            .checked_mul(self.output_len)
+            .ok_or_else(|| invalid("sparse matrix output shape overflow"))?;
+        let mut output = allocate_zeros(output_values, "sparse matrix row-batch output")?;
+
+        for input_index in 0..self.input_len {
+            let input_column = &input[input_index * rows..(input_index + 1) * rows];
+            let edge_start = input_index * self.row_weight;
+            for edge in edge_start..edge_start + self.row_weight {
+                let output_index = self.output_indices[edge] as usize;
+                let output_column = &mut output[output_index * rows..(output_index + 1) * rows];
+                let coefficient = self.coefficients[edge];
+                for (destination, &source) in output_column.iter_mut().zip(input_column) {
+                    *destination += source * coefficient;
+                }
+            }
+        }
+        Ok(output)
+    }
+}
+
+#[derive(Debug)]
+enum BrakedownNode {
+    Base {
+        message_len: usize,
+        encoded_len: usize,
+        parity: SparseRowMatrix,
+    },
+    Recursive {
+        message_len: usize,
+        encoded_len: usize,
+        factor: SparseRowMatrix,
+        inner: Box<BrakedownNode>,
+        outer: SparseRowMatrix,
+    },
+}
+
+impl BrakedownNode {
+    fn new(message_len: usize, seed: u64, depth: usize) -> Result<Self, io::Error> {
+        let encoded_len = brakedown_encoded_len(message_len)?;
+        if message_len <= BRAKEDOWN_BASE_THRESHOLD {
+            let parity_len = encoded_len
+                .checked_sub(message_len)
+                .ok_or_else(|| invalid("base-code parity width underflow"))?;
+            return Ok(Self::Base {
+                message_len,
+                encoded_len,
+                parity: SparseRowMatrix::new(
+                    message_len,
+                    parity_len,
+                    parity_len,
+                    derive_code_seed(seed, depth, b'R'),
+                )?,
+            });
+        }
+
+        let compressed_len = checked_ceil_mul_div(
+            message_len,
+            BRAKEDOWN_ALPHA_NUMERATOR,
+            BRAKEDOWN_ALPHA_DENOMINATOR,
+            "Brakedown compressed width",
+        )?;
+        if compressed_len == 0 || compressed_len >= message_len {
+            return Err(invalid("Brakedown compression did not reduce the message"));
+        }
+        let factor = SparseRowMatrix::new(
+            message_len,
+            compressed_len,
+            BRAKEDOWN_A_ROW_WEIGHT,
+            derive_code_seed(seed, depth, b'A'),
+        )?;
+        let inner = Box::new(Self::new(
+            compressed_len,
+            derive_code_seed(seed, depth, b'I'),
+            depth + 1,
+        )?);
+        let outer_len = encoded_len
+            .checked_sub(message_len)
+            .and_then(|remaining| remaining.checked_sub(inner.encoded_len()))
+            .ok_or_else(|| invalid("Brakedown outer-code width underflow"))?;
+        if outer_len == 0 {
+            return Err(invalid("Brakedown outer-code width is zero"));
+        }
+        let outer = SparseRowMatrix::new(
+            inner.encoded_len(),
+            outer_len,
+            BRAKEDOWN_B_ROW_WEIGHT,
+            derive_code_seed(seed, depth, b'B'),
+        )?;
+        Ok(Self::Recursive {
+            message_len,
+            encoded_len,
+            factor,
+            inner,
+            outer,
+        })
+    }
+
+    fn message_len(&self) -> usize {
+        match self {
+            Self::Base { message_len, .. } | Self::Recursive { message_len, .. } => *message_len,
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        match self {
+            Self::Base { encoded_len, .. } | Self::Recursive { encoded_len, .. } => *encoded_len,
+        }
+    }
+
+    fn encode_vector(&self, message: &[f64]) -> Result<Vec<f64>, io::Error> {
+        if message.len() != self.message_len() {
+            return Err(invalid("Brakedown message vector has the wrong length"));
+        }
+        let parity = self.encode_parity_vector(message)?;
+        let mut encoded = Vec::new();
+        encoded
+            .try_reserve_exact(self.encoded_len())
+            .map_err(|_| invalid("could not allocate Brakedown encoded vector"))?;
+        encoded.extend_from_slice(message);
+        encoded.extend_from_slice(&parity);
+        debug_assert_eq!(encoded.len(), self.encoded_len());
+        Ok(encoded)
+    }
+
+    fn encode_parity_vector(&self, message: &[f64]) -> Result<Vec<f64>, io::Error> {
+        match self {
+            Self::Base { parity, .. } => parity.apply_vector(message),
+            Self::Recursive {
+                factor,
+                inner,
+                outer,
+                ..
+            } => {
+                let compressed = factor.apply_vector(message)?;
+                let inner_codeword = inner.encode_vector(&compressed)?;
+                let outer_parity = outer.apply_vector(&inner_codeword)?;
+                let parity_len = inner_codeword
+                    .len()
+                    .checked_add(outer_parity.len())
+                    .ok_or_else(|| invalid("Brakedown parity length overflow"))?;
+                let mut parity = Vec::new();
+                parity
+                    .try_reserve_exact(parity_len)
+                    .map_err(|_| invalid("could not allocate Brakedown parity vector"))?;
+                parity.extend_from_slice(&inner_codeword);
+                parity.extend_from_slice(&outer_parity);
+                Ok(parity)
+            }
+        }
+    }
+
+    fn encode_rows(&self, message: &[f64], rows: usize) -> Result<Vec<f64>, io::Error> {
+        let expected_values = rows
+            .checked_mul(self.message_len())
+            .ok_or_else(|| invalid("Brakedown row-batch shape overflow"))?;
+        if message.len() != expected_values {
+            return Err(invalid("Brakedown row batch has the wrong shape"));
+        }
+        let parity = self.encode_parity_rows(message, rows)?;
+        let encoded_values = rows
+            .checked_mul(self.encoded_len())
+            .ok_or_else(|| invalid("Brakedown encoded row-batch shape overflow"))?;
+        let mut encoded = Vec::new();
+        encoded
+            .try_reserve_exact(encoded_values)
+            .map_err(|_| invalid("could not allocate Brakedown encoded row batch"))?;
+        encoded.extend_from_slice(message);
+        encoded.extend_from_slice(&parity);
+        debug_assert_eq!(encoded.len(), encoded_values);
+        Ok(encoded)
+    }
+
+    fn encode_parity_rows(&self, message: &[f64], rows: usize) -> Result<Vec<f64>, io::Error> {
+        match self {
+            Self::Base { parity, .. } => parity.apply_rows(message, rows),
+            Self::Recursive {
+                factor,
+                inner,
+                outer,
+                ..
+            } => {
+                let compressed = factor.apply_rows(message, rows)?;
+                let inner_codeword = inner.encode_rows(&compressed, rows)?;
+                let outer_parity = outer.apply_rows(&inner_codeword, rows)?;
+                let parity_values = inner_codeword
+                    .len()
+                    .checked_add(outer_parity.len())
+                    .ok_or_else(|| invalid("Brakedown row-batch parity length overflow"))?;
+                let mut parity = Vec::new();
+                parity
+                    .try_reserve_exact(parity_values)
+                    .map_err(|_| invalid("could not allocate Brakedown row-batch parity"))?;
+                parity.extend_from_slice(&inner_codeword);
+                parity.extend_from_slice(&outer_parity);
+                Ok(parity)
+            }
+        }
+    }
+
+    fn sparse_levels(&self) -> usize {
+        match self {
+            Self::Base { .. } => 0,
+            Self::Recursive { inner, .. } => 1 + inner.sparse_levels(),
+        }
+    }
+
+    fn base_message_len(&self) -> usize {
+        match self {
+            Self::Base { message_len, .. } => *message_len,
+            Self::Recursive { inner, .. } => inner.base_message_len(),
+        }
+    }
+
+    fn multiplication_count(&self) -> Result<usize, io::Error> {
+        match self {
+            Self::Base { parity, .. } => Ok(parity.edge_count()),
+            Self::Recursive {
+                factor,
+                inner,
+                outer,
+                ..
+            } => factor
+                .edge_count()
+                .checked_add(inner.multiplication_count()?)
+                .and_then(|count| count.checked_add(outer.edge_count()))
+                .ok_or_else(|| invalid("Brakedown multiplication count overflow")),
+        }
+    }
+
+    fn matrix_payload_bytes(&self) -> Result<usize, io::Error> {
+        match self {
+            Self::Base { parity, .. } => parity.payload_bytes(),
+            Self::Recursive {
+                factor,
+                inner,
+                outer,
+                ..
+            } => {
+                let factor_bytes = factor.payload_bytes()?;
+                let inner_bytes = inner.matrix_payload_bytes()?;
+                let outer_bytes = outer.payload_bytes()?;
+                factor_bytes
+                    .checked_add(inner_bytes)
+                    .and_then(|bytes| bytes.checked_add(outer_bytes))
+                    .ok_or_else(|| invalid("Brakedown matrix payload byte count overflow"))
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BrakedownCode {
+    source_columns: usize,
+    root: BrakedownNode,
+}
+
+impl BrakedownCode {
+    fn new(source_columns: usize, seed: u64) -> Result<Self, io::Error> {
+        if source_columns == 0 {
+            return Err(invalid("Brakedown source width must be positive"));
+        }
+        Ok(Self {
+            source_columns,
+            root: BrakedownNode::new(source_columns, seed, 0)?,
+        })
+    }
+
+    fn parity_columns(&self) -> usize {
+        self.root.encoded_len() - self.source_columns
+    }
+
     fn encoded_columns(&self) -> Result<usize, io::Error> {
-        self.source_columns
-            .checked_add(self.parity_columns)
-            .ok_or_else(|| invalid("encoded column count overflow"))
+        Ok(self.root.encoded_len())
     }
 
     fn encode_rows(&self, source: &[f64], rows: usize) -> Result<Vec<f64>, io::Error> {
-        let expected_source_values = rows
+        let expected_values = rows
             .checked_mul(self.source_columns)
-            .ok_or_else(|| invalid("source shape overflow"))?;
-        if source.len() != expected_source_values {
-            return Err(invalid("source storage does not match the code shape"));
+            .ok_or_else(|| invalid("Brakedown source shape overflow"))?;
+        if source.len() != expected_values {
+            return Err(invalid(
+                "source storage does not match the Brakedown code shape",
+            ));
         }
-        let parity_values = rows
-            .checked_mul(self.parity_columns)
-            .ok_or_else(|| invalid("parity shape overflow"))?;
-        let mut parity = Vec::new();
-        parity
-            .try_reserve_exact(parity_values)
-            .map_err(|_| invalid("could not allocate parity storage"))?;
-        parity.resize(parity_values, 0.0);
-
-        for parity_column in 0..self.parity_columns {
-            let edge_start = parity_column * self.degree;
-            for row in 0..rows {
-                let mut sum = 0.0;
-                for edge in edge_start..edge_start + self.degree {
-                    let value = source[self.neighbors[edge] * rows + row];
-                    sum = if self.signs[edge] {
-                        sum + value
-                    } else {
-                        sum - value
-                    };
-                }
-                parity[parity_column * rows + row] = sum * self.scale;
-            }
-        }
-        Ok(parity)
+        self.root.encode_parity_rows(source, rows)
     }
 
     fn encode_vector(&self, source: &[f64]) -> Result<Vec<f64>, io::Error> {
         if source.len() != self.source_columns {
-            return Err(invalid("source vector does not match the code width"));
+            return Err(invalid(
+                "source vector does not match the Brakedown code width",
+            ));
         }
-        let mut parity = Vec::new();
-        parity
-            .try_reserve_exact(self.parity_columns)
-            .map_err(|_| invalid("could not allocate encoded combination"))?;
-        for parity_column in 0..self.parity_columns {
-            let edge_start = parity_column * self.degree;
-            let mut sum = 0.0;
-            for edge in edge_start..edge_start + self.degree {
-                let value = source[self.neighbors[edge]];
-                sum = if self.signs[edge] {
-                    sum + value
-                } else {
-                    sum - value
-                };
-            }
-            parity.push(sum * self.scale);
-        }
-        Ok(parity)
+        self.root.encode_parity_vector(source)
+    }
+
+    fn encode_full_vector(&self, source: &[f64]) -> Result<Vec<f64>, io::Error> {
+        self.root.encode_vector(source)
+    }
+
+    fn sparse_levels(&self) -> usize {
+        self.root.sparse_levels()
+    }
+
+    fn base_message_columns(&self) -> usize {
+        self.root.base_message_len()
+    }
+
+    fn multiplication_count(&self) -> Result<usize, io::Error> {
+        self.root.multiplication_count()
+    }
+
+    fn matrix_payload_bytes(&self) -> Result<usize, io::Error> {
+        self.root.matrix_payload_bytes()
+    }
+
+    fn conditional_minimum_weight(&self) -> Result<usize, io::Error> {
+        checked_ceil_mul_div(
+            self.source_columns,
+            BRAKEDOWN_BETA_NUMERATOR,
+            BRAKEDOWN_BETA_DENOMINATOR,
+            "Brakedown conditional minimum weight",
+        )
+    }
+}
+
+fn brakedown_encoded_len(message_len: usize) -> Result<usize, io::Error> {
+    checked_ceil_mul_div(
+        message_len,
+        BRAKEDOWN_RATE_DENOMINATOR,
+        BRAKEDOWN_RATE_NUMERATOR,
+        "Brakedown encoded width",
+    )
+}
+
+fn checked_ceil_mul_div(
+    value: usize,
+    numerator: usize,
+    denominator: usize,
+    context: &str,
+) -> Result<usize, io::Error> {
+    if denominator == 0 {
+        return Err(invalid("ceil-multiply denominator must be positive"));
+    }
+    value
+        .checked_mul(numerator)
+        .and_then(|product| product.checked_add(denominator - 1))
+        .map(|rounded| rounded / denominator)
+        .ok_or_else(|| invalid(&format!("{context} overflow")))
+}
+
+fn allocate_zeros(len: usize, context: &str) -> Result<Vec<f64>, io::Error> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(len)
+        .map_err(|_| invalid(&format!("could not allocate {context}")))?;
+    values.resize(len, 0.0);
+    Ok(values)
+}
+
+fn derive_code_seed(seed: u64, depth: usize, role: u8) -> u64 {
+    let mut state = seed
+        ^ (depth as u64).wrapping_mul(0xd6e8_feb8_6659_fd93)
+        ^ u64::from(role).wrapping_mul(0xa076_1d64_78bd_642f);
+    splitmix64(&mut state)
+}
+
+fn sample_binary64_coefficient(state: &mut u64) -> f64 {
+    let random = splitmix64(state);
+    let magnitude = (1_u64 << 51) + (random & ((1_u64 << 51) - 1));
+    let coefficient = magnitude as f64 / (1_u64 << 52) as f64;
+    if random & (1_u64 << 63) == 0 {
+        coefficient
+    } else {
+        -coefficient
     }
 }
 
@@ -219,31 +578,6 @@ impl ColumnTree {
         self.hashes.len() * size_of::<[u8; 32]>()
     }
 
-    fn naive_opening(
-        &self,
-        source: &[f64],
-        parity: &[f64],
-        rows: usize,
-        source_columns: usize,
-        queries: usize,
-        seed: u64,
-    ) -> Result<NaiveOpening, io::Error> {
-        if queries == 0 || queries > self.column_count {
-            return Err(invalid("opening query count is out of range"));
-        }
-
-        let mut indices: Vec<usize> = (0..self.column_count).collect();
-        let mut state = seed;
-        for upper in (1..indices.len()).rev() {
-            let selected = (splitmix64(&mut state) as usize) % (upper + 1);
-            indices.swap(upper, selected);
-        }
-        indices.truncate(queries);
-        indices.sort_unstable();
-
-        self.opening_at_indices(source, parity, rows, source_columns, &indices)
-    }
-
     fn opening_at_indices(
         &self,
         source: &[f64],
@@ -251,7 +585,7 @@ impl ColumnTree {
         rows: usize,
         source_columns: usize,
         indices: &[usize],
-    ) -> Result<NaiveOpening, io::Error> {
+    ) -> Result<ColumnOpening, io::Error> {
         if indices.is_empty()
             || indices.iter().any(|&index| index >= self.column_count)
             || indices.windows(2).any(|pair| pair[0] >= pair[1])
@@ -265,45 +599,59 @@ impl ColumnTree {
             .len()
             .checked_mul(rows)
             .ok_or_else(|| invalid("opened value count overflow"))?;
-        let tree_height = self.padded_columns.ilog2() as usize;
-        let authentication_count = indices
-            .len()
-            .checked_mul(tree_height)
-            .ok_or_else(|| invalid("authentication hash count overflow"))?;
         let mut values = Vec::new();
         values
             .try_reserve_exact(value_count)
             .map_err(|_| invalid("could not allocate opened values"))?;
-        let mut authentication = Vec::new();
-        authentication
-            .try_reserve_exact(authentication_count)
-            .map_err(|_| invalid("could not allocate authentication paths"))?;
 
         for &column_index in indices {
             values.extend_from_slice(column(source, parity, rows, source_columns, column_index));
-            let mut node_index = self.padded_columns + column_index;
-            while node_index > 1 {
-                authentication.push(self.hashes[node_index ^ 1]);
-                node_index /= 2;
-            }
         }
+        let authentication = self.multiproof_frontier(indices)?;
 
-        Ok(NaiveOpening {
+        Ok(ColumnOpening {
             indices: indices.to_vec(),
             values,
             authentication,
         })
     }
+
+    fn multiproof_frontier(&self, indices: &[usize]) -> Result<Vec<[u8; 32]>, io::Error> {
+        let upper_bound = indices
+            .len()
+            .checked_mul(self.padded_columns.ilog2() as usize)
+            .ok_or_else(|| invalid("multiproof frontier upper bound overflow"))?;
+        let mut frontier = Vec::new();
+        frontier
+            .try_reserve_exact(upper_bound)
+            .map_err(|_| invalid("could not allocate multiproof frontier"))?;
+        let mut active = indices.to_vec();
+        let mut width = self.padded_columns;
+        while width > 1 {
+            for &index in &active {
+                let sibling = index ^ 1;
+                if active.binary_search(&sibling).is_err() {
+                    frontier.push(self.hashes[width + sibling]);
+                }
+            }
+            for index in &mut active {
+                *index /= 2;
+            }
+            active.dedup();
+            width /= 2;
+        }
+        Ok(frontier)
+    }
 }
 
 #[derive(Clone, Debug)]
-struct NaiveOpening {
+struct ColumnOpening {
     indices: Vec<usize>,
     values: Vec<f64>,
     authentication: Vec<[u8; 32]>,
 }
 
-impl NaiveOpening {
+impl ColumnOpening {
     fn payload_bytes(&self, source_columns: usize) -> Result<usize, io::Error> {
         let combination_bytes = source_columns
             .checked_mul(size_of::<f64>())
@@ -340,24 +688,25 @@ impl NaiveOpening {
         combined_source: &[f64],
         combined_parity: &[f64],
     ) -> Result<DefectMetrics, io::Error> {
-        let tree_height = tree.padded_columns.ilog2() as usize;
         let expected_values = self
             .indices
             .len()
             .checked_mul(rows)
             .ok_or_else(|| invalid("opened value shape overflow"))?;
-        let expected_authentication = self
-            .indices
-            .len()
-            .checked_mul(tree_height)
-            .ok_or_else(|| invalid("opening authentication shape overflow"))?;
         if self.values.len() != expected_values
-            || self.authentication.len() != expected_authentication
             || combined_source.len() != source_columns
             || row_weights.len() != rows
         {
             return Err(invalid("opening verification shape is invalid"));
         }
+        verify_column_multiproof(
+            tree.root(),
+            tree.padded_columns,
+            &self.indices,
+            &self.values,
+            rows,
+            &self.authentication,
+        )?;
 
         let mut absolute_defects = Vec::new();
         absolute_defects
@@ -370,24 +719,6 @@ impl NaiveOpening {
 
         for (query, &column_index) in self.indices.iter().enumerate() {
             let values = &self.values[query * rows..(query + 1) * rows];
-            let path = &self.authentication[query * tree_height..(query + 1) * tree_height];
-            let mut hash = hash_column(column_index, values);
-            let mut level_index = column_index;
-            for (level, sibling) in path.iter().enumerate() {
-                let parent_index = level_index / 2;
-                hash = if level_index.is_multiple_of(2) {
-                    hash_node(level + 1, parent_index, &hash, sibling)
-                } else {
-                    hash_node(level + 1, parent_index, sibling, &hash)
-                };
-                level_index = parent_index;
-            }
-            if hash != tree.root() {
-                return Err(invalid(
-                    "opening authentication path does not match the root",
-                ));
-            }
-
             let actual = dot(values, row_weights)?;
             let expected = if column_index < source_columns {
                 combined_source[column_index]
@@ -434,8 +765,8 @@ struct ResidualCompositionProof {
     residual_at_row_point: f64,
     matvec_sumcheck: ProductSumcheckProof,
     solution_at_column_point: f64,
-    source_combinations: [Vec<f64>; 2],
-    opening: NaiveOpening,
+    source_combinations: [Vec<f64>; 3],
+    opening: ColumnOpening,
 }
 
 impl ResidualCompositionProof {
@@ -508,6 +839,7 @@ struct ResidualTimingSamples {
     packing: Vec<Duration>,
     encoding: Vec<Duration>,
     commitment: Vec<Duration>,
+    testing_combination: Vec<Duration>,
     norm_sumcheck: Vec<Duration>,
     matvec_compression: Vec<Duration>,
     matvec_sumcheck: Vec<Duration>,
@@ -526,9 +858,9 @@ fn run_residual_composition(args: &Args) -> Result<(), Box<dyn Error>> {
         .checked_mul(2)
         .ok_or_else(|| invalid("packed residual message length overflow"))?;
     let source_columns = packed_dimension / args.rows;
-    let parity_columns = source_columns.div_ceil(args.parity_denominator);
     let code_seed = args.seed ^ 0x434f_4445_4752_4150;
-    let code = SparseSystematicCode::new(source_columns, parity_columns, args.degree, code_seed)?;
+    let code = BrakedownCode::new(source_columns, code_seed)?;
+    let parity_columns = code.parity_columns();
     let encoded_columns = code.encoded_columns()?;
     if args.queries > encoded_columns {
         return Err(invalid("queries cannot exceed encoded columns").into());
@@ -575,6 +907,13 @@ fn run_residual_composition(args: &Args) -> Result<(), Box<dyn Error>> {
             args.queries,
             code_seed,
         )?;
+
+        let start = Instant::now();
+        let testing_row_weights = derive_testing_row_weights(&mut transcript, args.rows)?;
+        let testing_combination =
+            combine_source_columns(&source, args.rows, source_columns, &testing_row_weights)?;
+        absorb_source_combination(&mut transcript, 0, &testing_combination)?;
+        let testing_combination_time = start.elapsed();
 
         let start = Instant::now();
         let residual_left = source[padded_dimension..].to_vec();
@@ -643,22 +982,23 @@ fn run_residual_composition(args: &Args) -> Result<(), Box<dyn Error>> {
         let residual_packed_point = packed_endpoint_point(1.0, &norm_endpoint.point);
         let solution_combination = prepare_endpoint_combination(
             &source,
-            &parity,
             args.rows,
             source_columns,
-            encoded_columns,
             &solution_packed_point,
         )?;
         let residual_combination = prepare_endpoint_combination(
             &source,
-            &parity,
             args.rows,
             source_columns,
-            encoded_columns,
             &residual_packed_point,
         )?;
-        let source_combinations = [solution_combination, residual_combination];
-        absorb_combinations(&mut transcript, &source_combinations)?;
+        let source_combinations = [
+            testing_combination,
+            solution_combination,
+            residual_combination,
+        ];
+        absorb_source_combination(&mut transcript, 1, &source_combinations[1])?;
+        absorb_source_combination(&mut transcript, 2, &source_combinations[2])?;
         let opening_combinations = start.elapsed();
 
         let start = Instant::now();
@@ -705,6 +1045,7 @@ fn run_residual_composition(args: &Args) -> Result<(), Box<dyn Error>> {
             samples.packing.push(packing);
             samples.encoding.push(encoding);
             samples.commitment.push(commitment);
+            samples.testing_combination.push(testing_combination_time);
             samples.norm_sumcheck.push(norm_sumcheck_time);
             samples.matvec_compression.push(matvec_compression);
             samples.matvec_sumcheck.push(matvec_sumcheck_time);
@@ -718,14 +1059,24 @@ fn run_residual_composition(args: &Args) -> Result<(), Box<dyn Error>> {
     let raw_solution_bytes = args.dimension * size_of::<f64>();
     let source_bytes = packed_dimension * size_of::<f64>();
     let parity_bytes = args.rows * parity_columns * size_of::<f64>();
-    let (minimum_single_source_weight, maximum_single_source_weight) =
-        single_source_encoded_weight_range(&code)?;
-    let single_source_query_miss_probability = without_replacement_miss_probability(
+    let unit_weight_scan_start = Instant::now();
+    let (minimum_unit_weight, maximum_unit_weight) = unit_encoded_weight_range(&code)?;
+    let unit_weight_scan = unit_weight_scan_start.elapsed();
+    let unit_query_miss_probability =
+        without_replacement_miss_probability(encoded_columns, minimum_unit_weight, args.queries)?;
+    let conditional_minimum_weight = code.conditional_minimum_weight()?;
+    let conditional_codeword_query_miss_probability = without_replacement_miss_probability(
         encoded_columns,
-        minimum_single_source_weight,
+        conditional_minimum_weight,
         args.queries,
     )?;
-    println!("status=two-sumcheck-composition-with-assumed-code-proximity");
+    let conditional_proximity_bad_columns = conditional_minimum_weight.div_ceil(3);
+    let conditional_proximity_query_miss_probability = without_replacement_miss_probability(
+        encoded_columns,
+        conditional_proximity_bad_columns,
+        args.queries,
+    )?;
+    println!("status=recursive-brakedown-layout-without-binary64-distance-theorem");
     println!("logical_dimension={}", args.dimension);
     println!("padded_dimension={padded_dimension}");
     println!("structural_nnz={}", problem.structural_nnz());
@@ -734,12 +1085,22 @@ fn run_residual_composition(args: &Args) -> Result<(), Box<dyn Error>> {
     println!("source_columns={source_columns}");
     println!("parity_columns={parity_columns}");
     println!("encoded_columns={encoded_columns}");
-    println!("degree={}", args.degree);
+    print_code_parameters(&code)?;
     println!("queries={}", args.queries);
-    println!("minimum_single_source_encoded_weight={minimum_single_source_weight}");
-    println!("maximum_single_source_encoded_weight={maximum_single_source_weight}");
+    println!("minimum_unit_message_encoded_weight={minimum_unit_weight}");
+    println!("maximum_unit_message_encoded_weight={maximum_unit_weight}");
+    println!("minimum_unit_message_query_miss_probability={unit_query_miss_probability:.17e}");
+    println!("conditional_finite_field_minimum_weight={conditional_minimum_weight}");
     println!(
-        "minimum_weight_single_source_query_miss_probability={single_source_query_miss_probability:.17e}"
+        "conditional_codeword_query_miss_probability={conditional_codeword_query_miss_probability:.17e}"
+    );
+    println!("conditional_proximity_bad_columns={conditional_proximity_bad_columns}");
+    println!(
+        "conditional_proximity_query_miss_probability={conditional_proximity_query_miss_probability:.17e}"
+    );
+    println!(
+        "unit_weight_scan_seconds={:.9}",
+        unit_weight_scan.as_secs_f64()
     );
     println!("raw_solution_bytes={raw_solution_bytes}");
     println!("source_bytes={source_bytes}");
@@ -784,6 +1145,7 @@ fn run_residual_composition(args: &Args) -> Result<(), Box<dyn Error>> {
     print_timing("packing", &mut samples.packing);
     print_timing("encoding", &mut samples.encoding);
     print_timing("commitment", &mut samples.commitment);
+    print_timing("testing_combination", &mut samples.testing_combination);
     print_timing("norm_sumcheck", &mut samples.norm_sumcheck);
     print_timing("matvec_compression", &mut samples.matvec_compression);
     print_timing("matvec_sumcheck", &mut samples.matvec_sumcheck);
@@ -809,20 +1171,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         .rows
         .checked_mul(source_columns)
         .ok_or_else(|| invalid("padded source dimension overflow"))?;
-    let parity_columns = source_columns.div_ceil(args.parity_denominator);
-    let code = SparseSystematicCode::new(
-        source_columns,
-        parity_columns,
-        args.degree,
-        args.seed ^ 0x434f_4445_4752_4150,
-    )?;
+    let code_seed = args.seed ^ 0x434f_4445_4752_4150;
+    let code = BrakedownCode::new(source_columns, code_seed)?;
+    let parity_columns = code.parity_columns();
     let encoded_columns = code.encoded_columns()?;
     if args.queries > encoded_columns {
         return Err(invalid("queries cannot exceed encoded columns").into());
     }
 
     let source = generate_source(args.dimension, padded_dimension, args.seed)?;
-    let row_weights = signed_dyadic_weights(args.rows, args.seed ^ 0x524f_575f_5745_4947)?;
     let column_weights = signed_dyadic_weights(source_columns, args.seed ^ 0x434f_4c5f_5745_4947)?;
 
     let mut samples = TimingSamples::default();
@@ -845,6 +1202,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         let commitment = start.elapsed();
 
         let start = Instant::now();
+        let mut transcript = initialize_throughput_transcript(
+            tree.root(),
+            args.rows,
+            &code,
+            args.queries,
+            code_seed,
+        )?;
+        let row_weights = derive_testing_row_weights(&mut transcript, args.rows)?;
         let combined = combine_columns(
             &source,
             &parity,
@@ -860,15 +1225,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         let combination_encoding = start.elapsed();
 
         let start = Instant::now();
-        let root_seed = u64::from_le_bytes(tree.root()[..8].try_into()?);
-        let opening = tree.naive_opening(
-            &source,
-            &parity,
-            args.rows,
-            source_columns,
-            args.queries,
-            args.seed ^ root_seed,
-        )?;
+        absorb_source_combination(&mut transcript, 0, &combined[..source_columns])?;
+        let query_indices = derive_query_indices(&mut transcript, encoded_columns, args.queries)?;
+        let opening =
+            tree.opening_at_indices(&source, &parity, args.rows, source_columns, &query_indices)?;
         let opening_extraction = start.elapsed();
 
         let start = Instant::now();
@@ -914,20 +1274,52 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let source_bytes = source.len() * size_of::<f64>();
     let parity_bytes = args.rows * parity_columns * size_of::<f64>();
+    let unit_weight_scan_start = Instant::now();
+    let (minimum_unit_weight, maximum_unit_weight) = unit_encoded_weight_range(&code)?;
+    let unit_weight_scan = unit_weight_scan_start.elapsed();
+    let conditional_minimum_weight = code.conditional_minimum_weight()?;
+    let unit_query_miss_probability =
+        without_replacement_miss_probability(encoded_columns, minimum_unit_weight, args.queries)?;
+    let conditional_codeword_query_miss_probability = without_replacement_miss_probability(
+        encoded_columns,
+        conditional_minimum_weight,
+        args.queries,
+    )?;
+    let conditional_proximity_bad_columns = conditional_minimum_weight.div_ceil(3);
+    let conditional_proximity_query_miss_probability = without_replacement_miss_probability(
+        encoded_columns,
+        conditional_proximity_bad_columns,
+        args.queries,
+    )?;
 
-    println!("status=throughput-surrogate-without-soundness-claim");
+    println!("status=recursive-brakedown-layout-without-binary64-distance-theorem");
     println!("logical_dimension={}", args.dimension);
     println!("padded_dimension={padded_dimension}");
     println!("rows={}", args.rows);
     println!("source_columns={source_columns}");
     println!("parity_columns={parity_columns}");
     println!("encoded_columns={encoded_columns}");
-    println!("degree={}", args.degree);
+    print_code_parameters(&code)?;
     println!("queries={}", args.queries);
+    println!("minimum_unit_message_encoded_weight={minimum_unit_weight}");
+    println!("maximum_unit_message_encoded_weight={maximum_unit_weight}");
+    println!("minimum_unit_message_query_miss_probability={unit_query_miss_probability:.17e}");
+    println!("conditional_finite_field_minimum_weight={conditional_minimum_weight}");
+    println!(
+        "conditional_codeword_query_miss_probability={conditional_codeword_query_miss_probability:.17e}"
+    );
+    println!("conditional_proximity_bad_columns={conditional_proximity_bad_columns}");
+    println!(
+        "conditional_proximity_query_miss_probability={conditional_proximity_query_miss_probability:.17e}"
+    );
+    println!(
+        "unit_weight_scan_seconds={:.9}",
+        unit_weight_scan.as_secs_f64()
+    );
     println!("source_bytes={source_bytes}");
     println!("parity_bytes={parity_bytes}");
     println!("retained_tree_bytes={final_tree_bytes}");
-    println!("naive_opening_bytes={final_opening_bytes}");
+    println!("compact_column_opening_bytes={final_opening_bytes}");
     println!("root={}", blake3::Hash::from_bytes(final_root).to_hex());
     println!("opening_claim={final_claim:.17e}");
     println!(
@@ -971,9 +1363,6 @@ fn validate_args(args: &Args) -> Result<(), io::Error> {
     }
     if !args.rows.is_power_of_two() {
         return Err(invalid("rows must be a power of two"));
-    }
-    if args.parity_denominator == 0 {
-        return Err(invalid("parity denominator must be positive"));
     }
     if args.queries == 0 || args.repetitions == 0 {
         return Err(invalid("queries and repetitions must be positive"));
@@ -1164,7 +1553,7 @@ fn initialize_residual_transcript(
     problem: &GeneratedProblem,
     root: [u8; 32],
     rows: usize,
-    code: &SparseSystematicCode,
+    code: &BrakedownCode,
     queries: usize,
     code_seed: u64,
 ) -> Result<Transcript, io::Error> {
@@ -1175,6 +1564,30 @@ fn initialize_residual_transcript(
         u64::try_from(problem.dimension())
             .map_err(|_| invalid("dimension does not fit in transcript"))?,
     );
+    absorb_code_context(&mut transcript, root, rows, code, queries, code_seed)?;
+    Ok(transcript)
+}
+
+fn initialize_throughput_transcript(
+    root: [u8; 32],
+    rows: usize,
+    code: &BrakedownCode,
+    queries: usize,
+    code_seed: u64,
+) -> Result<Transcript, io::Error> {
+    let mut transcript = Transcript::new(THROUGHPUT_PROTOCOL_LABEL);
+    absorb_code_context(&mut transcript, root, rows, code, queries, code_seed)?;
+    Ok(transcript)
+}
+
+fn absorb_code_context(
+    transcript: &mut Transcript,
+    root: [u8; 32],
+    rows: usize,
+    code: &BrakedownCode,
+    queries: usize,
+    code_seed: u64,
+) -> Result<(), io::Error> {
     transcript.absorb_u64(
         b"commitment-rows",
         u64::try_from(rows).map_err(|_| invalid("row count does not fit in transcript"))?,
@@ -1185,22 +1598,18 @@ fn initialize_residual_transcript(
             .map_err(|_| invalid("source width does not fit in transcript"))?,
     );
     transcript.absorb_u64(
-        b"parity-columns",
-        u64::try_from(code.parity_columns)
-            .map_err(|_| invalid("parity width does not fit in transcript"))?,
+        b"encoded-columns",
+        u64::try_from(code.encoded_columns()?)
+            .map_err(|_| invalid("encoded width does not fit in transcript"))?,
     );
-    transcript.absorb_u64(
-        b"code-degree",
-        u64::try_from(code.degree)
-            .map_err(|_| invalid("code degree does not fit in transcript"))?,
-    );
+    transcript.absorb_bytes(b"code-profile", BRAKEDOWN_CODE_PROFILE);
     transcript.absorb_u64(b"code-seed", code_seed);
     transcript.absorb_u64(
         b"column-queries",
         u64::try_from(queries).map_err(|_| invalid("query count does not fit in transcript"))?,
     );
     transcript.absorb_root(b"encoded-column-root", &root);
-    Ok(transcript)
+    Ok(())
 }
 
 fn sumcheck_challenge(
@@ -1277,48 +1686,59 @@ fn split_commitment_point(
 
 fn prepare_endpoint_combination(
     source: &[f64],
-    parity: &[f64],
     rows: usize,
     source_columns: usize,
-    encoded_columns: usize,
     packed_point: &[f64],
 ) -> Result<Vec<f64>, io::Error> {
     let (_, row_point) = split_commitment_point(packed_point, rows, source_columns)?;
     let row_weights = equality_table(row_point)?;
-    let encoded_combination = combine_columns(
-        source,
-        parity,
-        rows,
-        source_columns,
-        encoded_columns,
-        &row_weights,
-    )?;
-    Ok(encoded_combination[..source_columns].to_vec())
+    combine_source_columns(source, rows, source_columns, &row_weights)
 }
 
-fn absorb_combinations(
+fn derive_testing_row_weights(
     transcript: &mut Transcript,
-    combinations: &[Vec<f64>; 2],
-) -> Result<(), io::Error> {
-    for (index, combination) in combinations.iter().enumerate() {
-        let byte_len = combination
-            .len()
-            .checked_mul(size_of::<f64>())
-            .ok_or_else(|| invalid("combination serialization length overflow"))?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(byte_len)
-            .map_err(|_| invalid("could not allocate combination serialization"))?;
-        for &value in combination {
-            bytes.extend_from_slice(
-                &canonical_bits(value)
-                    .map_err(calculation_error)?
-                    .to_le_bytes(),
-            );
-        }
-        transcript.absorb_u64(b"opening-combination-index", index as u64);
-        transcript.absorb_bytes(b"opening-source-combination", &bytes);
+    rows: usize,
+) -> Result<Vec<f64>, io::Error> {
+    if rows == 0 || !rows.is_power_of_two() {
+        return Err(invalid("testing row count must be a positive power of two"));
     }
+    let mut weights = Vec::new();
+    weights
+        .try_reserve_exact(rows)
+        .map_err(|_| invalid("could not allocate testing row weights"))?;
+    let scale = 2.0 / rows as f64;
+    for index in 0..rows {
+        transcript.absorb_u64(b"testing-row-index", index as u64);
+        let challenge = transcript
+            .challenge_dyadic_f64(b"testing-row-coefficient")
+            .map_err(calculation_error)?;
+        weights.push(canonical((challenge - 0.5) * scale)?);
+    }
+    Ok(weights)
+}
+
+fn absorb_source_combination(
+    transcript: &mut Transcript,
+    index: usize,
+    combination: &[f64],
+) -> Result<(), io::Error> {
+    let byte_len = combination
+        .len()
+        .checked_mul(size_of::<f64>())
+        .ok_or_else(|| invalid("combination serialization length overflow"))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(byte_len)
+        .map_err(|_| invalid("could not allocate combination serialization"))?;
+    for &value in combination {
+        bytes.extend_from_slice(
+            &canonical_bits(value)
+                .map_err(calculation_error)?
+                .to_le_bytes(),
+        );
+    }
+    transcript.absorb_u64(b"opening-combination-index", index as u64);
+    transcript.absorb_bytes(b"opening-source-combination", &bytes);
     Ok(())
 }
 
@@ -1346,29 +1766,21 @@ fn derive_query_indices(
     Ok(indices)
 }
 
-fn single_source_encoded_weight_range(
-    code: &SparseSystematicCode,
-) -> Result<(usize, usize), io::Error> {
-    let mut weights = Vec::new();
-    weights
-        .try_reserve_exact(code.source_columns)
-        .map_err(|_| invalid("could not allocate source-column weights"))?;
-    weights.resize(code.source_columns, 1_usize);
-    for &neighbor in &code.neighbors {
-        weights[neighbor] = weights[neighbor]
-            .checked_add(1)
-            .ok_or_else(|| invalid("source-column encoded weight overflow"))?;
+fn unit_encoded_weight_range(code: &BrakedownCode) -> Result<(usize, usize), io::Error> {
+    let mut unit = allocate_zeros(code.source_columns, "unit-message diagnostic")?;
+    let mut minimum = usize::MAX;
+    let mut maximum = 0_usize;
+    for index in 0..code.source_columns {
+        unit[index] = 1.0;
+        let encoded = code.encode_full_vector(&unit)?;
+        unit[index] = 0.0;
+        let weight = encoded.iter().filter(|value| **value != 0.0).count();
+        minimum = minimum.min(weight);
+        maximum = maximum.max(weight);
     }
-    let minimum = weights
-        .iter()
-        .copied()
-        .min()
-        .ok_or_else(|| invalid("source-column weight set is empty"))?;
-    let maximum = weights
-        .iter()
-        .copied()
-        .max()
-        .ok_or_else(|| invalid("source-column weight set is empty"))?;
+    if minimum == usize::MAX {
+        return Err(invalid("unit-message weight set is empty"));
+    }
     Ok((minimum, maximum))
 }
 
@@ -1390,10 +1802,48 @@ fn without_replacement_miss_probability(
     Ok(probability)
 }
 
+fn print_code_parameters(code: &BrakedownCode) -> Result<(), io::Error> {
+    let encoded_columns = code.encoded_columns()?;
+    let multiplications = code.multiplication_count()?;
+    println!(
+        "code_profile={}",
+        String::from_utf8_lossy(BRAKEDOWN_CODE_PROFILE)
+    );
+    println!(
+        "code_actual_rate={:.9}",
+        code.source_columns as f64 / encoded_columns as f64
+    );
+    println!(
+        "code_parameter_alpha={:.9}",
+        BRAKEDOWN_ALPHA_NUMERATOR as f64 / BRAKEDOWN_ALPHA_DENOMINATOR as f64
+    );
+    println!(
+        "code_parameter_beta={:.9}",
+        BRAKEDOWN_BETA_NUMERATOR as f64 / BRAKEDOWN_BETA_DENOMINATOR as f64
+    );
+    println!(
+        "code_conditional_relative_distance={:.9}",
+        code.conditional_minimum_weight()? as f64 / encoded_columns as f64
+    );
+    println!("code_a_requested_row_weight={BRAKEDOWN_A_ROW_WEIGHT}");
+    println!("code_b_requested_row_weight={BRAKEDOWN_B_ROW_WEIGHT}");
+    println!("code_sparse_levels={}", code.sparse_levels());
+    println!("code_base_message_columns={}", code.base_message_columns());
+    println!("code_multiplications_per_row={multiplications}");
+    println!(
+        "code_multiplications_per_source_value={:.9}",
+        multiplications as f64 / code.source_columns as f64
+    );
+    println!("code_coefficient_minimum_magnitude=5.000000000e-1");
+    println!("code_coefficient_maximum_magnitude=9.99999999999999778e-1");
+    println!("code_matrix_payload_bytes={}", code.matrix_payload_bytes()?);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn verify_residual_composition(
     problem: &GeneratedProblem,
-    code: &SparseSystematicCode,
+    code: &BrakedownCode,
     root: [u8; 32],
     padded_columns: usize,
     rows: usize,
@@ -1410,6 +1860,8 @@ fn verify_residual_composition(
     let padded_dimension = problem.dimension().next_power_of_two();
     let mut transcript =
         initialize_residual_transcript(problem, root, rows, code, queries, code_seed)?;
+    let testing_row_weights = derive_testing_row_weights(&mut transcript, rows)?;
+    absorb_source_combination(&mut transcript, 0, &proof.source_combinations[0])?;
 
     absorb_float(
         &mut transcript,
@@ -1474,7 +1926,8 @@ fn verify_residual_composition(
 
     let solution_packed_point = packed_endpoint_point(0.0, &matvec.endpoint.point);
     let residual_packed_point = packed_endpoint_point(1.0, &norm.endpoint.point);
-    absorb_combinations(&mut transcript, &proof.source_combinations)?;
+    absorb_source_combination(&mut transcript, 1, &proof.source_combinations[1])?;
+    absorb_source_combination(&mut transcript, 2, &proof.source_combinations[2])?;
     let expected_queries = derive_query_indices(&mut transcript, encoded_columns, queries)?;
     if proof.opening.indices != expected_queries {
         return Err(invalid(
@@ -1482,13 +1935,22 @@ fn verify_residual_composition(
         ));
     }
 
+    let (_, solution_row_point) =
+        split_commitment_point(&solution_packed_point, rows, code.source_columns)?;
+    let (_, residual_row_point) =
+        split_commitment_point(&residual_packed_point, rows, code.source_columns)?;
+    let row_weights = [
+        testing_row_weights,
+        equality_table(solution_row_point)?,
+        equality_table(residual_row_point)?,
+    ];
     let queried_combination_maximum_absolute_defect = verify_batched_opening(
         root,
         padded_columns,
         encoded_columns,
         rows,
         code,
-        [&solution_packed_point, &residual_packed_point],
+        &row_weights,
         &proof.source_combinations,
         &proof.opening,
     )?;
@@ -1498,11 +1960,11 @@ fn verify_residual_composition(
     let (residual_column_point, _) =
         split_commitment_point(&residual_packed_point, rows, code.source_columns)?;
     let opened_solution = dot(
-        &proof.source_combinations[0],
+        &proof.source_combinations[1],
         &equality_table(solution_column_point)?,
     )?;
     let opened_residual = dot(
-        &proof.source_combinations[1],
+        &proof.source_combinations[2],
         &equality_table(residual_column_point)?,
     )?;
 
@@ -1534,22 +1996,16 @@ fn verify_batched_opening(
     padded_columns: usize,
     encoded_columns: usize,
     rows: usize,
-    code: &SparseSystematicCode,
-    packed_points: [&[f64]; 2],
-    source_combinations: &[Vec<f64>; 2],
-    opening: &NaiveOpening,
+    code: &BrakedownCode,
+    row_weights: &[Vec<f64>; 3],
+    source_combinations: &[Vec<f64>; 3],
+    opening: &ColumnOpening,
 ) -> Result<f64, io::Error> {
-    let tree_height = padded_columns.ilog2() as usize;
     let expected_values = opening
         .indices
         .len()
         .checked_mul(rows)
         .ok_or_else(|| invalid("opened value shape overflow"))?;
-    let expected_authentication = opening
-        .indices
-        .len()
-        .checked_mul(tree_height)
-        .ok_or_else(|| invalid("opening authentication shape overflow"))?;
     if opening.indices.is_empty()
         || opening.indices.windows(2).any(|pair| pair[0] >= pair[1])
         || opening
@@ -1557,44 +2013,31 @@ fn verify_batched_opening(
             .iter()
             .any(|&index| index >= encoded_columns)
         || opening.values.len() != expected_values
-        || opening.authentication.len() != expected_authentication
         || source_combinations
             .iter()
             .any(|combination| combination.len() != code.source_columns)
+        || row_weights.iter().any(|weights| weights.len() != rows)
     {
         return Err(invalid("batched opening shape is invalid"));
     }
+    verify_column_multiproof(
+        root,
+        padded_columns,
+        &opening.indices,
+        &opening.values,
+        rows,
+        &opening.authentication,
+    )?;
 
-    let mut row_weights = Vec::with_capacity(2);
-    let mut combined_parity = Vec::with_capacity(2);
-    for (packed_point, source_combination) in packed_points.iter().zip(source_combinations) {
-        let (_, row_point) = split_commitment_point(packed_point, rows, code.source_columns)?;
-        row_weights.push(equality_table(row_point)?);
-        combined_parity.push(code.encode_vector(source_combination)?);
-    }
+    let combined_parity = source_combinations
+        .iter()
+        .map(|combination| code.encode_vector(combination))
+        .collect::<Result<Vec<_>, io::Error>>()?;
 
     let mut maximum_absolute_defect = 0.0_f64;
     for (query, &column_index) in opening.indices.iter().enumerate() {
         let values = &opening.values[query * rows..(query + 1) * rows];
-        let path = &opening.authentication[query * tree_height..(query + 1) * tree_height];
-        let mut hash = hash_column(column_index, values);
-        let mut level_index = column_index;
-        for (level, sibling) in path.iter().enumerate() {
-            let parent_index = level_index / 2;
-            hash = if level_index.is_multiple_of(2) {
-                hash_node(level + 1, parent_index, &hash, sibling)
-            } else {
-                hash_node(level + 1, parent_index, sibling, &hash)
-            };
-            level_index = parent_index;
-        }
-        if hash != root {
-            return Err(invalid(
-                "batched opening authentication path does not match the root",
-            ));
-        }
-
-        for endpoint in 0..2 {
+        for endpoint in 0..source_combinations.len() {
             let actual = dot(values, &row_weights[endpoint])?;
             let expected = if column_index < code.source_columns {
                 source_combinations[endpoint][column_index]
@@ -1742,6 +2185,93 @@ fn hash_node(level: usize, index: usize, left: &[u8; 32], right: &[u8; 32]) -> [
     *hasher.finalize().as_bytes()
 }
 
+fn verify_column_multiproof(
+    root: [u8; 32],
+    padded_columns: usize,
+    indices: &[usize],
+    values: &[f64],
+    rows: usize,
+    frontier: &[[u8; 32]],
+) -> Result<(), io::Error> {
+    if padded_columns == 0
+        || !padded_columns.is_power_of_two()
+        || indices.is_empty()
+        || indices.windows(2).any(|pair| pair[0] >= pair[1])
+        || indices.iter().any(|&index| index >= padded_columns)
+    {
+        return Err(invalid(
+            "column multiproof indices or tree shape are invalid",
+        ));
+    }
+    let expected_values = indices
+        .len()
+        .checked_mul(rows)
+        .ok_or_else(|| invalid("column multiproof value count overflow"))?;
+    if values.len() != expected_values {
+        return Err(invalid("column multiproof has the wrong number of values"));
+    }
+
+    let mut active = Vec::new();
+    active
+        .try_reserve_exact(indices.len())
+        .map_err(|_| invalid("could not allocate column multiproof leaves"))?;
+    for (query, &index) in indices.iter().enumerate() {
+        active.push((
+            index,
+            hash_column(index, &values[query * rows..(query + 1) * rows]),
+        ));
+    }
+
+    let mut frontier_index = 0_usize;
+    let mut width = padded_columns;
+    let mut level = 1_usize;
+    while width > 1 {
+        let mut parents = Vec::new();
+        parents
+            .try_reserve_exact(active.len().div_ceil(2))
+            .map_err(|_| invalid("could not allocate column multiproof parents"))?;
+        let mut active_index = 0_usize;
+        while active_index < active.len() {
+            let (index, hash) = active[active_index];
+            let parent_index = index / 2;
+            let (left, right, consumed) = if index.is_multiple_of(2)
+                && active
+                    .get(active_index + 1)
+                    .is_some_and(|(next_index, _)| *next_index == index + 1)
+            {
+                (hash, active[active_index + 1].1, 2)
+            } else {
+                let sibling = frontier
+                    .get(frontier_index)
+                    .copied()
+                    .ok_or_else(|| invalid("column multiproof frontier is truncated"))?;
+                frontier_index += 1;
+                if index.is_multiple_of(2) {
+                    (hash, sibling, 1)
+                } else {
+                    (sibling, hash, 1)
+                }
+            };
+            parents.push((parent_index, hash_node(level, parent_index, &left, &right)));
+            active_index += consumed;
+        }
+        active = parents;
+        width /= 2;
+        level += 1;
+    }
+
+    if frontier_index != frontier.len()
+        || active.len() != 1
+        || active[0].0 != 0
+        || active[0].1 != root
+    {
+        return Err(invalid(
+            "column multiproof frontier does not reconstruct the committed root",
+        ));
+    }
+    Ok(())
+}
+
 fn combine_columns(
     source: &[f64],
     parity: &[f64],
@@ -1760,6 +2290,36 @@ fn combine_columns(
     for column_index in 0..encoded_columns {
         combined.push(dot(
             column(source, parity, rows, source_columns, column_index),
+            weights,
+        )?);
+    }
+    Ok(combined)
+}
+
+fn combine_source_columns(
+    source: &[f64],
+    rows: usize,
+    source_columns: usize,
+    weights: &[f64],
+) -> Result<Vec<f64>, io::Error> {
+    if weights.len() != rows {
+        return Err(invalid("row weights do not match the source matrix shape"));
+    }
+    let expected_values = rows
+        .checked_mul(source_columns)
+        .ok_or_else(|| invalid("source combination shape overflow"))?;
+    if source.len() != expected_values {
+        return Err(invalid(
+            "source storage does not match the source matrix shape",
+        ));
+    }
+    let mut combined = Vec::new();
+    combined
+        .try_reserve_exact(source_columns)
+        .map_err(|_| invalid("could not allocate source row combination"))?;
+    for column_index in 0..source_columns {
+        combined.push(dot(
+            &source[column_index * rows..(column_index + 1) * rows],
             weights,
         )?);
     }
@@ -1883,7 +2443,7 @@ mod tests {
         let source_columns = 8;
         let dimension = rows * source_columns;
         let source = generate_source(dimension, dimension, 7)?;
-        let code = SparseSystematicCode::new(source_columns, 4, 2, 11)?;
+        let code = BrakedownCode::new(source_columns, 11)?;
         let parity = code.encode_rows(&source, rows)?;
         let encoded_columns = code.encoded_columns()?;
         let tree = build_column_tree(&source, &parity, rows, source_columns, encoded_columns)?;
@@ -1897,7 +2457,8 @@ mod tests {
             &weights,
         )?;
         let combined_parity = code.encode_vector(&combined[..source_columns])?;
-        let opening = tree.naive_opening(&source, &parity, rows, source_columns, 4, 17)?;
+        let opening =
+            tree.opening_at_indices(&source, &parity, rows, source_columns, &[0, 3, 8, 11])?;
         let metrics = opening.verify(
             &tree,
             rows,
@@ -1923,10 +2484,40 @@ mod tests {
                 .is_err()
         );
 
-        let mut bad_path = opening;
+        let mut bad_path = opening.clone();
         bad_path.authentication[0][0] ^= 1;
         assert!(
             bad_path
+                .verify(
+                    &tree,
+                    rows,
+                    source_columns,
+                    &weights,
+                    &combined[..source_columns],
+                    &combined_parity,
+                )
+                .is_err()
+        );
+
+        let mut missing_frontier = opening.clone();
+        missing_frontier.authentication.pop();
+        assert!(
+            missing_frontier
+                .verify(
+                    &tree,
+                    rows,
+                    source_columns,
+                    &weights,
+                    &combined[..source_columns],
+                    &combined_parity,
+                )
+                .is_err()
+        );
+
+        let mut extra_frontier = opening;
+        extra_frontier.authentication.push([0x5a; 32]);
+        assert!(
+            extra_frontier
                 .verify(
                     &tree,
                     rows,
@@ -1946,10 +2537,8 @@ mod tests {
         let source_columns = 4;
         let dimension = rows * source_columns;
         let source = generate_source(dimension, dimension, 19)?;
-        let first_code = SparseSystematicCode::new(source_columns, 2, 2, 23)?;
-        let second_code = SparseSystematicCode::new(source_columns, 2, 2, 23)?;
-        assert_eq!(first_code.neighbors, second_code.neighbors);
-        assert_eq!(first_code.signs, second_code.signs);
+        let first_code = BrakedownCode::new(source_columns, 23)?;
+        let second_code = BrakedownCode::new(source_columns, 23)?;
         let first_parity = first_code.encode_rows(&source, rows)?;
         let second_parity = second_code.encode_rows(&source, rows)?;
         assert_eq!(first_parity, second_parity);
@@ -1972,19 +2561,80 @@ mod tests {
     }
 
     #[test]
-    fn invalid_code_degree_is_rejected() {
-        assert!(SparseSystematicCode::new(4, 2, 0, 1).is_err());
-        assert!(SparseSystematicCode::new(4, 2, 3, 1).is_err());
-        assert!(SparseSystematicCode::new(4, 2, 8, 1).is_err());
+    fn invalid_code_shapes_are_rejected() {
+        assert!(BrakedownCode::new(0, 1).is_err());
+        assert!(SparseRowMatrix::new(0, 2, 1, 1).is_err());
+        assert!(SparseRowMatrix::new(2, 0, 1, 1).is_err());
+        assert!(SparseRowMatrix::new(2, 2, 0, 1).is_err());
     }
 
     #[test]
-    fn sparse_surrogate_exposes_its_single_coordinate_escape_rate() -> Result<(), Box<dyn Error>> {
-        let code = SparseSystematicCode::new(4096, 2048, 4, 29)?;
-        let (minimum_weight, maximum_weight) = single_source_encoded_weight_range(&code)?;
-        let miss = without_replacement_miss_probability(6144, minimum_weight, 16)?;
-        assert!(minimum_weight < maximum_weight);
-        assert!(miss > 0.98);
+    fn recursive_layout_matches_the_paper_recurrence() -> Result<(), Box<dyn Error>> {
+        let code = BrakedownCode::new(2048, 29)?;
+        assert_eq!(code.encoded_columns()?, 2910);
+        assert_eq!(code.parity_columns(), 862);
+        assert_eq!(code.sparse_levels(), 2);
+        assert_eq!(code.base_message_columns(), 30);
+        assert_eq!(code.multiplication_count()?, 27_084);
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_matrices_are_input_row_regular() -> Result<(), Box<dyn Error>> {
+        let matrix = SparseRowMatrix::new(19, 11, 6, 31)?;
+        assert_eq!(matrix.edge_count(), 19 * 6);
+        for row in matrix.output_indices.chunks_exact(matrix.row_weight) {
+            let mut sorted = row.to_vec();
+            sorted.sort_unstable();
+            assert!(sorted.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batched_row_encoding_matches_independent_vectors() -> Result<(), Box<dyn Error>> {
+        let rows = 4;
+        let columns = 64;
+        let source = generate_source(rows * columns, rows * columns, 37)?;
+        let code = BrakedownCode::new(columns, 41)?;
+        let batched = code.encode_rows(&source, rows)?;
+        for row in 0..rows {
+            let message = (0..columns)
+                .map(|column| source[column * rows + row])
+                .collect::<Vec<_>>();
+            let encoded = code.encode_vector(&message)?;
+            for (column, &expected) in encoded.iter().enumerate() {
+                assert_eq!(batched[column * rows + row].to_bits(), expected.to_bits());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recursive_code_spreads_unit_and_two_sparse_messages() -> Result<(), Box<dyn Error>> {
+        let columns = 64;
+        let code = BrakedownCode::new(columns, 43)?;
+        let target = code.conditional_minimum_weight()?;
+        let (minimum_unit, maximum_unit) = unit_encoded_weight_range(&code)?;
+        assert!(minimum_unit >= target);
+        assert!(maximum_unit >= minimum_unit);
+
+        let mut message = vec![0.0; columns];
+        let mut minimum_two_sparse = usize::MAX;
+        for left in 0..columns {
+            for right in left + 1..columns {
+                for right_sign in [-1.0, 1.0] {
+                    message[left] = 1.0;
+                    message[right] = right_sign;
+                    let encoded = code.encode_full_vector(&message)?;
+                    let weight = encoded.iter().filter(|value| **value != 0.0).count();
+                    minimum_two_sparse = minimum_two_sparse.min(weight);
+                    message[left] = 0.0;
+                    message[right] = 0.0;
+                }
+            }
+        }
+        assert!(minimum_two_sparse >= target);
         Ok(())
     }
 
@@ -2000,7 +2650,7 @@ mod tests {
         let padded_dimension = dimension.next_power_of_two();
         let packed_dimension = 2 * padded_dimension;
         let source_columns = packed_dimension / rows;
-        let code = SparseSystematicCode::new(source_columns, source_columns / 2, 4, code_seed)?;
+        let code = BrakedownCode::new(source_columns, code_seed)?;
         let encoded_columns = code.encoded_columns()?;
         let residual = compute_generated_residual(&problem, &solution)?;
         let source =
@@ -2009,6 +2659,10 @@ mod tests {
         let tree = build_column_tree(&source, &parity, rows, source_columns, encoded_columns)?;
         let mut transcript =
             initialize_residual_transcript(&problem, tree.root(), rows, &code, queries, code_seed)?;
+        let testing_row_weights = derive_testing_row_weights(&mut transcript, rows)?;
+        let testing_combination =
+            combine_source_columns(&source, rows, source_columns, &testing_row_weights)?;
+        absorb_source_combination(&mut transcript, 0, &testing_combination)?;
 
         let residual_left = source[padded_dimension..].to_vec();
         let residual_right = residual_left.clone();
@@ -2060,24 +2714,12 @@ mod tests {
         let solution_point = packed_endpoint_point(0.0, &matvec_endpoint.point);
         let residual_point = packed_endpoint_point(1.0, &norm_endpoint.point);
         let source_combinations = [
-            prepare_endpoint_combination(
-                &source,
-                &parity,
-                rows,
-                source_columns,
-                encoded_columns,
-                &solution_point,
-            )?,
-            prepare_endpoint_combination(
-                &source,
-                &parity,
-                rows,
-                source_columns,
-                encoded_columns,
-                &residual_point,
-            )?,
+            testing_combination,
+            prepare_endpoint_combination(&source, rows, source_columns, &solution_point)?,
+            prepare_endpoint_combination(&source, rows, source_columns, &residual_point)?,
         ];
-        absorb_combinations(&mut transcript, &source_combinations)?;
+        absorb_source_combination(&mut transcript, 1, &source_combinations[1])?;
+        absorb_source_combination(&mut transcript, 2, &source_combinations[2])?;
         let indices = derive_query_indices(&mut transcript, encoded_columns, queries)?;
         let opening = tree.opening_at_indices(&source, &parity, rows, source_columns, &indices)?;
         let proof = ResidualCompositionProof {
@@ -2104,6 +2746,23 @@ mod tests {
         assert!(metrics.matvec_sumcheck_maximum_absolute_defect.is_finite());
         assert!(metrics.residual_opening_absolute_defect.is_finite());
         assert!(metrics.solution_opening_absolute_defect.is_finite());
+
+        let mut changed_testing_combination = proof.clone();
+        changed_testing_combination.source_combinations[0][0] =
+            f64::from_bits(changed_testing_combination.source_combinations[0][0].to_bits() ^ 1);
+        assert!(
+            verify_residual_composition(
+                &problem,
+                &code,
+                tree.root(),
+                tree.padded_columns,
+                rows,
+                queries,
+                code_seed,
+                &changed_testing_combination,
+            )
+            .is_err()
+        );
 
         let mut changed_endpoint = proof.clone();
         changed_endpoint.solution_at_column_point =

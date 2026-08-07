@@ -1,266 +1,264 @@
-# Brakedown-shaped binary64 commitment cost floor
+# Recursive Brakedown-layout binary64 experiment
 
-Status: throughput and two-sumcheck composition experiments without a
-proximity or soundness claim.
+Status: faithful implementation of Brakedown's recursive encoder layout and
+testing schedule, but **not** an instantiation of its finite-field distance or
+soundness theorem.
 
 This benchmark accompanies
 [`brakedown-inspired-binary64-metric-commitments.md`](../../proposals/brakedown-inspired-binary64-metric-commitments.md).
-It asks whether removing the global FFT is worth deeper theoretical work. It
-does not instantiate Brakedown's code or register a proof protocol.
+It replaces the first degree-4 throughput proxy with the actual recursive
+shape from Brakedown and composes that commitment with the repository's two
+binary64 residual sumchecks. The experiment asks two separate questions:
 
-## Surrogate pipeline
+1. Does the recursive code destroy the attractive prover cost measured for the
+   proxy? No: its encoding cost is small enough that the band-32 composed prover
+   remains faster than the recorded factorization-plus-solve.
+2. Does using the recursive shape establish binary64 soundness? No: the
+   finite-field distance proof does not transfer to dyadic binary64 arithmetic.
 
-The release example
-[`brakedown_metric_commitment.rs`](../../crates/ssv-fast/examples/brakedown_metric_commitment.rs)
-performs:
+The executable prints the second limitation in its status line and labels every
+distance-derived escape probability as conditional.
 
-1. systematic degree-4 row encoding with signed dyadic weights;
-2. BLAKE3 hashing of every encoded column and a retained flat Merkle tree;
-3. one challenged linear combination of every encoded column;
-4. encoding of the source part of that combination;
-5. comparison of encode-then-combine with combine-then-encode;
-6. extraction of 16 complete columns and their naive authentication paths; and
-7. verifier-side authentication and metric comparison of those openings.
+## What is implemented
 
-The synthetic source contains deterministic values in `[-1, 1)` with up to 52
-fractional bits. This intentionally exposes binary64 operation-order defects;
-a low-precision dyadic source made both linearity orders bit-identical.
+For a source row `x`, the encoder recursively computes
 
-The row code is only a data-movement surrogate. Its deterministic graph has no
-claimed expansion, distance, local-test, or decoder theorem. Authentication
-paths are stored independently rather than as a deduplicated multiproof, so
-the byte figures are conservative for the implemented tree.
+```text
+y = x A
+z = Enc(y)
+v = z B
+Enc(x) = (x, z, v).
+```
 
-## Residual-composition mode
+Both `A` and `B` are stored as flat input-row-regular sparse matrices. Each
+input coordinate chooses distinct output coordinates, matching the orientation
+of Brakedown's matrix distribution rather than the proxy's fixed-neighbor
+parity columns. The profile uses the fastest large-field parameter row reported
+by the original paper:
 
-The same example has an explicit `--residual-composition` mode. It keeps the
-surrogate commitment but replaces the synthetic source with the padded message
-`[x || r]` for a registered shifted graph-Laplacian problem. It then performs:
+```text
+rate rho              = 0.704
+claimed distance delta = 0.02
+alpha                  = 0.1195
+beta = delta / rho     = 0.0284
+A row weight           = 6
+B row weight           = 33
+base threshold         = 30
+```
 
-1. the sparse pass `r = A x - b`;
-2. a product sumcheck for `sum_i r_i^2`, yielding `rho` and
-   `r_tilde(rho)`;
+The resulting 2,048-column code has 2,910 encoded columns, two sparse levels,
+and 27,084 multiply-adds per row, or 13.225 per source value. Encoding all rows
+is therefore linear in the source table size.
+
+The experiment deliberately differs from Brakedown in two decisive ways:
+
+- sparse coefficients are signed 52-bit dyadic binary64 values with magnitude
+  in `[0.5, 1)`, not uniform nonzero elements of a large finite field; and
+- the terminal code is a small dense random systematic dyadic code, not the
+  paper's exact Reed--Solomon base code.
+
+Those substitutions retain the data layout and arithmetic count, but invalidate
+the paper's cancellation and minimum-distance arguments. A unit-vector scan is
+reported only as a falsification diagnostic; it is not a minimum-distance
+calculation because linear combinations can have lower support or much smaller
+metric amplitude.
+
+## Commitment and testing schedule
+
+The source and recursively generated parity columns are committed by a BLAKE3
+Merkle tree. Openings use one canonical, deduplicated multiproof frontier rather
+than independent paths.
+
+Residual-composition mode commits the padded table `[x || r]`, where
+`r = A x - b`, before deriving any testing challenge. It then performs:
+
+1. an independent transcript-derived random row combination for the Brakedown
+   codeword test;
+2. a product sumcheck for `sum_i r_i^2`;
 3. a sparse pass forming `w_j = sum_i eq(rho,i) A_ij`;
 4. a product sumcheck for
-   `b_tilde(rho) + r_tilde(rho) = sum_j w_j x_j`, yielding `sigma` and
-   `x_tilde(sigma)`;
-5. two row combinations of the one committed matrix for the packed MLE points
-   `(0, sigma)` and `(1, rho)`; and
-6. one shared set of sampled encoded columns authenticating both combinations.
+   `b_tilde(rho) + r_tilde(rho) = sum_j w_j x_j`;
+5. source row combinations for the two terminal MLE points; and
+6. one shared set of sampled encoded columns authenticating all three supplied
+   combinations.
 
-The verifier replays both sumchecks, evaluates the registered public matrix
-and RHS MLEs, authenticates each opened column once, and reports every
-binary64 defect. Changing a terminal claim changes the subsequent query
-schedule; stale claims or Merkle paths fail structural verification.
+The commitment root fixes the table before the independent random row vector.
+All three source combinations are fixed before the shared query set. The
+verifier replays both sumchecks, evaluates the registered public matrix and RHS
+MLEs, verifies the compact multiproof, re-encodes each supplied source
+combination, and reports binary64 discrepancies.
 
-This is an end-to-end **composition cost**, not an end-to-end sound proof. The
-implemented degree-4 graph is not a distance code, so the sampled-column step
-is explicitly conditioned on an unavailable proximity theorem. The benchmark
-prints the minimum encoded weight of a one-source-coordinate change and its
-exact without-replacement query miss probability to make that limitation
-visible in every run.
+This is the relevant Brakedown test order. The earlier proxy reused structured
+sumcheck endpoint weights and therefore omitted the independent random row
+combination that is central to the codeword test.
 
 ## Reproduction
+
+Build the isolated release example:
 
 ```sh
 cargo +stable build --release -p ssv-fast \
   --example brakedown_metric_commitment
-target/release/examples/brakedown_metric_commitment \
-  --dimension 1048576 \
-  --rows 256 \
-  --parity-denominator 2 \
-  --degree 4 \
-  --queries 16 \
-  --warmups 2 \
-  --repetitions 25
 ```
 
-The composed 1M offset-32 run is:
+The stable 1M band-32 run at the proof-size stretch target was:
 
 ```sh
-target/release/examples/brakedown_metric_commitment \
+/usr/bin/time -v target/release/examples/brakedown_metric_commitment \
   --residual-composition \
   --dimension 1048576 \
-  --rows 1024 \
+  --rows 128 \
   --offsets 1,32 \
-  --parity-denominator 2 \
-  --degree 4 \
-  --queries 16 \
+  --queries 512 \
   --warmups 2 \
   --repetitions 25
 ```
 
-Use `--offsets 1` for the half-bandwidth-1 comparison. The candidate solution
-is generated outside the timer as `1` plus a deterministic integer multiple
-of `2^-24`; `--perturbation-bits` changes that scale. Problem compilation is
-also excluded. Residual construction, all commitment work, both sumchecks,
-both sparse proof scans, and opening extraction are included.
+Use `--offsets 1` for the half-bandwidth-1 comparison. The low-query cost floor
+uses `--rows 1024 --queries 16`. The more aggressive sampling points use
+`--rows 64 --queries 1024` or `--rows 64 --queries 1536`.
 
-The master seed defaults to `0x5eedc0ded15ca11e`. Graph, source, row-weight,
-column-weight, and query seeds are deterministically domain-separated in the
-example. The output includes the commitment root and all benchmark parameters.
+The candidate solution is generated outside the timer as `1` plus a
+deterministic integer multiple of `2^-24`. Problem compilation, graph
+construction, and the exhaustive unit-vector diagnostic are also outside the
+timer. Residual construction, packing, recursive encoding, commitment, the
+independent code test combination, both sumchecks, both sparse proof scans,
+terminal combinations, opening extraction, and proof verification are timed.
 
 ## Environment
 
 - CPU: Intel Core i7-1360P
 - OS: Linux 7.0.11 x86-64
-- Rust: 1.97.0
+- Rust: stable 1.97.0
 - Build: release, thin LTO, one process and one thread
-- Timing: two warm-ups followed by 25 repetitions
-- Dimension: `2^20 = 1,048,576` source binary64 values
-- Code surrogate: one parity column per two source columns, degree 4
-- Queries: 16 complete columns
+- Logical solution dimension: `2^20 = 1,048,576`
+- Committed source: padded `[x || r]`, or `2^21` binary64 values
+- Timing: two warm-ups followed by 25 repetitions unless marked exploratory
 
-## Results
+The laptop exhibited run-to-run and thermal variation. Tables therefore retain
+the observed min--max range instead of treating the median as an exact machine
+constant.
 
-The total prover-side surrogate includes encoding, commitment, combination,
-combination encoding, defect calculation, and opening extraction. It excludes
-the separately reported opening verification.
+## Stable results
 
-| Rows | Source columns | Total | Encode | Commit | Combine | Opening bytes | Opening verification | Peak RSS |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 | 4,096 | 16.739 ms | 2.052 ms | 13.854 ms | 0.745 ms | 72,352 B | 0.063 ms | 15,300 KiB |
-| 512 | 2,048 | 16.086 ms | 1.990 ms | 13.241 ms | 0.791 ms | 88,224 B | 0.093 ms | 15,076 KiB |
-| 1,024 | 1,024 | 14.963 ms | 1.889 ms | 12.359 ms | 0.763 ms | 145,056 B | 0.145 ms | 15,040 KiB |
-| 2,048 | 512 | 14.346 ms | 1.816 ms | 11.793 ms | 0.762 ms | 271,520 B | 0.256 ms | 15,132 KiB |
-| 4,096 | 256 | 14.363 ms | 1.849 ms | 11.672 ms | 0.768 ms | 531,104 B | 0.491 ms | 15,204 KiB |
+### Sixteen-query cost floor
 
-The `256 x 4096` layout minimizes bytes among the tested shapes because opening
-cost is approximately
+These runs use 1,024 rows, 2,048 source columns, 2,910 encoded columns, and 16
+shared column queries.
 
-```text
-8 * (source_columns + queries * rows) + authentication.
-```
+| Offsets | Structural nnz | Prover median | Min--max | Verifier median | Estimated artifact | Artifact / solution | Peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `[1]` | 3,145,726 | 150.551 ms | 146.954--158.313 ms | 16.737 ms | 184,728 B | 2.20% | 61,688 KiB |
+| `[1, 32]` | 5,242,814 | 179.501 ms | 161.878--187.378 ms | 33.770 ms | 184,984 B | 2.21% | 61,608 KiB |
 
-The square layout is slightly faster because it initializes fewer column
-hashers, but sends twice as many bytes for this query count. Layout therefore
-needs to be selected from the measured proof-size/runtime frontier rather than
-fixed to `sqrt(N)` by analogy.
+Sixteen queries are not a useful proximity setting. Conditional even on the
+unavailable 2%-distance theorem, the paper's `beta/3` proximity event is missed
+with probability about `0.8953`.
 
-For the `256 x 4096` layout, the retained tree is 512 KiB, source storage is 8
-MiB, and parity storage is 4 MiB. The opening is 0.86% of the raw vector size.
-Commitment hashing accounts for about 83% of the measured pipeline.
+### 512-query proof-size stretch point
 
-The honest binary64 linearity observations were:
+These runs use 128 rows, 16,384 source columns, 23,273 encoded columns, and 512
+shared queries. This shape balances the three source combinations against the
+opened columns and compact authentication frontier.
 
-| Rows | Maximum absolute defect | RMS absolute defect | Maximum queried defect |
-| ---: | ---: | ---: | ---: |
-| 256 | 7.63e-17 | 1.44e-17 | 2.43e-17 |
-| 512 | 9.71e-17 | 1.41e-17 | 3.12e-17 |
-| 1,024 | 7.29e-17 | 1.38e-17 | 1.91e-17 |
-| 2,048 | 5.38e-17 | 1.34e-17 | 2.21e-17 |
-| 4,096 | 6.94e-17 | 1.54e-17 | 3.30e-17 |
-
-These defects are measurements, not acceptance thresholds. In particular, the
-queried maximum being smaller than the global maximum illustrates why sampled
-observations require a confidence statement and magnitude or energy control.
-
-## Two-sumcheck composition results
-
-The composed runs used the same machine and release profile, one thread, two
-warm-ups, and 25 measured repetitions. The packed two-table message used 1,024
-rows and 2,048 source columns, one parity column per two source columns,
-degree 4, and 16 shared column queries.
-
-| Offsets | Structural nnz | Prover median | Min--max | Verifier median | Estimated proof | Peak RSS |
+| Offsets | Prover median | Min--max | Verifier median | Estimated artifact | Artifact / solution | Peak RSS |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `[1]` | 3,145,726 | 142.419 ms | 133.973--148.457 ms | 16.452 ms | 171,128 B | 60,224 KiB |
-| `[1, 32]` | 5,242,814 | 171.202 ms | 160.415--180.859 ms | 30.584 ms | 171,128 B | 60,240 KiB |
+| `[1]` | 159.292 ms | 147.005--166.129 ms | 17.823 ms | 1,000,344 B | 11.93% | 63,968 KiB |
+| `[1, 32]` | 192.992 ms | 181.240--202.093 ms | 34.635 ms | 999,288 B | 11.91% | 64,248 KiB |
 
-The proof estimate includes one 32-byte root, the three scalar claims, both
-20-round quadratic sumchecks, both complete source row combinations, 16 full
-opened columns, indices, and naive authentication paths. It is not canonical
-serialization. It is 2.04% of the 8 MiB raw solution.
+For the band-32 run, median recursive encoding was 11.498 ms and commitment was
+29.484 ms. The random test combination was 1.199 ms. The sparse residual and
+row-compression work plus the two sumchecks remain the dominant work. The code
+graph itself occupies 2,590,884 bytes and is reusable across proofs.
 
-Median offset-32 prover stages were:
+The smallest observed encoded support among all unit source messages was 4,703
+of 23,273 columns. This is encouraging evidence that the isolated-coordinate
+failure of the proxy is gone, but it is not a bound for arbitrary nonzero
+messages. The conditional `beta/3` proximity miss probability at 512 queries is
+`0.0307455`.
 
-| Stage | Time |
-| --- | ---: |
-| Residual sparse pass | 46.463 ms |
-| Packed-message copy | 5.934 ms |
-| Sparse row encoding | 5.594 ms |
-| Column/tree commitment | 23.722 ms |
-| Residual-norm sumcheck | 23.388 ms |
-| Matvec row-compression sparse pass | 48.935 ms |
-| Matvec sumcheck | 13.441 ms |
-| Two terminal row combinations | 3.512 ms |
-| Opening extraction | 0.024 ms |
+## Exploratory query curve
 
-The two sparse passes account for about 95.4 ms and are now the largest cost.
-There is no global FFT and no third linear-opening sumcheck.
+The following band-32 points used 64 rows and 32,768 source columns. They used
+five and three repetitions, respectively, so they are feasibility measurements
+rather than stable timing comparisons.
 
-The honest maximum defects were `2.07e-25` in the norm transcript,
-`1.11e-16` in the matvec transcript, `9.05e-26` at the residual opening,
-`1.11e-15` at the solution opening, and `5.55e-16` among sampled code
-combinations. These are diagnostic observations, not a derived acceptance
-threshold.
+| Queries | Prover median | Verifier median | Estimated artifact | Artifact / solution | Conditional `beta/3` miss | Peak RSS |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 187.859 ms | 34.789 ms | 1,475,032 B | 17.58% | `9.67e-4` | 76,104 KiB |
+| 1,536 | 195.855 ms | 37.898 ms | 1,789,048 B | 21.33% | `2.83e-5` | 72,588 KiB |
 
-### Deliberate falsification result
-
-For this shape the surrogate has 3,072 encoded columns. Its minimum encoded
-weight for changing one source coordinate is only one: at least one systematic
-source coordinate happens to have no adjacent parity column. Sixteen uniform
-queries without replacement miss that coordinate with probability
-
-```text
-3056 / 3072 = 0.9947916667.
-```
-
-This is decisive evidence that the throughput graph cannot serve as the final
-code. The good runtime answers only the composition-cost question. A real
-linear-time code with proved distance and robust local testing must replace the
-surrogate, and the complete benchmark must then be rerun.
+The last row is a useful engineering point: substantially more sampling still
+keeps the prover below the band-32 solve and the artifact below the proposal's
+25% initial limit. It is **not** a soundness estimate. The probability is the
+exact without-replacement miss probability for `ceil(beta C)/3` bad encoded
+columns, conditional on a finite-field theorem that has not been established
+for this code or arithmetic. It also omits random-row cancellation, graph
+generation failure, numerical tolerance, and retry terms.
 
 ## Relation to the measured solves
 
-The earlier 1M SciPy banded-Cholesky measurements, including factorization and
-triangular solve, were 30.491 ms at half-bandwidth 1 and 247.374 ms at
-half-bandwidth 32. The `256 x 4096` surrogate therefore costs about 0.55 and
-0.068 of those solves, respectively.
+The recorded SciPy banded-Cholesky baselines include factorization and
+triangular solve: 30.491 ms at half-bandwidth 1 and 247.374 ms at
+half-bandwidth 32.
 
-The two-sumcheck composition is the more relevant comparison:
+| Profile | Half-bandwidth | SciPy factor + solve | Composed prover | Prover / solve |
+| --- | ---: | ---: | ---: | ---: |
+| 16 queries | 1 | 30.491 ms | 150.551 ms | 4.94x |
+| 16 queries | 32 | 247.374 ms | 179.501 ms | 0.73x |
+| 512 queries | 1 | 30.491 ms | 159.292 ms | 5.22x |
+| 512 queries | 32 | 247.374 ms | 192.992 ms | 0.78x |
 
-| Half-bandwidth | SciPy factor + solve | Composed prover | Prover / solve | Current proof / composed prover |
-| ---: | ---: | ---: | ---: | ---: |
-| 1 | 30.491 ms | 142.419 ms | 4.67x | 11.90x |
-| 32 | 247.374 ms | 171.202 ms | 0.69x | 9.72x |
+The actual recursive encoder adds only a few milliseconds over the prior proxy;
+it does not consume the performance budget. On the intended band-32 benchmark,
+the complete experimental prover—including the commitment test and residual
+sumchecks—remains faster than factorization plus solve. The very narrow band-1
+solve remains roughly five times faster than proof construction.
 
-Thus the measured offset-32 composition no longer perturbs the benchmark more
-than the solve itself. The offset-1 case remains about 4.7 times the very fast
-banded factor-and-solve. Neither comparison includes the unknown cost needed
-to replace the unsound sparse graph with a defensible Brakedown code.
+For context, the previous degree-4 proxy measured 142.419 ms and 171.202 ms at
+bands 1 and 32, with a 171,128-byte artifact. The recursive experiment is 5.7%
+and 4.8% slower at the 16-query cost floor, respectively. Its important gain is
+structural, not speed: every input coordinate now participates in the recursive
+expander layout and a separate random combination actually tests the committed
+codeword.
 
-This is encouraging but incomplete. The surrogate omits:
+## What the result does not prove
 
-- a defensible linear-time code and its metric proximity analysis;
-- matrix/residual relation work;
-- residual and norm sumchecks;
-- batching and anti-cancellation transcripts;
-- confidence-curve calculation;
-- canonical artifact framing and serialization; and
-- adversarial retry accounting.
+The experiment has not crossed the central theoretical gap:
 
-Consequently, 16.7 ms is a measured cost floor, not a projected complete proof
-time. It does show that sparse encoding plus a complete hash commitment need
-not by themselves exceed the band-1 solve.
+- Brakedown's Hamming-distance theorem is over a finite field; the implemented
+  coefficients and operations are binary64.
+- The dense base code is only a shape-compatible stand-in for exact
+  Reed--Solomon encoding.
+- Hamming support does not control alteration magnitude. Subnormal, scaling,
+  and cancellation attacks can be metrically significant even if a support
+  statement holds.
+- Honest encode-then-combine and combine-then-encode orders differ. The largest
+  sampled defect reached about `2.18e-11` in the 64-row experiments.
+- Unit-message enumeration does not find the minimum-weight codeword and cannot
+  exclude adversarial linear combinations.
+- The conditional sampling curve excludes anti-cancellation and selective-retry
+  accounting.
 
-## Sensitivity
-
-At the `256 x 4096` shape, a separate 25-repetition sweep measured:
-
-| Parity/source | Degree | Encode | Commit | Total |
-| ---: | ---: | ---: | ---: | ---: |
-| 1/2 | 4 | 1.929 ms | 12.890 ms | 15.737 ms |
-| 1/2 | 8 | 3.762 ms | 13.790 ms | 18.685 ms |
-| 1/4 | 4 | 0.981 ms | 11.447 ms | 13.100 ms |
-
-The high-rate surrogate is faster, but no query or rate reduction is justified
-until a concrete code theorem and solve-relative retry model assign its cost.
+The most useful conclusion is therefore narrower: a faithful recursive
+Brakedown *layout* is operationally viable, and the old proxy's obvious
+distance failure is gone. Turning it into a certificate now depends on a
+binary64 metric authentication theorem, not another encoding optimization.
 
 ## Correctness checks
 
-The example tests cover deterministic graph/root construction, successful
-opening authentication, rejection after changing an opened value, rejection
-after changing an authentication hash, and invalid code degrees. The optimized
-run recomputes every queried column combination and reports its numerical
-defects after authenticating the path.
+The example tests cover:
+
+- deterministic graph construction and roots;
+- exact recursive dimensions and multiplication counts;
+- distinct, input-row-regular sparse neighbors;
+- equivalence of batched row encoding and independent vector encoding;
+- exhaustive unit and two-sparse-message support checks on a tiny code;
+- compact multiproof verification and rejection of changed values, missing
+  frontier nodes, extra frontier nodes, and changed authentication nodes;
+- residual transcript replay and rejection after changing a terminal claim,
+  testing combination, or authentication node; and
+- invalid shapes and allocation boundaries.
+
+These are implementation checks, not evidence for the missing binary64
+distance or metric-proximity theorem.
