@@ -316,6 +316,173 @@ Each option must state exactly which message is fixed before each challenge.
 Transcript hashes, optional nonces, selective aborts, and proof retries are
 part of the threat model.
 
+### 6.1 Two-checkpoint append schedule
+
+The most concrete schedule currently under study is:
+
+```text
+C0 = commit(canonical source tables, sumcheck prefix, alpha, v_hat)
+D  = challenge(C0)
+P_hat = alleged row-wise H D checksums
+C1 = commit(domain, C0, D, root(P_hat), shapes, arithmetic profile)
+later checksum-consistency challenges = challenge(C1, ...)
+```
+
+`C1` is append-only: it binds `C0` rather than replacing or rehashing the
+source leaves. Public `D` after `C0` is not itself a problem. The required
+property is that the discrepancy measured by `D` was fixed under `C0`.
+
+The prover is adversarial throughout. Write
+
+```text
+E = P_hat - U D H^T.
+```
+
+The Merkle root in `C1` binds the exact alleged `P_hat`, but it does not imply
+`E = 0`. A complete protocol must derive a justified metric bound on `E`, not
+assume that the appended checksums were honestly computed.
+
+### 6.2 Tempting odd/even reduction
+
+Absorb the diagonal signs into one source row `z = D u` and use column-vector
+notation `p = H_n z`. For `n = 2m`, split both vectors into halves:
+
+```text
+z = (a, b)
+p = (c, d).
+```
+
+The normalized Walsh recursion is
+
+```text
+c = H_m (a + b) / sqrt(2)
+d = H_m (a - b) / sqrt(2).
+```
+
+For a post-parent-commitment challenge `rho`, define
+
+```text
+z' = ((1 + rho) a + (1 - rho) b) / sqrt(2)
+p' = c + rho d.
+```
+
+Then an honest relation shrinks exactly:
+
+```text
+p' = H_m z'.
+```
+
+This resembles the even/odd polynomial fold in FRI. An honest prover can form
+all geometrically shrinking children in `O(n)` work after the initial
+transform, and a verifier can check one opened parent/child location with a
+constant number of arithmetic operations.
+
+The identity proves completeness, but it does **not** supply the proximity
+property that makes the Reed--Solomon fold sound under a small number of
+Merkle queries.
+
+### 6.3 Sparse codeword-switch attack on local folds
+
+Consider a one-coordinate alteration `Delta` fixed under `C0`, before `D`.
+For clarity take the committed row to be zero. A malicious appended table can
+contain
+
+```text
+source side = 0
+parity side = H D Delta.
+```
+
+It is not the encoding of the committed source, but it differs in only one
+systematic coordinate from the valid codeword
+
+```text
+[D Delta || H D Delta].
+```
+
+After seeing the first fold challenge, the prover commits the child obtained
+from that valid codeword. The child is a valid smaller Hadamard relation, so
+every later fold and the terminal scalar can be honest. Only the first-round
+systematic fold equation carrying `Delta` is false.
+
+For width `C = 4096`, the first round has `2048` coordinate pairs. Sixteen
+distinct uniform local queries miss the single false pair with probability
+
+```text
+1 - 16 / 2048 = 0.9921875.
+```
+
+Fresh random signs do not repair this attack: multiplying a unit spike by `D`
+preserves its support. The accompanying executable constructs the attack,
+checks that the malicious child is a valid Hadamard codeword up to binary64
+roundoff, and checks that the final scalar relation is valid independently of
+all later challenges.
+
+This is the missing distinction from Reed--Solomon proximity testing. A
+rate-one-half Reed--Solomon evaluation word has constant relative distance;
+the systematic real frame `[I || H D]` permits the nearby-codeword switch
+above. The standard BLR test for the binary Hadamard code does not apply: that
+code encodes a short linear function by its complete truth table, whereas this
+proposal applies a square Walsh transform to an arbitrary length-`C` real
+vector.
+
+### 6.4 Global sumcheck candidate
+
+The stronger next candidate is a global contraction of the appended relation.
+After `C1`, derive row and column weights `lambda` and `L` and supervise
+
+```text
+s = lambda^T (P_hat - U D H^T) L
+  = lambda^T P_hat L - lambda^T U (D H^T L).
+```
+
+Equivalently, for one vector orientation this contains the proposed quantity
+`L^T (H D) d`. A sumcheck over the table and Walsh butterfly wiring can reduce
+all checksum cells to a few scalar claims. The Walsh recursion makes the
+public wiring regular, and geometrically shrinking table folds suggest an
+`O(R C)` prover pass after checksum generation rather than another global FFT.
+
+This global reduction removes the particular one-unchecked-edge weakness: a
+sparse local lie contributes to a random aggregate fixed only after `C1`.
+It also matches the intended metric semantics. Instead of one Boolean test,
+the transcript can report the observed contraction, scale information,
+roundoff enclosure, and the resulting confidence bound on a norm of `E`.
+
+The endpoint obligation must remain explicit. Ordinary sumcheck ends at fresh
+non-Boolean evaluations such as
+
+```text
+MLE_U(r_U) and MLE_P_hat(r_P).
+```
+
+A Merkle root authenticates Boolean table entries, not these MLE values. If
+the prover merely supplies the endpoint values, the original commitment gap
+has moved to the last line of the sumcheck. Also, standard sumcheck challenges
+cannot simply be forced to equal the earlier point defining `v_hat`: fixing
+the endpoint before the round messages changes the soundness ordering.
+
+This admits a direct attack, not merely a missing proof step. Keep `C1` rooted
+in a table with a material checksum error, but run the sumcheck prover over an
+uncommitted all-zero private table with the public coefficient table. Every
+round relation, the zero initial claim, and the zero private endpoint are then
+internally consistent. The verifier cannot connect that endpoint back to the
+table under `C1`. The executable includes this root-disconnected zero-table
+attack as a deterministic test.
+
+Consequently the global candidate is complete only with an endpoint binding
+mechanism. The concrete alternatives to compare are:
+
+1. the current unit-circle commitment, as a sound but expensive control;
+2. a Brakedown-shaped sparse proximity layer committed under `C0`;
+3. a verifier-maintained streaming linear digest when interaction and input
+   preprocessing are available; or
+4. a different commitment that natively authenticates linear/MLE queries.
+
+The executable implements this transcript-shaped approximate-sumcheck cost
+surrogate. It stops at, labels, and measures the private endpoint claim and
+prints `global_sumcheck_data_endpoint_authenticated=false`. The next target is
+to compare endpoint-binding mechanisms; the surrogate must not be counted as a
+completed proof in the meantime.
+
 ## 7. Initial cost measurement
 
 The accompanying release surrogate uses:
@@ -333,38 +500,49 @@ On the development machine it measured:
 
 | Component | Median |
 | --- | ---: |
-| Hadamard encoding into committed layout | 7.757 ms |
-| Systematic row-to-column transpose | 4.131 ms |
-| Complete 16 MiB column/Merkle commitment | 17.067 ms |
-| Encoded row combination | 1.060 ms |
-| Combination Hadamard transform | 0.019 ms |
-| Opening extraction | 0.080 ms |
-| Defect scan | 0.038 ms |
-| Total prover-side surrogate | 30.239 ms |
-| Opening verification | 0.064 ms |
+| Hadamard encoding into committed layout | 6.617 ms |
+| Systematic row-to-column transpose | 2.432 ms |
+| Complete 16 MiB column/Merkle commitment | 16.175 ms |
+| Encoded row combination | 1.001 ms |
+| Combination Hadamard transform | 0.011 ms |
+| Opening extraction | 0.056 ms |
+| Defect scan | 0.022 ms |
+| Base prover-side surrogate | 26.410 ms |
+| Global relation-table construction and initial contraction | 20.664 ms |
+| Global 21-round product sumcheck | 29.125 ms |
+| Staged prover-side surrogate | 75.692 ms |
+| Opening verification | 0.071 ms |
+| Global sumcheck replay and public endpoint | 0.052 ms |
 
-The 25 measured totals ranged from `26.491` to `33.389` ms. The naive opening
-was `72,352` bytes, peak process RSS was `27,616` KiB, and the maximum honest
-linearity defect was `1.39e-16`.
+The 25 staged totals ranged from `72.259` to `80.281` ms. The naive opening was
+`72,352` bytes and the global sumcheck added `520` bytes, for a `72,872`-byte
+surrogate artifact. A cold staged process peaked at `52,284` KiB RSS. The
+maximum honest transform/combine defect remained `1.39e-16`; the honest global
+relation contraction was `-1.67e-17`.
 
-This cost is approximately:
+The endpoint-incomplete staged cost is approximately:
 
-- `0.99x` the earlier `30.491` ms half-bandwidth-1 factor-and-solve;
-- `0.122x` the earlier `247.374` ms half-bandwidth-32 factor-and-solve;
-- `0.019x` the `1.66--1.69` second complete chunked/unit-circle proof; and
-- `1.81x` the `16.739` ms sparse-code commitment surrogate on the separate
+- `2.48x` the earlier `30.491` ms half-bandwidth-1 factor-and-solve;
+- `0.306x` the earlier `247.374` ms half-bandwidth-32 factor-and-solve;
+- `0.045x` the `1.66--1.69` second complete chunked/unit-circle proof; and
+- `4.52x` the `16.739` ms sparse-code commitment surrogate on the separate
   Brakedown-shaped research branch.
 
 These cross-branch measurements share the same development machine but are not
-one executable baseline. The Hadamard total is still a cost floor: it omits the
-fresh-checksum authentication mechanism, relation sumchecks, final metric
-composition, serialization, and retry handling.
+one executable baseline. The global sumcheck is only an arithmetic cost
+surrogate: its final private data MLE is printed as unauthenticated. It also
+uses one rank-one contraction without a completed norm/anti-concentration
+theorem. Endpoint authentication, metric composition, serialization, and retry
+handling remain outside the staged timer.
 
 The full parity block doubles source storage before tree overhead. The fused
 row transform writes parity directly into committed column-major storage;
-source transposition remains explicit and measured. A tiled canonical layout
-may reduce that copy, but layout changes must not hide data movement from the
-benchmark.
+source transposition remains explicit and measured. The generic global
+sumcheck consumes those two column-major allocations into a 16 MiB mutable data
+table and materializes a second 16 MiB coefficient table. This explains most
+of the increase from the earlier `27,616` KiB base-only RSS. A factor-aware
+sumcheck could avoid the coefficient table, but optimizing an
+endpoint-incomplete protocol is secondary to choosing its binding mechanism.
 
 ## 8. Query-count and escape-cost illustration
 
@@ -447,6 +625,10 @@ randomized spreading itself is unavailable.
 - Alexander Golovnev, Jonathan Lee, Srinath Setty, Justin Thaler, and Riad
   Wahby, [Brakedown: Linear-time and Field-agnostic SNARKs for
   R1CS](https://eprint.iacr.org/2021/1043.pdf).
+- Luke Melas-Kyriazi et al., [WHIR: Reed--Solomon Proximity
+  Testing](https://eprint.iacr.org/2024/1586.pdf).
+- Justin Thaler, [Time-Optimal Interactive Proofs for Circuit
+  Evaluation](https://arxiv.org/abs/1304.3812).
 - Yang Wang, [Random Matrices and Erasure Robust
   Frames](https://arxiv.org/abs/1403.5969).
 - Matthew Fickus and Dustin G. Mixon, [Numerically Erasure-Robust

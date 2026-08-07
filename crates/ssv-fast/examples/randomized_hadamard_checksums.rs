@@ -14,11 +14,18 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use ssv_fast::{
+    DefectObservation, ProductEndpoint, ProductSumcheckProof, QuadraticBernstein, Transcript,
+    evaluate_mle, product_sum, prove_product_owned, verify_product, verify_product_endpoint,
+};
 
 const LEAF_DOMAIN: &[u8] = b"ssv/research/randomized-hadamard/column-leaf/v1";
 const PADDING_DOMAIN: &[u8] = b"ssv/research/randomized-hadamard/column-padding/v1";
 const NODE_DOMAIN: &[u8] = b"ssv/research/randomized-hadamard/column-node/v1";
 const QUERY_DOMAIN: &[u8] = b"ssv/research/randomized-hadamard/query-seed/v1";
+const GLOBAL_SUMCHECK_DOMAIN: &[u8] =
+    b"ssv/research/randomized-hadamard/global-checksum-sumcheck/v1";
+const GLOBAL_WEIGHT_DOMAIN: &[u8] = b"ssv/research/randomized-hadamard/global-checksum-weights/v1";
 const VALUES_PER_HASH_BLOCK: usize = 64;
 const TRANSPOSE_TILE: usize = 32;
 const TAIL_SCALE: f64 = 0.5;
@@ -337,6 +344,10 @@ struct TimingSamples {
     opening_verification: Vec<Duration>,
     defect_scan: Vec<Duration>,
     total: Vec<Duration>,
+    global_sumcheck_table_build: Vec<Duration>,
+    global_sumcheck_prove: Vec<Duration>,
+    global_sumcheck_verify: Vec<Duration>,
+    staged_total: Vec<Duration>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -347,6 +358,35 @@ struct AlterationMetrics {
     query_miss_probability: f64,
     encoded_energy_ratio: f64,
     effective_support: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RecursiveFoldSwitchMetrics {
+    first_round_pairs: usize,
+    violated_first_round_pairs: usize,
+    query_miss_probability: f64,
+    child_relation_maximum_absolute_defect: f64,
+    terminal_absolute_defect: f64,
+}
+
+#[derive(Debug)]
+struct GlobalRelationTables {
+    data: Vec<f64>,
+    coefficients: Vec<f64>,
+    row_weights: Vec<f64>,
+    output_weights: Vec<f64>,
+    source_weights: Vec<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct GlobalSumcheckMetrics {
+    initial_claim: f64,
+    rounds: usize,
+    incremental_payload_bytes: usize,
+    maximum_round_absolute_defect: f64,
+    public_coefficient_endpoint_absolute_defect: f64,
+    final_product_absolute_defect: f64,
+    unauthenticated_data_endpoint: f64,
 }
 
 #[derive(Debug, Default)]
@@ -394,6 +434,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut final_opening_bytes = 0_usize;
     let mut final_defects = DefectMetrics::default();
     let mut final_query_defects = DefectMetrics::default();
+    let mut final_global_sumcheck = GlobalSumcheckMetrics::default();
     let mut final_claim = 0.0;
 
     for repetition in 0..args.warmups + args.repetitions {
@@ -445,6 +486,32 @@ fn main() -> Result<(), Box<dyn Error>> {
         let total = total_start.elapsed();
 
         let start = Instant::now();
+        let global_tables = build_global_relation_tables(
+            source,
+            parity,
+            args.rows,
+            source_columns,
+            &code.signs,
+            &tree.root(),
+        )?;
+        let global_initial_claim = product_sum(&global_tables.data, &global_tables.coefficients)?;
+        let global_sumcheck_table_build = start.elapsed();
+
+        let start = Instant::now();
+        let mut global_prover_transcript =
+            initialize_global_sumcheck_transcript(&tree.root(), global_initial_claim);
+        let (global_proof, global_endpoint) = prove_product_owned(
+            global_tables.data,
+            global_tables.coefficients,
+            global_initial_claim,
+            |round, polynomial| {
+                global_sumcheck_challenge(&mut global_prover_transcript, round, polynomial)
+            },
+        )?;
+        let global_sumcheck_prove = start.elapsed();
+        let staged_total = total + global_sumcheck_table_build + global_sumcheck_prove;
+
+        let start = Instant::now();
         let query_defects = opening.verify(
             &tree,
             args.rows,
@@ -455,16 +522,56 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?;
         let opening_verification = start.elapsed();
 
+        let start = Instant::now();
+        let mut global_verifier_transcript =
+            initialize_global_sumcheck_transcript(&tree.root(), global_initial_claim);
+        let global_table_len = padded_dimension
+            .checked_mul(2)
+            .ok_or_else(|| invalid("global sumcheck table length overflow"))?;
+        let global_verification = verify_product(
+            global_table_len,
+            global_initial_claim,
+            &global_proof,
+            |round, polynomial| {
+                global_sumcheck_challenge(&mut global_verifier_transcript, round, polynomial)
+            },
+        )?;
+        let public_coefficient_endpoint = evaluate_global_coefficient_endpoint(
+            &global_verification.endpoint.point,
+            args.rows,
+            source_columns,
+            &global_tables.row_weights,
+            &global_tables.output_weights,
+            &global_tables.source_weights,
+        )?;
+        let final_product = verify_product_endpoint(
+            &global_verification.endpoint,
+            global_endpoint.left_evaluation,
+            public_coefficient_endpoint,
+        )?;
+        let global_sumcheck_verify = start.elapsed();
+
+        let global_sumcheck = summarize_global_sumcheck(
+            global_initial_claim,
+            &global_proof,
+            &global_endpoint,
+            &global_verification.round_defects,
+            public_coefficient_endpoint,
+            final_product.absolute_defect,
+        )?;
+
         black_box(tree.root());
         black_box(defects.maximum_absolute);
         black_box(claim);
         black_box(opening.values.last());
         black_box(query_defects.maximum_absolute);
+        black_box(global_sumcheck.final_product_absolute_defect);
         final_root = tree.root();
         final_tree_bytes = tree.bytes();
         final_opening_bytes = opening.payload_bytes(source_columns)?;
         final_defects = defects;
         final_query_defects = query_defects;
+        final_global_sumcheck = global_sumcheck;
         final_claim = claim;
 
         if repetition >= args.warmups {
@@ -477,6 +584,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             samples.opening_verification.push(opening_verification);
             samples.defect_scan.push(defect_scan);
             samples.total.push(total);
+            samples
+                .global_sumcheck_table_build
+                .push(global_sumcheck_table_build);
+            samples.global_sumcheck_prove.push(global_sumcheck_prove);
+            samples.global_sumcheck_verify.push(global_sumcheck_verify);
+            samples.staged_total.push(staged_total);
         }
     }
 
@@ -527,6 +640,32 @@ fn main() -> Result<(), Box<dyn Error>> {
         "queried_rms_absolute_defect={:.17e}",
         final_query_defects.rms_absolute
     );
+    println!(
+        "global_sumcheck_initial_metric_claim={:.17e}",
+        final_global_sumcheck.initial_claim
+    );
+    println!("global_sumcheck_rounds={}", final_global_sumcheck.rounds);
+    println!(
+        "global_sumcheck_incremental_payload_bytes={}",
+        final_global_sumcheck.incremental_payload_bytes
+    );
+    println!(
+        "global_sumcheck_maximum_round_absolute_defect={:.17e}",
+        final_global_sumcheck.maximum_round_absolute_defect
+    );
+    println!(
+        "global_sumcheck_public_coefficient_endpoint_absolute_defect={:.17e}",
+        final_global_sumcheck.public_coefficient_endpoint_absolute_defect
+    );
+    println!(
+        "global_sumcheck_final_product_absolute_defect={:.17e}",
+        final_global_sumcheck.final_product_absolute_defect
+    );
+    println!(
+        "global_sumcheck_unauthenticated_data_endpoint={:.17e}",
+        final_global_sumcheck.unauthenticated_data_endpoint
+    );
+    println!("global_sumcheck_data_endpoint_authenticated=false");
     print_timing("transform_encoding", &mut samples.transform_encoding);
     print_timing("transpose", &mut samples.transpose);
     print_timing("commitment", &mut samples.commitment);
@@ -536,6 +675,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     print_timing("opening_verification", &mut samples.opening_verification);
     print_timing("defect_scan", &mut samples.defect_scan);
     print_timing("total", &mut samples.total);
+    print_timing(
+        "global_sumcheck_table_build",
+        &mut samples.global_sumcheck_table_build,
+    );
+    print_timing("global_sumcheck_prove", &mut samples.global_sumcheck_prove);
+    print_timing(
+        "global_sumcheck_verify",
+        &mut samples.global_sumcheck_verify,
+    );
+    print_timing("staged_total", &mut samples.staged_total);
 
     run_spreading_study(
         source_columns,
@@ -543,6 +692,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         args.spreading_trials,
         args.seed ^ 0x5350_5245_4144_494e,
     )?;
+    let fold_switch =
+        recursive_fold_switch_attack(&code, args.queries, args.seed ^ 0x464f_4c44_5f53_5749)?;
+    println!("recursive_fold_candidate=odd-even-local-fold-v1");
+    println!(
+        "recursive_fold_switch_attack_first_round_pairs={}",
+        fold_switch.first_round_pairs
+    );
+    println!(
+        "recursive_fold_switch_attack_violated_first_round_pairs={}",
+        fold_switch.violated_first_round_pairs
+    );
+    println!(
+        "recursive_fold_switch_attack_query_miss_probability={:.9e}",
+        fold_switch.query_miss_probability
+    );
+    println!(
+        "recursive_fold_switch_attack_child_relation_maximum_absolute_defect={:.17e}",
+        fold_switch.child_relation_maximum_absolute_defect
+    );
+    println!(
+        "recursive_fold_switch_attack_terminal_absolute_defect={:.17e}",
+        fold_switch.terminal_absolute_defect
+    );
     Ok(())
 }
 
@@ -577,6 +749,143 @@ fn fwht_in_place(values: &mut [f64]) {
         }
         half = block;
     }
+}
+
+/// Folds one normalized Walsh--Hadamard relation.
+///
+/// For `parity = H_n source`, split both vectors into equal halves and set
+///
+/// ```text
+/// next_source = ((1 + challenge) source_0
+///              + (1 - challenge) source_1) / sqrt(2)
+/// next_parity = parity_0 + challenge parity_1.
+/// ```
+///
+/// The result satisfies `next_parity = H_(n/2) next_source`, up to binary64
+/// roundoff. This identity supplies completeness; it does not by itself give
+/// proximity soundness for Merkle-sampled fold relations.
+fn fold_hadamard_relation(
+    source: &[f64],
+    parity: &[f64],
+    challenge: f64,
+) -> Result<(Vec<f64>, Vec<f64>), io::Error> {
+    if source.len() != parity.len() || source.len() < 2 || !source.len().is_power_of_two() {
+        return Err(invalid("Hadamard fold relation shape is invalid"));
+    }
+    if !challenge.is_finite() {
+        return Err(invalid("Hadamard fold challenge must be finite"));
+    }
+    let half = source.len() / 2;
+    let inverse_sqrt_two = 1.0 / 2.0_f64.sqrt();
+    let plus = 1.0 + challenge;
+    let minus = 1.0 - challenge;
+    let mut next_source = Vec::new();
+    next_source
+        .try_reserve_exact(half)
+        .map_err(|_| invalid("could not allocate folded Hadamard source"))?;
+    let mut next_parity = Vec::new();
+    next_parity
+        .try_reserve_exact(half)
+        .map_err(|_| invalid("could not allocate folded Hadamard parity"))?;
+    for index in 0..half {
+        next_source.push((plus * source[index] + minus * source[index + half]) * inverse_sqrt_two);
+        next_parity.push(parity[index] + challenge * parity[index + half]);
+    }
+    Ok((next_source, next_parity))
+}
+
+fn normalized_hadamard(source: &[f64]) -> Result<Vec<f64>, io::Error> {
+    if source.is_empty() || !source.len().is_power_of_two() {
+        return Err(invalid(
+            "normalized Hadamard input must have positive power-of-two length",
+        ));
+    }
+    let mut transformed = source.to_vec();
+    fwht_in_place(&mut transformed);
+    let normalization = 1.0 / (source.len() as f64).sqrt();
+    for value in &mut transformed {
+        *value *= normalization;
+    }
+    Ok(transformed)
+}
+
+fn dyadic_fold_challenge(state: &mut u64) -> f64 {
+    // Keep the challenge away from either projection endpoint. All possible
+    // values are exactly representable in binary64.
+    let numerator = 256 + splitmix64(state) % 513;
+    numerator as f64 / 1024.0
+}
+
+/// Executes the sparse codeword-switch attack against the tempting recursive
+/// odd/even checker.
+///
+/// The checkpoint fixes a one-coordinate source alteration before the random
+/// signs. The appended parity is nevertheless allowed to encode the altered
+/// source. After seeing the first fold challenge, the adversary changes the
+/// child systematic vector at the one affected pair. That child and every
+/// later level are honest codewords, so only one first-round local equation is
+/// false and the terminal equality is valid independently of later challenges.
+fn recursive_fold_switch_attack(
+    code: &RandomizedHadamardCode,
+    queries: usize,
+    seed: u64,
+) -> Result<RecursiveFoldSwitchMetrics, io::Error> {
+    if code.width < 2 {
+        return Err(invalid("recursive fold attack requires width at least two"));
+    }
+
+    let committed_source = vec![0.0; code.width];
+    let mut fixed_alteration = vec![0.0; code.width];
+    fixed_alteration[0] = 1.0;
+    let forged_parity = code.encode_vector(&fixed_alteration)?;
+
+    // The recursive relation sees D * source on its systematic side.
+    let mut signed_alteration = fixed_alteration;
+    for (value, &sign) in signed_alteration.iter_mut().zip(&code.signs) {
+        *value *= sign;
+    }
+
+    let mut state = seed;
+    let first_challenge = dyadic_fold_challenge(&mut state);
+    let (honest_child_source, honest_child_parity) =
+        fold_hadamard_relation(&committed_source, &forged_parity, first_challenge)?;
+    let (altered_child_source, altered_child_parity) =
+        fold_hadamard_relation(&signed_alteration, &forged_parity, first_challenge)?;
+
+    // Both executions fold the identical parent parity. The adversary changes
+    // only the child systematic coordinate carrying the fixed alteration.
+    let parity_fold_defects = compare_vectors(&altered_child_parity, &honest_child_parity)?;
+    let violated_first_round_pairs = altered_child_source
+        .iter()
+        .zip(&honest_child_source)
+        .filter(|(altered, honest)| *altered != *honest)
+        .count();
+
+    let child_expected_parity = normalized_hadamard(&altered_child_source)?;
+    let child_relation = compare_vectors(&altered_child_parity, &child_expected_parity)?;
+
+    let mut source = altered_child_source;
+    let mut parity = altered_child_parity;
+    while source.len() > 1 {
+        let challenge = dyadic_fold_challenge(&mut state);
+        (source, parity) = fold_hadamard_relation(&source, &parity, challenge)?;
+    }
+
+    let first_round_pairs = code.width / 2;
+    let sampled_pairs = queries.min(first_round_pairs);
+    Ok(RecursiveFoldSwitchMetrics {
+        first_round_pairs,
+        violated_first_round_pairs,
+        query_miss_probability: miss_probability(
+            first_round_pairs,
+            violated_first_round_pairs,
+            sampled_pairs,
+        ),
+        child_relation_maximum_absolute_defect: child_relation
+            .maximum_absolute
+            .max(parity_fold_defects.maximum_absolute),
+        terminal_absolute_defect: (source[0] - parity[0]).abs(),
+    })
 }
 
 fn generate_source(
@@ -759,6 +1068,193 @@ fn derive_query_seed(root: &[u8; 32], combined_source: &[f64]) -> u64 {
             .try_into()
             .expect("a BLAKE3 digest always contains eight bytes"),
     )
+}
+
+fn build_global_relation_tables(
+    mut source: Vec<f64>,
+    parity: Vec<f64>,
+    rows: usize,
+    columns: usize,
+    signs: &[f64],
+    appended_root: &[u8; 32],
+) -> Result<GlobalRelationTables, io::Error> {
+    let table_len = rows
+        .checked_mul(columns)
+        .ok_or_else(|| invalid("global relation table shape overflow"))?;
+    if source.len() != table_len || parity.len() != table_len || signs.len() != columns {
+        return Err(invalid("global relation table shape is invalid"));
+    }
+
+    let master_seed = derive_root_seed(appended_root, GLOBAL_WEIGHT_DOMAIN);
+    let row_weights = signed_unit_weights(rows, master_seed ^ 0x524f_575f_4c41_4d42)?;
+    let output_weights = signed_unit_weights(columns, master_seed ^ 0x4f55_545f_5745_4947)?;
+    let mut source_weights = normalized_hadamard(&output_weights)?;
+    for (value, &sign) in source_weights.iter_mut().zip(signs) {
+        *value = canonicalize_zero(*value * sign);
+    }
+
+    let combined_len = table_len
+        .checked_mul(2)
+        .ok_or_else(|| invalid("global relation combined table length overflow"))?;
+    let mut data = parity;
+    data.try_reserve_exact(table_len)
+        .map_err(|_| invalid("could not grow the global relation data table"))?;
+    data.append(&mut source);
+    debug_assert_eq!(data.len(), combined_len);
+    for value in &mut data {
+        *value = canonicalize_zero(*value);
+    }
+
+    let mut coefficients = Vec::new();
+    coefficients
+        .try_reserve_exact(combined_len)
+        .map_err(|_| invalid("could not allocate global relation coefficient table"))?;
+    for &column_weight in &output_weights {
+        for &row_weight in &row_weights {
+            coefficients.push(canonicalize_zero(row_weight * column_weight));
+        }
+    }
+    for &column_weight in &source_weights {
+        for &row_weight in &row_weights {
+            coefficients.push(canonicalize_zero(-(row_weight * column_weight)));
+        }
+    }
+
+    Ok(GlobalRelationTables {
+        data,
+        coefficients,
+        row_weights,
+        output_weights,
+        source_weights,
+    })
+}
+
+fn canonicalize_zero(value: f64) -> f64 {
+    if value == 0.0 { 0.0 } else { value }
+}
+
+fn signed_unit_weights(len: usize, seed: u64) -> Result<Vec<f64>, io::Error> {
+    if len == 0 || !len.is_power_of_two() {
+        return Err(invalid(
+            "orthogonal weight count must be a positive power of two",
+        ));
+    }
+    let mut weights = Vec::new();
+    weights
+        .try_reserve_exact(len)
+        .map_err(|_| invalid("could not allocate orthogonal weights"))?;
+    let mut state = seed;
+    let scale = 1.0 / (len as f64).sqrt();
+    for _ in 0..len {
+        let sign = if splitmix64(&mut state) & 1 == 0 {
+            1.0
+        } else {
+            -1.0
+        };
+        weights.push(sign * scale);
+    }
+    Ok(weights)
+}
+
+fn derive_root_seed(root: &[u8; 32], domain: &[u8]) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain);
+    hasher.update(root);
+    let digest = hasher.finalize();
+    u64::from_le_bytes(
+        digest.as_bytes()[..size_of::<u64>()]
+            .try_into()
+            .expect("a BLAKE3 digest always contains eight bytes"),
+    )
+}
+
+fn initialize_global_sumcheck_transcript(root: &[u8; 32], initial_claim: f64) -> Transcript {
+    let mut transcript = Transcript::new(GLOBAL_SUMCHECK_DOMAIN);
+    transcript.absorb_root(b"appended-checksum-root", root);
+    transcript.absorb_u64(b"global-relation-initial-claim", initial_claim.to_bits());
+    transcript
+}
+
+fn global_sumcheck_challenge(
+    transcript: &mut Transcript,
+    round: usize,
+    polynomial: &QuadraticBernstein,
+) -> f64 {
+    transcript.absorb_u64(b"global-relation-round", round as u64);
+    for &coefficient in &polynomial.coefficients {
+        transcript.absorb_u64(b"global-relation-coefficient", coefficient.to_bits());
+    }
+    transcript
+        .challenge_dyadic_f64(b"global-relation-challenge")
+        .expect("the fixed logarithmic sumcheck cannot exhaust the transcript counter")
+}
+
+fn evaluate_global_coefficient_endpoint(
+    point: &[f64],
+    rows: usize,
+    columns: usize,
+    row_weights: &[f64],
+    output_weights: &[f64],
+    source_weights: &[f64],
+) -> Result<f64, Box<dyn Error>> {
+    let column_variables = columns.ilog2() as usize;
+    let row_variables = rows.ilog2() as usize;
+    let expected_variables = 1_usize
+        .checked_add(column_variables)
+        .and_then(|value| value.checked_add(row_variables))
+        .ok_or_else(|| invalid("global coefficient point dimension overflow"))?;
+    if point.len() != expected_variables
+        || row_weights.len() != rows
+        || output_weights.len() != columns
+        || source_weights.len() != columns
+    {
+        return Err(invalid("global coefficient endpoint shape is invalid").into());
+    }
+
+    let block_coordinate = point[0];
+    let column_point = &point[1..1 + column_variables];
+    let row_point = &point[1 + column_variables..];
+    let row_evaluation = evaluate_mle(row_weights, row_point)?;
+    let output_evaluation = evaluate_mle(output_weights, column_point)?;
+    let source_evaluation = evaluate_mle(source_weights, column_point)?;
+    Ok(
+        (1.0 - block_coordinate) * row_evaluation * output_evaluation
+            - block_coordinate * row_evaluation * source_evaluation,
+    )
+}
+
+fn summarize_global_sumcheck(
+    initial_claim: f64,
+    proof: &ProductSumcheckProof,
+    endpoint: &ProductEndpoint,
+    round_defects: &[DefectObservation],
+    public_coefficient_endpoint: f64,
+    final_product_absolute_defect: f64,
+) -> Result<GlobalSumcheckMetrics, io::Error> {
+    let round_bytes = proof
+        .rounds
+        .len()
+        .checked_mul(3 * size_of::<f64>())
+        .ok_or_else(|| invalid("global sumcheck round byte count overflow"))?;
+    let incremental_payload_bytes = 2_usize
+        .checked_mul(size_of::<f64>())
+        .and_then(|value| value.checked_add(round_bytes))
+        .ok_or_else(|| invalid("global sumcheck payload byte count overflow"))?;
+    let maximum_round_absolute_defect = round_defects
+        .iter()
+        .map(|defect| defect.absolute_defect)
+        .fold(0.0_f64, f64::max);
+    Ok(GlobalSumcheckMetrics {
+        initial_claim,
+        rounds: proof.rounds.len(),
+        incremental_payload_bytes,
+        maximum_round_absolute_defect,
+        public_coefficient_endpoint_absolute_defect: (endpoint.right_evaluation
+            - public_coefficient_endpoint)
+            .abs(),
+        final_product_absolute_defect,
+        unauthenticated_data_endpoint: endpoint.left_evaluation,
+    })
 }
 
 fn combine_columns(
@@ -1207,6 +1703,139 @@ mod tests {
                     &combined_parity,
                 )
                 .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn odd_even_fold_preserves_a_hadamard_relation() -> Result<(), Box<dyn Error>> {
+        let source = random_unit_vector(256, 43)?;
+        let parity = normalized_hadamard(&source)?;
+        let (folded_source, folded_parity) = fold_hadamard_relation(&source, &parity, 0.375)?;
+        let expected = normalized_hadamard(&folded_source)?;
+        let defects = compare_vectors(&folded_parity, &expected)?;
+        assert!(defects.maximum_absolute < 1.0e-14);
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_switch_defeats_local_odd_even_fold_queries() -> Result<(), Box<dyn Error>> {
+        let code = RandomizedHadamardCode::new(4096, 47)?;
+        let metrics = recursive_fold_switch_attack(&code, 16, 53)?;
+        assert_eq!(metrics.first_round_pairs, 2048);
+        assert_eq!(metrics.violated_first_round_pairs, 1);
+        assert!((metrics.query_miss_probability - 0.992_187_5).abs() < f64::EPSILON);
+        assert!(metrics.child_relation_maximum_absolute_defect < 1.0e-14);
+        assert!(metrics.terminal_absolute_defect < 1.0e-13);
+        Ok(())
+    }
+
+    #[test]
+    fn global_coefficient_endpoint_factorizes() -> Result<(), Box<dyn Error>> {
+        let rows = 8;
+        let columns = 16;
+        let source_row = generate_source(rows * columns, rows * columns, 59)?;
+        let code = RandomizedHadamardCode::new(columns, 61)?;
+        let parity = code.encode_rows_to_columns(&source_row, rows)?;
+        let source = transpose_row_to_column(&source_row, rows, columns)?;
+        let tree = build_column_tree(&source, &parity, rows, columns, 2 * columns)?;
+        let tables =
+            build_global_relation_tables(source, parity, rows, columns, &code.signs, &tree.root())?;
+        let point = vec![0.375; (2 * rows * columns).ilog2() as usize];
+        let direct = evaluate_mle(&tables.coefficients, &point)?;
+        let factored = evaluate_global_coefficient_endpoint(
+            &point,
+            rows,
+            columns,
+            &tables.row_weights,
+            &tables.output_weights,
+            &tables.source_weights,
+        )?;
+        assert!((direct - factored).abs() < 1.0e-15);
+        Ok(())
+    }
+
+    #[test]
+    fn global_contraction_observes_a_committed_checksum_mutation() -> Result<(), Box<dyn Error>> {
+        let rows = 8;
+        let columns = 8;
+        let source_row = generate_source(rows * columns, rows * columns, 67)?;
+        let code = RandomizedHadamardCode::new(columns, 71)?;
+        let mut parity = code.encode_rows_to_columns(&source_row, rows)?;
+        let source = transpose_row_to_column(&source_row, rows, columns)?;
+        let honest_tree = build_column_tree(&source, &parity, rows, columns, 2 * columns)?;
+        let honest = build_global_relation_tables(
+            source.clone(),
+            parity.clone(),
+            rows,
+            columns,
+            &code.signs,
+            &honest_tree.root(),
+        )?;
+        assert!(product_sum(&honest.data, &honest.coefficients)?.abs() < 1.0e-14);
+
+        parity[0] += 1.0;
+        let altered_tree = build_column_tree(&source, &parity, rows, columns, 2 * columns)?;
+        let altered = build_global_relation_tables(
+            source,
+            parity,
+            rows,
+            columns,
+            &code.signs,
+            &altered_tree.root(),
+        )?;
+        assert!(product_sum(&altered.data, &altered.coefficients)?.abs() > 0.1);
+        Ok(())
+    }
+
+    #[test]
+    fn unauthenticated_endpoint_allows_a_root_disconnected_zero_table() -> Result<(), Box<dyn Error>>
+    {
+        let rows = 8;
+        let columns = 8;
+        let source_row = generate_source(rows * columns, rows * columns, 73)?;
+        let code = RandomizedHadamardCode::new(columns, 79)?;
+        let mut parity = code.encode_rows_to_columns(&source_row, rows)?;
+        parity[0] += 1.0;
+        let source = transpose_row_to_column(&source_row, rows, columns)?;
+        let tree = build_column_tree(&source, &parity, rows, columns, 2 * columns)?;
+        let tables =
+            build_global_relation_tables(source, parity, rows, columns, &code.signs, &tree.root())?;
+        assert!(product_sum(&tables.data, &tables.coefficients)?.abs() > 0.1);
+
+        // The alleged sumcheck table is not linked to the committed root. A
+        // malicious prover substitutes zeros while retaining the public
+        // coefficient table derived from that root.
+        let fake_data = vec![0.0; tables.data.len()];
+        let mut prover_transcript = initialize_global_sumcheck_transcript(&tree.root(), 0.0);
+        let (proof, endpoint) =
+            prove_product_owned(fake_data, tables.coefficients, 0.0, |round, polynomial| {
+                global_sumcheck_challenge(&mut prover_transcript, round, polynomial)
+            })?;
+        let mut verifier_transcript = initialize_global_sumcheck_transcript(&tree.root(), 0.0);
+        let verification = verify_product(tables.data.len(), 0.0, &proof, |round, polynomial| {
+            global_sumcheck_challenge(&mut verifier_transcript, round, polynomial)
+        })?;
+        let public_endpoint = evaluate_global_coefficient_endpoint(
+            &verification.endpoint.point,
+            rows,
+            columns,
+            &tables.row_weights,
+            &tables.output_weights,
+            &tables.source_weights,
+        )?;
+        let final_defect = verify_product_endpoint(
+            &verification.endpoint,
+            endpoint.left_evaluation,
+            public_endpoint,
+        )?;
+        assert_eq!(endpoint.left_evaluation, 0.0);
+        assert_eq!(final_defect.absolute_defect, 0.0);
+        assert!(
+            verification
+                .round_defects
+                .iter()
+                .all(|defect| defect.absolute_defect == 0.0)
         );
         Ok(())
     }
