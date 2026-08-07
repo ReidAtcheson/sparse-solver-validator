@@ -15,4 +15,5 @@ ssv-validation = { path = "../ssv-validation" }
 thiserror.workspace = true
 
 [dev-dependencies]
+clap.workspace = true
 ssv-relation = { path = "../ssv-relation" }
