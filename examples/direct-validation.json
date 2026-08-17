@@ -1,7 +1,0 @@
-{
-  "schema": "sparse-solve/validation/v1",
-  "protocol": "direct-reference-v1",
-  "max_solution_elements": 16777216,
-  "max_public_matrix_terms": 4096,
-  "max_public_rhs_terms": 4096
-}
