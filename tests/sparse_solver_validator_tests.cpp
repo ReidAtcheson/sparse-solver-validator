@@ -1,5 +1,11 @@
-#include <sparse_solver_validator/sparse_solver_validator.hpp>
-
 #include <cstdlib>
+#include <random>
 
-int main() { return EXIT_SUCCESS; }
+int main() {
+  std::philox4x32 engine;
+  for (int i = 0; i < 9'999; ++i) {
+    (void)engine();
+  }
+
+  return engine() == 1'955'073'260 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
